@@ -50,6 +50,20 @@ just otelq trace <trace_id>
 
 Run `just otel-clean` to reset captured telemetry (empties the active JSONL files in place, drops rotated backups, and clears the otelq cache). Run `just otel-down` to stop the Collector.
 
+### Try it without an app (demo)
+
+No app to instrument yet? Generate synthetic telemetry with one command:
+
+```sh
+just otel-demo        # starts the Collector, then runs otelgen for ~15s
+just otelq summary    # now there is traces + logs data to query
+just otelq slow --top 5
+```
+
+`just otel-demo` brings up the Collector and runs [otelgen](https://github.com/krzko/otelgen) (the `demo` Compose profile) to push ~15s of synthetic **traces and logs** through it, populating `telemetry/`. It's the fastest way to exercise otelq — and the `query-telemetry` skill — on a fresh clone. (Metrics aren't generated: otelgen's metrics CLI is broken upstream at the pinned version.)
+
+> The demo generators live **only in this repo** as a testing aid. They are **not** part of integrating otelq into another project — that path adds only the Collector's file exporters (see [Collector: standalone or integrated](#collector-standalone-or-integrated)), never otelgen.
+
 ## Install / run options
 
 **(a) Zero-install, ad-hoc** — `otelq.py` is a [PEP 723](https://peps.python.org/pep-0723/) single-file script. `uv` provisions Python and DuckDB on the fly:

@@ -9,9 +9,20 @@ otel-up:
     docker compose --profile otel up -d
     @echo "OTel Collector listening on localhost:4317 (gRPC) / localhost:4318 (HTTP)"
 
-# Stop the dev OTel Collector
+# Quick test with synthetic data — no app needed. Starts the Collector, then runs
+# otelgen generators that push ~15s of traces and logs through it, populating
+# telemetry/ so otelq (and the query-telemetry skill) can be tried on a fresh clone.
+otel-demo:
+    mkdir -p telemetry
+    docker compose --profile otel up -d
+    @echo "Generating ~15s of synthetic traces + logs via otelgen (one-shot)..."
+    docker compose --profile demo up
+    -docker compose --profile demo rm -fs >/dev/null 2>&1
+    @echo "Done. Query it:  just otelq summary  |  just otelq slow  |  just otelq --format json logs"
+
+# Stop the dev OTel Collector (and remove any demo generator containers)
 otel-down:
-    docker compose --profile otel down
+    docker compose --profile otel --profile demo down
 
 # Reset captured telemetry: empty the active files in place, drop rotated
 # backups and the otelq parquet cache. The dev Collector keeps

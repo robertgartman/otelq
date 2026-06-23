@@ -6,6 +6,18 @@
 #
 # The "otel" profile keeps the Collector opt-in: it only starts when explicitly
 # selected (`docker compose --profile otel up`), so `docker compose up` alone is a no-op.
+#
+# The "demo" profile adds otelgen generators that push synthetic traces, logs, and
+# metrics through the Collector — a zero-instrumentation way to populate telemetry/
+# so otelq (and the query-telemetry skill) can be tried on a fresh clone. Driven by
+# `just otel-demo` (which starts the Collector first, then runs the generators).
+
+# Shared settings for the otelgen generator services (profile "demo").
+x-otelgen: &otelgen
+  image: ghcr.io/krzko/otelgen:v0.5.2
+  profiles: ["demo"]
+  restart: "no" # one-shot: emit for --duration seconds, then exit
+
 services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.119.0
@@ -17,3 +29,30 @@ services:
       - ./telemetry:/telemetry
     ports: ["4317:4317", "4318:4318"]
     restart: unless-stopped
+
+  # otelgen generators: each sends ONE signal over OTLP gRPC to the Collector,
+  # which writes it to telemetry/<signal>.jsonl. The gRPC exporter retries while
+  # the Collector comes up, so no depends_on gate is needed (the just recipe
+  # starts the Collector first regardless).
+  #
+  # traces: global flags (endpoint/insecure/duration/rate) precede the subcommand.
+  otelgen-traces:
+    <<: *otelgen
+    command:
+      ["--otel-exporter-otlp-endpoint", "otel-collector:4317", "--insecure",
+       "--duration", "15", "--rate", "1", "--service-name", "otelq-demo",
+       "traces", "multi"]
+
+  # logs: --duration is a `logs multi` subcommand flag, so it follows the command.
+  otelgen-logs:
+    <<: *otelgen
+    command:
+      ["--otel-exporter-otlp-endpoint", "otel-collector:4317", "--insecure",
+       "--service-name", "otelq-demo",
+       "logs", "multi", "--duration", "15"]
+
+  # NOTE: no metrics generator. otelgen v0.5.2's `metrics <type>` subcommands do
+  # not receive the global --duration (they fail with "either `metrics` or
+  # `duration` must be greater than 0"), so they cannot emit over OTLP from the
+  # CLI. The demo covers traces + logs, which exercise summary/errors/slow/trace/
+  # logs. Revisit if a fixed otelgen release lands.
