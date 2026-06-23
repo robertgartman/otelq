@@ -1,5 +1,9 @@
 # otelq
 
+[![CI](https://github.com/robertgartman/otelq/actions/workflows/ci.yml/badge.svg)](https://github.com/robertgartman/otelq/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/robertgartman/otelq/badge)](https://scorecard.dev/viewer/?uri=github.com/robertgartman/otelq)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **Feed your agentic development setup with Open Telemetry**
 
 otelq is a tiny CLI that queries the OpenTelemetry traces, logs, and metrics your app emits locally. A stock OpenTelemetry Collector captures those signals to plain JSONL files on disk, and otelq reads them directly with DuckDB — no Jaeger, no SigNoz, no Grafana, no server, and no UI. It is built for the inner development loop and for AI coding agents doing close-the-loop verification: run the app, then ask "did the request error?", "what was slow?", "show me trace X" straight from the terminal.
@@ -102,7 +106,12 @@ just lint          # ruff
 just otelq-test    # pytest suite
 ```
 
-Issues and pull requests welcome at [github.com/robertgartman/otelq](https://github.com/robertgartman/otelq).
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full setup, the project-specific
+rules (strict typing, the load-bearing `duckdb` pin, the `justfile` gateway), and
+the PR checklist. Participation is governed by the
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md); report vulnerabilities per
+[`SECURITY.md`](SECURITY.md). Issues and pull requests welcome at
+[github.com/robertgartman/otelq](https://github.com/robertgartman/otelq).
 
 ## License
 

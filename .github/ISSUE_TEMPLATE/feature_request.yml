@@ -1,0 +1,30 @@
+name: Feature request
+description: Suggest an idea or improvement for otelq
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        otelq is deliberately small and CLI-only. Proposals that keep it a
+        single-file, server-less tool are the easiest to accept.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: The use case or pain point, ideally from the dev inner loop.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What you'd like otelq to do. A sample command and its output helps.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches, or how you work around this today.
+    validations:
+      required: false
