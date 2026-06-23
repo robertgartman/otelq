@@ -53,16 +53,40 @@ The first run builds otelq and fetches the DuckDB `otlp` community extension
 `--dir $TARGET/telemetry` so otelq reads the target project's output folder. To
 pin a version, append a ref: `…/otelq@v0.1.0 otelq …`.
 
-## Step 0 — Ask for `$TARGET`, then preflight
+## Step 0 — Ask for `$TARGET`, secure its working tree, then preflight
 
 1. **Get `$TARGET`** (absolute path) and confirm it exists.
-2. **Preflight the host** — fail fast with a fix if any is missing:
+
+2. **Secure the target's working tree before editing anything.** This skill changes
+   files in `$TARGET`, adds a commit, runs a verify probe, and reverts it, so start
+   from a known git state. Inspect it first:
+
+   ```sh
+   git -C "$TARGET" rev-parse --is-inside-work-tree   # is it a git repo at all?
+   git -C "$TARGET" branch --show-current             # current branch
+   git -C "$TARGET" status --porcelain                # any uncommitted changes?
+   ```
+
+   Then **advise the user and act on their choice before progressing**:
+   - **Uncommitted changes present** → advise **committing (or stashing) them first**,
+     so their in-flight work is saved and the tree is clean before otelq touches
+     anything — otherwise your edits and the verify probe entangle with theirs.
+   - **Either way** → recommend doing the integration on a **dedicated branch**
+     (e.g. `otelq-collector-setup`) rather than on their working branch, so the whole
+     change set — including the probe's commit and revert — stays isolated and is
+     trivial to review or drop.
+   - **Not a git repo** → say so: the commit/revert verify model needs git. Offer to
+     `git init`, or proceed only if the user accepts undoing the probe by hand.
+
+   **Do not edit any file in `$TARGET` until the user has committed/stashed and/or
+   switched branch as they prefer** (or has explicitly chosen to proceed on the
+   current branch as-is).
+
+3. **Preflight the host** — fail fast with a fix if any is missing:
    - `uv` / `uvx` on PATH (`uv --version`) — runs otelq.
    - `docker` and `docker compose` working (`docker compose version`).
-   - `$TARGET` is a **git repo with a clean (or known) working tree**
-     (`git -C "$TARGET" status --porcelain`). The verify step commits and then
-     reverts inside `$TARGET`; without git, you must undo the probe by hand.
-3. **Detect the Collector.** Search `$TARGET` for a Compose service using
+
+4. **Detect the Collector.** Search `$TARGET` for a Compose service using
    `otel/opentelemetry-collector*` (look in `compose.yaml`, `compose.yml`,
    `docker-compose.yml`, and any `-f`-referenced overlays).
    - Found → **Path A** (integrate).
