@@ -52,9 +52,16 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
-import duckdb
+# duckdb is imported lazily inside the three functions that actually open a
+# connection (connect/build_connection) or catch its errors (cmd_sql), so commands
+# that never touch it — doctor, collector-config, --help — don't pay its ~40 ms
+# import. Module-wide, only the type annotations need the symbol, and those are
+# strings under `from __future__ import annotations`, resolved by this
+# type-checking-only import (no runtime cost).
+if TYPE_CHECKING:
+    import duckdb
 
 # Public surface of this single-file module. The CLI entry is `main`; the rest
 # is the API the test suite pins. The trailing group is deliberately exported
@@ -1002,6 +1009,8 @@ def connect(telemetry_dir: Path) -> duckdb.DuckDBPyConnection:
 
     Retained for the test fixtures and as the simplest read path. Builds the
     query relations directly from every raw file."""
+    import duckdb  # lazy; see TYPE_CHECKING note above
+
     conn = duckdb.connect(database=":memory:")
     conn.execute("INSTALL otlp FROM community")
     conn.execute("LOAD otlp")
@@ -1066,6 +1075,8 @@ def plan_range(args: argparse.Namespace) -> Plan:
 
 
 def build_connection(telemetry_dir: Path, plan: Plan) -> duckdb.DuckDBPyConnection:
+    import duckdb  # lazy; see TYPE_CHECKING note above
+
     conn = duckdb.connect(database=":memory:")
     conn.execute("INSTALL otlp FROM community")
     conn.execute("LOAD otlp")
@@ -1154,6 +1165,8 @@ def cmd_summary(
 def cmd_sql(
     conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
 ) -> CommandResult:
+    import duckdb  # lazy; see TYPE_CHECKING note above
+
     try:
         result = conn.execute(args.query)
         columns = [d[0] for d in result.description] if result.description else []
