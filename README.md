@@ -16,6 +16,21 @@ otelq is a tiny CLI that queries the OpenTelemetry traces, logs, and metrics you
 
 The bind-mounted directory is the entire contract. The Collector writes OTLP signals as `traces.jsonl`, `logs.jsonl`, and `metrics.jsonl`; otelq reads those same files. There is no network coupling between the Collector and the CLI — the shared directory is the API.
 
+### Collector: standalone or integrated
+
+The Collector is interchangeable — otelq is a pure consumer of the telemetry directory, so any conformant producer works. There are two setups (see [`context/adr/ADR-007`](context/adr/ADR-007-dual-collector-standalone-and-integrated.md)):
+
+- **Standalone** — `just otel-up` runs otelq's bundled Collector. Best for a project with no telemetry stack, or a quick demo.
+- **Integrated** — another project on the same host already runs its own Collector. Add otelq's file-export pipeline to *that project's* Collector instead of running a second one. The direction matters: you work **from the otelq repo** and integrate otelq **into the target project** (identified by its absolute path, e.g. `/Users/me/dev/my-service`) — not the other way around.
+
+  ```sh
+  otelq collector-config                      # run in the otelq repo: prints the exporters + pipeline wiring
+  # ...paste the fragment into the TARGET project's Collector config, bind-mount its ./telemetry, restart...
+  otelq --dir /Users/me/dev/my-service/telemetry doctor    # verify the target's wiring satisfies the contract
+  ```
+
+  `collector-config` is generated from otelq's pinned constants, so it never drifts from the contract. The `file` exporter requires the `*-contrib` Collector image. In integrated mode otelq never manages the target's Collector — the `just otel-*` recipes (especially `otel-clean`) are standalone-only. The **integrate-collector** skill automates this and asks for the target project's path; see below.
+
 ## Quickstart
 
 ```sh
@@ -69,6 +84,8 @@ just otel-up
 | `logs`    | Filtered log records (`--service`, `--level`, `--grep`)   |
 | `metric`  | Time series for one metric (`metric <name>`)              |
 | `sql`     | Ad-hoc SQL over the `traces`/`logs`/`metrics` views       |
+| `collector-config` | Print the file-export fragment to add to an existing Collector |
+| `doctor`  | Check that a telemetry dir satisfies the contract (`--dir`) |
 
 **Argument-order rule:** `--format` (`table` \| `json` \| `csv`) is a global flag and goes **before** the subcommand. The same applies to `--all` and `--no-cache`. The `--since` window (e.g. `10m`, `2h`, `1d`) goes after the subcommand.
 
@@ -91,6 +108,7 @@ This repo is built to be driven by AI coding agents:
 - **[`AGENTS.md`](AGENTS.md)** — start here. The entry point for agents working in this repo.
 - **[`context/CONTEXT.md`](context/CONTEXT.md)** — the documentation system (PRD / SPEC / ADR / CONTRACT routing rules).
 - **[`.agents/skills/query-telemetry`](.agents/skills/query-telemetry/SKILL.md)** — the query-telemetry skill: capture OTEL signals from the dev Collector and query them with otelq. A `.claude` shim (`.claude/skills/query-telemetry`) mirrors it for Claude Code.
+- **[`.agents/skills/integrate-collector`](.agents/skills/integrate-collector/SKILL.md)** — the integrate-collector skill: run from this repo to wire otelq's file-export pipeline into *another* project's existing Collector (the integrated setup above). It asks for the target project's absolute path and verifies the result with `otelq doctor`.
 
 The `.claude-plugin` manifest (`.claude-plugin/plugin.json`, `marketplace.json`) is an early distribution path for shipping otelq and its skill as an installable plugin.
 

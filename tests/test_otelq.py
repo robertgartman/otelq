@@ -1032,3 +1032,108 @@ def test_errors_names_gap_when_only_metrics_present() -> None:
     msg = str(exc.value)
     assert msg != otelq._NO_TELEMETRY_MSG
     assert "metrics" in msg  # names the present signal so the gap is obvious
+
+
+# --- collector-config: reference producer fragment ---------------------------
+# `otelq collector-config` emits the file-export settings to merge into an
+# existing Collector (the "integrated" setup). It is GENERATED from this
+# module's pinned constants so it can never drift from the telemetry/ contract;
+# the drift guard below ties those constants back to the shipped dev config.
+
+
+def test_collector_config_emits_pinned_values() -> None:
+    out = otelq.render_collector_config()
+    assert f"max_megabytes: {otelq.ROTATION_MAX_MEGABYTES}" in out
+    assert f"max_backups: {otelq.ROTATION_MAX_BACKUPS}" in out
+    for sig in ("traces", "logs", "metrics"):
+        assert f"path: {otelq.COLLECTOR_MOUNT_PATH}/{sig}.jsonl" in out
+        assert f"file/{sig}:" in out
+    assert "-contrib" in out  # the file exporter is contrib-only — must be flagged
+
+
+def test_collector_config_matches_dev_yaml() -> None:
+    """Drift guard: the generated fragment's contract values must match the
+    shipped reference Collector config."""
+    dev_yaml = (Path(__file__).resolve().parents[1] / "otel-collector-dev.yaml").read_text()
+    assert f"max_megabytes: {otelq.ROTATION_MAX_MEGABYTES}" in dev_yaml
+    assert f"max_backups: {otelq.ROTATION_MAX_BACKUPS}" in dev_yaml
+    for sig in ("traces", "logs", "metrics"):
+        assert f"path: {otelq.COLLECTOR_MOUNT_PATH}/{sig}.jsonl" in dev_yaml
+
+
+# --- doctor: validate a telemetry dir against the contract -------------------
+
+
+def test_doctor_ok_on_valid_dir(temp_telemetry: Path) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base)])
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base)])
+    write_jsonl(temp_telemetry / "metrics.jsonl", [make_gauge(base)])
+    rows, ok = otelq.doctor_report(temp_telemetry)
+    assert ok
+    status = {r[0]: r[1] for r in rows}
+    assert status["traces"] == "OK"
+    assert status["logs"] == "OK"
+    assert status["metrics"] == "OK"
+
+
+def test_doctor_fails_on_missing_dir(tmp_path: Path) -> None:
+    rows, ok = otelq.doctor_report(tmp_path / "does-not-exist")
+    assert not ok
+    assert rows[0][1] == "FAIL"
+
+
+def test_doctor_fails_on_no_telemetry(temp_telemetry: Path) -> None:
+    rows, ok = otelq.doctor_report(temp_telemetry)  # empty dir, no jsonl
+    assert not ok
+    assert any(r[0] == "telemetry" and r[1] == "FAIL" for r in rows)
+
+
+def test_doctor_fails_on_malformed_jsonl(temp_telemetry: Path) -> None:
+    (temp_telemetry / "traces.jsonl").write_text("not json at all\n", encoding="utf-8")
+    rows, ok = otelq.doctor_report(temp_telemetry)
+    assert not ok
+    assert any(r[0] == "traces" and r[1] == "FAIL" for r in rows)
+
+
+def test_doctor_fails_on_wrong_signal_key(temp_telemetry: Path) -> None:
+    # a logs payload written into traces.jsonl: valid JSON, wrong top-level key
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_log(base)])
+    rows, ok = otelq.doctor_report(temp_telemetry)
+    assert not ok
+    detail = {r[0]: r[2] for r in rows}
+    assert "resourceSpans" in detail["traces"]
+
+
+def test_doctor_partial_capture_is_ok(temp_telemetry: Path) -> None:
+    # only traces flowing: logs/metrics WARN but the dir is still usable.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base)])
+    rows, ok = otelq.doctor_report(temp_telemetry)
+    assert ok
+    status = {r[0]: r[1] for r in rows}
+    assert status["traces"] == "OK"
+    assert status["logs"] == "WARN"
+    assert status["metrics"] == "WARN"
+
+
+def test_doctor_exit_codes_via_main(temp_telemetry: Path, tmp_path: Path) -> None:
+    import io as _io
+    from contextlib import redirect_stdout
+
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base)])
+    with redirect_stdout(_io.StringIO()):
+        assert otelq.main(["--dir", str(temp_telemetry), "doctor"]) == 0
+        assert otelq.main(["--dir", str(tmp_path / "nope"), "doctor"]) == 1
+
+
+def test_collector_config_via_main_prints_fragment() -> None:
+    import io as _io
+    from contextlib import redirect_stdout
+
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        assert otelq.main(["collector-config"]) == 0
+    assert "exporters:" in buf.getvalue()

@@ -83,6 +83,8 @@ __all__ = [
     "cmd_trace",
     "cmd_logs",
     "cmd_metric",
+    "render_collector_config",
+    "doctor_report",
     "CACHE_DIRNAME",
     "PENDING_DIRNAME",
     "CURSOR_FILENAME",
@@ -102,6 +104,23 @@ SIGNAL_GLOBS = {
     "traces": "traces*.jsonl",
     "logs": "logs*.jsonl",
     "metrics": "metrics*.jsonl",
+}
+
+# --- Reference producer (collector-config / doctor) --------------------------
+# The Collector that writes the telemetry/ contract is interchangeable (see
+# CONTRACT-telemetry-directory: any conformant producer interoperates). otelq
+# ships the reference producer settings here so `otelq collector-config` emits
+# exactly the pinned values the consumer expects, generated — never hand-copied
+# — so they cannot drift from this module. These MUST stay in lockstep with
+# otel-collector-dev.yaml and the contract; a test asserts they match.
+COLLECTOR_MOUNT_PATH = "/telemetry"  # producer-side bind-mount target
+ROTATION_MAX_MEGABYTES = 50  # rotation threshold per active file (< 100 MB reader cap)
+ROTATION_MAX_BACKUPS = 5  # retained rotated backups per signal
+# The OTLP/JSON top-level key each signal's lines must carry (contract framing).
+OTLP_TOP_LEVEL_KEY = {
+    "traces": "resourceSpans",
+    "logs": "resourceLogs",
+    "metrics": "resourceMetrics",
 }
 
 # read_otlp_* corrupts memory above 2048 output rows; _SAFE_CHUNK leaves a
@@ -1269,6 +1288,111 @@ def cmd_metric(
     return columns, rows
 
 
+def render_collector_config() -> str:
+    """Emit the reference file-export fragment to merge into a Collector.
+
+    Generated from this module's pinned constants so the rotation thresholds and
+    paths can never drift from the telemetry/ contract. Serves both humans and
+    AI agents wiring otelq into an existing (integrated) Collector.
+    """
+    signals = ("traces", "logs", "metrics")
+    exporters: list[str] = ["exporters:"]
+    for sig in signals:
+        exporters += [
+            f"  file/{sig}:",
+            f"    path: {COLLECTOR_MOUNT_PATH}/{sig}.jsonl",
+            "    flush_interval: 1s",
+            "    rotation:",
+            f"      max_megabytes: {ROTATION_MAX_MEGABYTES}",
+            f"      max_backups: {ROTATION_MAX_BACKUPS}",
+        ]
+    pipelines: list[str] = ["service:", "  pipelines:"]
+    for sig in signals:
+        pipelines += [
+            f"    {sig}:",
+            f"      # add file/{sig} alongside your existing {sig} exporters",
+            f"      exporters: [file/{sig}]",
+        ]
+    return "\n".join(
+        [
+            "# ── otelq collector integration ─────────────────────────────────────────────",
+            "# Make an existing OpenTelemetry Collector write the telemetry/ contract that",
+            "# otelq reads. Requires the *-contrib collector image: the `file` exporter is",
+            "# not in the core distribution.",
+            "#",
+            "# 1) Merge these exporters into your collector config:",
+            "",
+            *exporters,
+            "",
+            "# 2) Wire them into your existing pipelines (keep your current exporters too):",
+            "",
+            *pipelines,
+            "",
+            "# 3) Bind-mount a host telemetry dir into the collector service (compose):",
+            "#",
+            "#      volumes:",
+            f"#        - ./telemetry:{COLLECTOR_MOUNT_PATH}",
+            "#",
+            "# 4) Query it, pointing otelq at that dir:",
+            "#",
+            "#      otelq --dir ./telemetry summary",
+            "#      otelq --dir ./telemetry doctor      # verify the wiring",
+        ]
+    )
+
+
+def _validate_active_file(path: Path, signal: str) -> tuple[str, str]:
+    """Check one signal's active .jsonl against the contract framing."""
+    if not path.exists():
+        return "WARN", "active file absent (only rotated backups present)"
+    if path.stat().st_size == 0:
+        return "WARN", "empty — no batches written yet"
+    key = OTLP_TOP_LEVEL_KEY[signal]
+    try:
+        with path.open(encoding="utf-8") as fh:
+            first = fh.readline()
+        obj = json.loads(first)
+    except (OSError, json.JSONDecodeError) as exc:
+        return "FAIL", f"first line is not valid OTLP/JSON: {exc}"
+    if not isinstance(obj, dict) or key not in obj:
+        return "FAIL", f"first line missing top-level '{key}' (wrong signal or format)"
+    return "OK", f"valid OTLP/JSON ('{key}' present)"
+
+
+def doctor_report(telemetry_dir: Path) -> tuple[list[Row], bool]:
+    """Check a telemetry dir against the contract. Returns (rows, ok)."""
+    rows: list[Row] = []
+    if not telemetry_dir.is_dir():
+        rows.append(("directory", "FAIL", f"{telemetry_dir} does not exist"))
+        return rows, False
+    rows.append(("directory", "OK", str(telemetry_dir)))
+
+    any_files = False
+    ok = True
+    for signal in ("traces", "logs", "metrics"):
+        files = sorted(glob.glob(str(telemetry_dir / SIGNAL_GLOBS[signal])))
+        if not files:
+            rows.append((signal, "WARN", "no files — this signal is not being captured"))
+            continue
+        any_files = True
+        status, detail = _validate_active_file(telemetry_dir / f"{signal}.jsonl", signal)
+        if status == "FAIL":
+            ok = False
+        rows.append((signal, status, detail))
+
+    if not any_files:
+        rows.append(
+            ("telemetry", "FAIL", "no *.jsonl found — is the collector running and exporting?")
+        )
+        ok = False
+
+    cache = telemetry_dir / CACHE_DIRNAME
+    rows.append(
+        (".otelq-cache", "INFO", "present" if cache.is_dir() else "absent (built on first query)")
+    )
+    return rows, ok
+
+
 COMMANDS: dict[str, Command] = {
     "summary": cmd_summary,
     "sql": cmd_sql,
@@ -1332,11 +1456,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_metric = sub.add_parser("metric", help="time series for one metric")
     p_metric.add_argument("name", help="metric name")
     add_since(p_metric)
+    sub.add_parser(
+        "collector-config",
+        help="print the file-export fragment to add to an existing Collector",
+    )
+    sub.add_parser(
+        "doctor",
+        help="check that --dir satisfies the telemetry contract",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "collector-config":
+        print(render_collector_config())
+        return 0
+    if args.command == "doctor":
+        rows, ok = doctor_report(args.dir)
+        print(format_output(["check", "status", "detail"], rows, args.format))
+        return 0 if ok else 1
     try:
         columns, rows = run_command(args)
     except NoTelemetryError as exc:
