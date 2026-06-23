@@ -29,6 +29,8 @@ semantic_tags:
   - integration
   - collector-config
   - doctor
+  - verification
+  - telemetrygen
   - observability
 ---
 
@@ -89,6 +91,20 @@ subtree. The `just otel-*` recipes — `otel-clean` in particular, which truncat
 the active `.jsonl` files — are **standalone-only** and must not be run against an
 integrated directory.
 
+**Verification probe (bounded exception to the boundary).** Confirming an
+integration may use a *transient* synthetic producer — a `telemetrygen` Compose
+service added to the target, run against its Collector over the project network,
+then reverted — so a project can prove the wiring end-to-end without exercising its
+app. This does not breach the lifecycle boundary: it adds a throwaway *client*, not
+management of the Collector, and leaves nothing committed to the target after revert.
+Because
+a Collector pipeline fans every item out to all of its exporters, synthetic data
+injected into a teed pipeline also reaches that pipeline's other, real exporters; so
+the probe is gated on the teed pipeline's exporter set — unrestricted when only
+`file/*` exporters share the pipeline, flagged when a real backend does. This is
+operational guidance owned by the `integrate-collector` skill; **`doctor` itself
+stays a pure, read-only conformance check and never generates data.**
+
 ## Alternatives Considered
 
 - **Ship a static example fragment to copy.** Rejected: a copied snippet drifts
@@ -113,6 +129,10 @@ integrated directory.
   a test.
 - `doctor` gives close-the-loop agents a contract-conformance gate with a
   meaningful exit code, turning "did integration work?" into one command.
+- Integration can be verified without app traffic via a transient, self-reverting
+  synthetic probe; because `doctor` stays generation-free, the conformance gate and
+  the data-injection step remain separate concerns, and the probe's reach is bounded
+  by the teed pipeline's exporter set.
 - The standalone-only scope of the `just otel-*` recipes must be stated wherever
   integration is documented, because `otel-clean` against a project-owned dir
   would destroy that project's telemetry.
