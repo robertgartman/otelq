@@ -1,7 +1,6 @@
 # otelq
 
 [![CI](https://github.com/robertgartman/otelq/actions/workflows/ci.yml/badge.svg)](https://github.com/robertgartman/otelq/actions/workflows/ci.yml)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/robertgartman/otelq/badge)](https://scorecard.dev/viewer/?uri=github.com/robertgartman/otelq)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Give your AI coding agent eyes on your app's traces, logs, and metrics.**
