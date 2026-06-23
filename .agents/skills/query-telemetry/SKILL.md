@@ -1,6 +1,6 @@
 ---
 name: query-telemetry
-description: "Use when debugging backend or frontend behaviour, or verifying that instrumentation works — captures OTEL traces, logs, and metrics from the local dev Collector and queries them with the otelq CLI."
+description: "Query logs, metrics, and traces captured from the OpenTelemetry feed using the otelq CLI."
 ---
 
 # Query Telemetry
@@ -9,26 +9,50 @@ Inspect real OpenTelemetry signals from the running system. Use this to close
 the loop after a change: run the code, then confirm from telemetry that it
 behaved as intended.
 
+## Running otelq
+
+Throughout this skill, **`otelq …`** is shorthand for running the CLI straight
+from the repo with `uvx` — no `just`, no global install, no clone:
+
+```
+uvx --from git+https://github.com/robertgartman/otelq otelq --dir telemetry …
+```
+
+- `uvx` fetches and runs otelq in an isolated environment. The **first** run
+  clones + builds it, and otelq then fetches the DuckDB `otlp` community
+  extension; both are cached, so later runs are fast (and the build needs
+  network once).
+- `--dir telemetry` is required. It is a *global* flag and points otelq at the
+  Collector's output folder (the repo's `telemetry/`). Because `uvx` runs otelq
+  from an isolated build, the default would not resolve to the repo — always
+  pass `--dir`.
+- To pin a version, append a ref: `…/otelq@v0.1.0 otelq …`.
+
+The Collector itself is still brought up and reset with `just` (see The loop) —
+only the otelq *queries* run through `uvx`.
+
 ## The loop
 
 1. **Start the dev stack** (the Collector starts with it): `just otel-up`
 2. **Enable export:** ensure `OTEL_ENABLED=true` in `.env`, then (re)start the
    app(s) you are exercising.
 3. **Reproduce** the behaviour (hit an endpoint, run a flow, run a test).
-4. **Query:** `just otelq --format json <command>` (the `--format` flag goes
-   *before* the subcommand — see Commands below)
+4. **Query:** `otelq --format json <command>` (the `--format` flag goes *before*
+   the subcommand — see Commands below).
 5. **Inspect** the JSON, then iterate.
 
 ## Commands
 
-Run `just otelq <command>`. For parseable output add `--format json`.
+Run `otelq <command>` (the shorthand above). For parseable output add
+`--format json`.
 
-> **Argument order matters.** `--format` is a *global* flag, so it must come
-> **before** the subcommand — correct: `just otelq --format json errors`;
-> wrong: `just otelq errors --format json`. The wrong order fails with
-> `otelq: error: unrecognized arguments: --format json`. Subcommand-specific
-> flags (`--since`, `--top`, `--service`, etc.) still go *after* the
-> subcommand. (`table` is the default format; `csv` is also available.)
+> **Argument order matters.** `--dir` and `--format` are *global* flags, so they
+> must come **before** the subcommand — correct:
+> `otelq --format json errors`; wrong: `otelq errors --format json`. The wrong
+> order fails with `otelq: error: unrecognized arguments: --format json`.
+> Subcommand-specific flags (`--since`, `--top`, `--service`, etc.) still go
+> *after* the subcommand. (`table` is the default format; `csv` is also
+> available.)
 
 - `summary` — counts and time span per signal; the "is anything captured?" check
 - `errors [--since 10m]` — error-status spans and ERROR/FATAL logs
@@ -37,10 +61,8 @@ Run `just otelq <command>`. For parseable output add `--format json`.
 - `logs [--service X] [--level ERROR] [--grep text]` — filtered log records
 - `metric <name>` — time series for one metric
 - `sql "<query>"` — ad-hoc SQL over the views `traces`, `logs`, `metrics`,
-  `metrics_gauge`, `metrics_sum`. Use the dedicated recipe:
-  `just otelq-sql "SELECT count(*) FROM traces"`. (`just otelq sql "..."` breaks
-  on any whitespace due to variadic word-splitting; `uv run otelq.py
-  sql "..."` also works as a fallback.)
+  `metrics_gauge`, `metrics_sum`, e.g.
+  `otelq sql "SELECT count(*) FROM traces"`.
 
 Always prefer `--format json` so output is parsed structurally, not scraped.
 

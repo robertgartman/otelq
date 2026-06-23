@@ -26,7 +26,7 @@ Creates `telemetry/` and brings up the dev OTel Collector (OTLP gRPC `:4317` / H
 - **No solution-name leakage** — keep code neutral; do not embed any external/solution project name in otelq code or filenames.
 
 **5. Common pitfalls** (cost you cycles if missed):
-- `--format` is a **GLOBAL** flag and must precede the subcommand: `otelq --format json summary` ✅, not `otelq summary --format json` ❌.
+- `--format` is a **GLOBAL** flag and must precede the subcommand: `just otelq --format json summary` ✅, not `just otelq summary --format json` ❌.
 - The `duckdb-otlp` community extension is fetched from `community-extensions.duckdb.org` on **first run** (network once, then cached). A first invocation on a fresh machine needs connectivity.
 - The `otlp` community extension **lags DuckDB releases** — this is why the pin is exact (see ADR-003). Confirm the extension exists for a target version before any bump.
 - `just otel-clean` **stops the Collector before truncating** the active jsonl files, then restarts it. The Collector holds those fds open; `rm`-ing or live-truncating them while it runs orphans the fd / leaves a NUL hole and silently loses low-volume logs/metrics. Use the recipe; don't clear `telemetry/` by hand.

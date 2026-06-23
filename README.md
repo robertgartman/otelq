@@ -12,7 +12,7 @@ otelq is a tiny command-line tool that turns the OpenTelemetry signals your appl
 
 - **Built for AI coding agents.** Feed close-the-loop verification with real traces, logs, and metrics from any OpenTelemetry-compliant app: make a change, run it, and let the agent confirm from telemetry that it actually worked.
 - **Lightweight, fast, token-efficient.** A single-file CLI invoked on demand — structured `json`/`csv`/`table` output an agent can parse, not dashboards to scrape. No always-on services burning resources or context.
-- **Zero heavy infrastructure.** A stock OpenTelemetry Collector writes signals to plain JSONL files; otelq reads them in-process with DuckDB. Nothing to deploy, nothing to run between queries. `just otel-demo` gets you querying real signals in seconds.
+- **Zero heavy infrastructure.** A stock OpenTelemetry Collector writes signals to plain JSONL files; otelq reads them in-process with DuckDB. Nothing to deploy, nothing to run between queries. A one-shot bundled demo gets you querying real signals in seconds.
 - **Fully local, fully isolated.** Telemetry never leaves your machine — it lives in a directory you own and read directly. Nothing is shipped to a backend, a vendor, or the cloud.
 
 ## Give it a try
@@ -78,39 +78,45 @@ Your application(s) send OpenTelemetry over OTLP to a Collector running in Docke
 
 The bind-mounted directory is the entire contract: the Collector writes `traces.jsonl`, `logs.jsonl`, and `metrics.jsonl`; otelq reads those same files. There is no network coupling between the Collector and the CLI — the shared directory is the API.
 
-### Collector: standalone or integrated
+### Integrating with your Collector
 
-The Collector is interchangeable — otelq is a pure consumer of the telemetry directory, so any conformant producer works. There are two setups (see [`context/adr/ADR-007`](context/adr/ADR-007-dual-collector-standalone-and-integrated.md)):
+otelq is a pure *consumer* of the telemetry directory — it never owns or runs a Collector. In any real setup the Collector belongs to **your** project: it is the one your application already sends OTLP to. You connect otelq by **teeing that Collector's output to a directory otelq can read** — add otelq's `file` exporters to the Collector so it also writes `traces.jsonl` / `logs.jsonl` / `metrics.jsonl`, then point otelq at that directory. otelq never starts, stops, or cleans that Collector; it only reads the files and owns its `.otelq-cache/` subtree.
 
-- **Standalone** — `just otel-up` runs otelq's bundled Collector. Best for a project with no telemetry stack, or a quick demo.
-- **Integrated** — another project on the same host already runs its own Collector. Add otelq's file-export pipeline to *that project's* Collector instead of running a second one. The direction matters: you work **from the otelq repo** and integrate otelq **into the target project** (identified by its absolute path, e.g. `/Users/me/dev/my-service`) — not the other way around.
+The direction matters: you work **from the otelq repo** and integrate otelq **into your target project** (identified by its absolute path, e.g. `/Users/me/dev/my-service`) — not the other way around.
 
-  ```sh
-  otelq collector-config                      # run in the otelq repo: prints the exporters + pipeline wiring
-  # ...paste the fragment into the TARGET project's Collector config, bind-mount its ./telemetry, restart...
-  otelq --dir /Users/me/dev/my-service/telemetry doctor    # verify the target's wiring satisfies the contract
-  ```
+```sh
+# otelq runs straight from GitHub via uvx — no clone, no install:
+alias otelq="uvx --from git+https://github.com/robertgartman/otelq otelq"
 
-  `collector-config` is generated from otelq's pinned constants, so it never drifts from the contract. The `file` exporter requires the `*-contrib` Collector image. In integrated mode otelq never manages the target's Collector — the `just otel-*` recipes (especially `otel-clean`) are standalone-only. The **integrate-collector** skill automates this and asks for the target project's path; see below.
+otelq collector-config                      # prints the exporters + pipeline wiring to add
+# ...paste the fragment into your project's Collector config, bind-mount its ./telemetry, restart...
+otelq --dir /Users/me/dev/my-service/telemetry doctor    # verify your wiring satisfies the contract
+```
+
+`collector-config` is generated from otelq's pinned constants, so it never drifts from the contract; `doctor` checks a telemetry directory against it. The `file` exporter requires the `*-contrib` Collector image. The **integrate-collector** skill automates all of this and asks for the target project's path; see below.
+
+> **No Collector yet?** otelq bundles one purely so you can try the tool without instrumenting anything — see [Give it a try](#give-it-a-try). That bundled stack (and the Compose files and optional `just` recipes that manage it) is a **demo and local-dev aid, not a deployment model**: in real use the Collector lives in your project, and otelq just reads what it writes.
 
 ## Quickstart
 
 ```sh
-# 1. Start the dev Collector (OTLP gRPC :4317 / HTTP :4318)
-just otel-up
+# 1. Start the bundled dev Collector (OTLP gRPC :4317 / HTTP :4318)
+docker compose --profile otel up -d
 
 # 2. Point the app you are debugging at the Collector and run it
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 #    ...then run your app so it emits telemetry...
 
-# 3. Query what was captured
-just otelq summary
-just otelq --format json errors
-just otelq slow --top 10
-just otelq trace <trace_id>
+# 3. Query what was captured — uv runs the single-file CLI, no install
+uv run otelq.py summary
+uv run otelq.py --format json errors
+uv run otelq.py slow --top 10
+uv run otelq.py trace <trace_id>
 ```
 
-Run `just otel-clean` to reset captured telemetry (empties the active JSONL files in place, drops rotated backups, and clears the otelq cache). Run `just otel-down` to stop the Collector. To see otelq work without instrumenting an app, use the demo in [Give it a try](#give-it-a-try) above.
+Stop the Collector with `docker compose --profile otel down`. To see otelq work without instrumenting an app, use the demo in [Give it a try](#give-it-a-try) above.
+
+> **Optional `just` shortcuts.** If you have [`just`](https://github.com/casey/just) installed, the repo's [`justfile`](justfile) wraps all of the above — `just otel-up`, `just otelq summary`, `just otel-down`, and `just otel-clean` (a *safe* telemetry reset that stops the Collector before truncating its open files, then clears the cache). They are a convenience, not a requirement.
 
 ## Install / run options
 
@@ -127,12 +133,12 @@ uvx otelq summary          # ephemeral, no install
 pipx install otelq         # persistent install
 ```
 
-**(c) Clone the repo** for the full dev setup — the Collector compose file and the `justfile`:
+**(c) Clone the repo** for the bundled dev Collector (the Compose stack, plus an optional `justfile` of shortcuts):
 
 ```sh
 git clone https://github.com/robertgartman/otelq
 cd otelq
-just otel-up
+docker compose --profile otel up -d
 ```
 
 ## Commands

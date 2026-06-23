@@ -8,7 +8,7 @@
 #
 # The demo collector publishes NO host ports: the generators reach it over the
 # Docker project network, not via localhost. So clear the host-port mapping here.
-# This lets the demo run even when another project's collector already owns host
+# This lets the demo run even when your project's collector already owns host
 # ports 4317/4318 — the demo never competes for them. (Standalone `just otel-up`
 # still publishes 4317/4318 for a real app on the host; only the demo drops them.)
 name: otelq-demo

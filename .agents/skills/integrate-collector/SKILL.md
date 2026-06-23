@@ -1,9 +1,9 @@
 ---
 name: integrate-collector
-description: "Use from the otelq repo to wire otelq into ANOTHER project on the same host — adds otelq's file-export pipeline to that project's existing OpenTelemetry Collector so otelq can read its telemetry. Asks for the target project's absolute path."
+description: "Use from the otelq repo to wire otelq into your project on the same host — adds otelq's file-export pipeline to your project's existing OpenTelemetry Collector so otelq can read its telemetry. Asks for the target project's absolute path."
 ---
 
-# Integrate otelq with another project's Collector
+# Integrate otelq with your project's Collector
 
 **Direction (important):** this skill runs **from the otelq repository** and
 operates on a **different target project elsewhere on the same host**. otelq is
@@ -15,8 +15,9 @@ to the **target project's** Collector so otelq can read what that project emits.
 project** (the project whose Collector should be wired up), e.g.
 `/Users/me/dev/my-service`. Call it `$TARGET`. Every file you read or edit in the
 steps below lives under `$TARGET` — **never** edit files inside the otelq repo for
-this task. The only otelq-repo command you run is `otelq collector-config`, which
-just *prints* the fragment to paste into `$TARGET`.
+this task. The only otelq command you run is `otelq collector-config` (run via
+`uvx` — see **Running otelq** below), which just *prints* the fragment to paste
+into `$TARGET`.
 
 otelq reads OTLP signals as JSONL from a shared `telemetry/` directory — that
 directory is the entire contract (see
@@ -44,6 +45,20 @@ aid for this project, not part of any integration. Into `$TARGET` you add **only
 the three `file/*` exporters, the pipeline wiring, and the bind mount — nothing
 else. The real telemetry comes from `$TARGET`'s own application; telemetrygen has
 no place there.
+
+## Running otelq
+
+Throughout this skill, **`otelq …`** is shorthand for running the CLI straight
+from GitHub with `uvx` — no clone, no global install:
+
+```
+uvx --from git+https://github.com/robertgartman/otelq otelq …
+```
+
+The first run builds otelq and fetches the DuckDB `otlp` community extension
+(network once, then cached). For the `doctor` / `summary` checks below, pass
+`--dir $TARGET/telemetry` so otelq reads the target project's output folder. To
+pin a version, append a ref: `…/otelq@v0.1.0 otelq …`.
 
 ## Steps
 
