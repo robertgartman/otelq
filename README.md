@@ -4,9 +4,16 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/robertgartman/otelq/badge)](https://scorecard.dev/viewer/?uri=github.com/robertgartman/otelq)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Feed your agentic development setup with Open Telemetry**
+**Give your AI coding agent eyes on your app's traces, logs, and metrics.**
 
-otelq is a tiny CLI that queries the OpenTelemetry traces, logs, and metrics your app emits locally. A stock OpenTelemetry Collector captures those signals to plain JSONL files on disk, and otelq reads them directly with DuckDB — no Jaeger, no SigNoz, no Grafana, no server, and no UI. It is built for the inner development loop and for AI coding agents doing close-the-loop verification: run the app, then ask "did the request error?", "what was slow?", "show me trace X" straight from the terminal.
+otelq is a tiny command-line tool that turns the OpenTelemetry signals your application already emits into answers — straight from the terminal, in the same loop your AI agent codes in. Run the app, then ask *"did the request error?"*, *"what was slow?"*, *"show me trace X"* and get a structured answer back. No Jaeger, no Grafana, no SigNoz, no server, no UI.
+
+## Why otelq
+
+- **Built for AI coding agents.** Feed close-the-loop verification with real traces, logs, and metrics from any OpenTelemetry-compliant app: make a change, run it, and let the agent confirm from telemetry that it actually worked.
+- **Lightweight, fast, token-efficient.** A single-file CLI invoked on demand — structured `json`/`csv`/`table` output an agent can parse, not dashboards to scrape. No always-on services burning resources or context.
+- **Zero heavy infrastructure.** A stock OpenTelemetry Collector writes signals to plain JSONL files; otelq reads them in-process with DuckDB. Nothing to deploy, nothing to run between queries. `just otel-demo` gets you querying real signals in seconds.
+- **Fully local, fully isolated.** Telemetry never leaves your machine — it lives in a directory you own and read directly. Nothing is shipped to a backend, a vendor, or the cloud.
 
 ## Architecture
 
