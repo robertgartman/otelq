@@ -15,13 +15,68 @@ otelq is a tiny command-line tool that turns the OpenTelemetry signals your appl
 - **Zero heavy infrastructure.** A stock OpenTelemetry Collector writes signals to plain JSONL files; otelq reads them in-process with DuckDB. Nothing to deploy, nothing to run between queries. `just otel-demo` gets you querying real signals in seconds.
 - **Fully local, fully isolated.** Telemetry never leaves your machine — it lives in a directory you own and read directly. Nothing is shipped to a backend, a vendor, or the cloud.
 
+## Give it a try
+
+See it work in under a minute — no app to instrument. Clone the repo and run the demo: it starts the Collector and pushes ~15s of synthetic traces, metrics, and logs through it with [telemetrygen](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen), the official OpenTelemetry load generator.
+
+```sh
+git clone https://github.com/robertgartman/otelq
+cd otelq
+```
+
+**With [`just`](https://github.com/casey/just)** — a small command runner (`brew install just`, `cargo install just`, or see its repo):
+
+```sh
+just otel-demo            # Collector + generators, then waits for the flush
+just otelq summary        # counts and time span per signal
+just otelq metric gen     # the synthetic gauge from the demo
+just otel-down            # stop and clean up
+```
+
+**Or with plain Docker Compose** — no command runner needed:
+
+```sh
+# start the Collector (no published host ports) and run the generators
+docker compose -f compose.yaml -f compose.demo.yaml --profile otel up -d
+docker compose -f compose.yaml -f compose.demo.yaml --profile demo up
+sleep 7                                    # let the Collector flush its 5s batch
+
+uv run otelq.py summary                    # uv runs the single-file CLI — no install
+uv run otelq.py metric gen
+
+docker compose -f compose.yaml -f compose.demo.yaml --profile otel --profile demo down
+```
+
+Both paths need [Docker](https://www.docker.com/) and [uv](https://docs.astral.sh/uv/); the `just` path additionally needs [`just`](https://github.com/casey/just). The demo generators live **only in this repo** as a testing aid — they are never part of integrating otelq into your own project.
+
 ## Architecture
 
-```
-  your app  --OTLP-->  Collector (Docker)  --writes-->  ./telemetry/*.jsonl  --read by-->  otelq (host CLI)
+At runtime, every component lives on your machine:
+
+```mermaid
+flowchart TB
+  subgraph host["Local host — nothing leaves your machine"]
+    apps["Applications generating OpenTelemetry<br/>(your services, tests, scripts)"]
+    collector["OpenTelemetry Collector<br/>· Docker container ·"]
+    skill["query-telemetry skill"]
+    otelq["otelq · host CLI"]
+
+    subgraph project["Your project"]
+      signals["telemetry/<br/>traces.jsonl · logs.jsonl · metrics.jsonl"]
+      cache["telemetry/.otelq-cache/<br/>parquet query cache"]
+    end
+  end
+
+  apps -->|"OTLP · gRPC :4317 / HTTP :4318"| collector
+  collector -->|"writes JSONL · bind mount"| signals
+  skill -->|invokes| otelq
+  otelq -->|reads| signals
+  otelq -->|"reads / writes"| cache
 ```
 
-The bind-mounted directory is the entire contract. The Collector writes OTLP signals as `traces.jsonl`, `logs.jsonl`, and `metrics.jsonl`; otelq reads those same files. There is no network coupling between the Collector and the CLI — the shared directory is the API.
+Your application(s) send OpenTelemetry over OTLP to a Collector running in Docker. The Collector writes each signal as plain JSONL into a `telemetry/` directory bind-mounted from your project. otelq runs on the host — invoked directly or by the `query-telemetry` skill — and reads those `.jsonl` files in-process with DuckDB, keeping an incremental parquet cache under `telemetry/.otelq-cache/` for fast repeat queries.
+
+The bind-mounted directory is the entire contract: the Collector writes `traces.jsonl`, `logs.jsonl`, and `metrics.jsonl`; otelq reads those same files. There is no network coupling between the Collector and the CLI — the shared directory is the API.
 
 ### Collector: standalone or integrated
 
@@ -55,22 +110,7 @@ just otelq slow --top 10
 just otelq trace <trace_id>
 ```
 
-Run `just otel-clean` to reset captured telemetry (empties the active JSONL files in place, drops rotated backups, and clears the otelq cache). Run `just otel-down` to stop the Collector.
-
-### Try it without an app (demo)
-
-No app to instrument yet? Generate synthetic telemetry with one command:
-
-```sh
-just otel-demo        # starts the Collector, then runs telemetrygen for ~15s
-just otelq summary    # now there is traces + metrics + logs data to query
-just otelq slow --top 5
-just otelq metric gen # the synthetic gauge telemetrygen emits
-```
-
-`just otel-demo` brings up the Collector and runs [telemetrygen](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen) — the official OpenTelemetry load generator, part of `opentelemetry-collector-contrib` — under the `demo` Compose profile to push ~15s of synthetic **traces, metrics, and logs** through the Collector, populating `telemetry/`. It's the fastest way to exercise otelq and the `query-telemetry` skill on a fresh clone.
-
-> The demo generators live **only in this repo** as a testing aid. They are **not** part of integrating otelq into another project — that path adds only the Collector's file exporters (see [Collector: standalone or integrated](#collector-standalone-or-integrated)), never telemetrygen.
+Run `just otel-clean` to reset captured telemetry (empties the active JSONL files in place, drops rotated backups, and clears the otelq cache). Run `just otel-down` to stop the Collector. To see otelq work without instrumenting an app, use the demo in [Give it a try](#give-it-a-try) above.
 
 ## Install / run options
 
