@@ -1,0 +1,19 @@
+# Standalone dev OpenTelemetry Collector for otelq.
+#
+# The contract is the bind mount: the Collector writes OTLP signals as JSONL into
+# ./telemetry on the host, and the otelq CLI reads those same files. There is no
+# network coupling between collector and CLI — the shared directory IS the API.
+#
+# The "otel" profile keeps the Collector opt-in: it only starts when explicitly
+# selected (`docker compose --profile otel up`), so `docker compose up` alone is a no-op.
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.119.0
+    profiles: ["otel"]
+    container_name: otel-collector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-dev.yaml:/etc/otelcol/config.yaml:ro
+      - ./telemetry:/telemetry
+    ports: ["4317:4317", "4318:4318"]
+    restart: unless-stopped

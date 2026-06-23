@@ -1,0 +1,64 @@
+# Dev OpenTelemetry Collector — writes OTLP traces/logs/metrics as JSONL to /telemetry
+# for the otelq CLI. See context/adr/ADR-004 and context/contract/CONTRACT-telemetry-directory.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins:
+            - "http://localhost:*"
+            - "https://localhost:*"
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 128
+    spike_limit_mib: 32
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+    send_batch_max_size: 1024
+
+exporters:
+  file/traces:
+    path: /telemetry/traces.jsonl
+    flush_interval: 1s
+    rotation:
+      max_megabytes: 50
+      max_backups: 5
+  file/logs:
+    path: /telemetry/logs.jsonl
+    flush_interval: 1s
+    rotation:
+      max_megabytes: 50
+      max_backups: 5
+  file/metrics:
+    path: /telemetry/metrics.jsonl
+    flush_interval: 1s
+    rotation:
+      max_megabytes: 50
+      max_backups: 5
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [file/traces, debug]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [file/logs, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [file/metrics, debug]
+  telemetry:
+    logs:
+      level: info

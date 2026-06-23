@@ -1,0 +1,35 @@
+# Publishes otelq to PyPI via Trusted Publishing (OIDC) — no token/password.
+#
+# PREREQUISITE: Before the first release can succeed, a Trusted Publisher must
+# be registered on PyPI for the project (https://pypi.org/manage/account/publishing/):
+#   - Workflow filename: release.yml
+#   - Environment name:  pypi
+# Until that publisher is registered, the publish step will fail.
+
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  pypi-publish:
+    name: Build and publish to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/otelq
+    permissions:
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

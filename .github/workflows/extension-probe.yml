@@ -1,0 +1,32 @@
+# Early-warning probe: verifies the pinned DuckDB still has a published
+# 'otlp' community extension build (the #1 fragility — see context/adr/ADR-003).
+#
+# If this goes red, the pinned DuckDB version no longer has a matching
+# duckdb-otlp build — see context/adr/ADR-003 before bumping.
+
+name: Extension Probe
+
+on:
+  schedule:
+    - cron: "0 7 * * 1"   # weekly, Mondays 07:00 UTC
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: otlp extension probe (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Probe otlp community extension for duckdb 1.5.3
+        # Fails loudly (non-zero exit) if INSTALL or LOAD raises.
+        run: |
+          uv run --with "duckdb==1.5.3" python -c "import duckdb; c=duckdb.connect(); c.execute(\"INSTALL otlp FROM community\"); c.execute(\"LOAD otlp\"); print(\"otlp extension OK for duckdb 1.5.3\")"

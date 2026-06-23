@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: lint + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Ruff check
+        run: uvx ruff check .
+
+      - name: Pytest
+        # GitHub runners have outbound network to fetch the duckdb-otlp
+        # community extension at runtime.
+        env:
+          PYTHONPATH: .
+        run: uv run --with pytest --with "duckdb==1.5.3" pytest tests/ -v

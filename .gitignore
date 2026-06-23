@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- otelq runtime telemetry capture (Collector output + query cache) — never committed ---
+/telemetry/*
+!/telemetry/.gitkeep
