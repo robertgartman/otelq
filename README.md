@@ -93,7 +93,7 @@ otelq collector-config                      # prints the exporters + pipeline wi
 otelq --dir /Users/me/dev/my-service/telemetry doctor    # verify your wiring satisfies the contract
 ```
 
-`collector-config` is generated from otelq's pinned constants, so it never drifts from the contract; `doctor` checks a telemetry directory against it. The `file` exporter requires the `*-contrib` Collector image. The **integrate-collector** skill automates all of this and asks for the target project's path; see below. When exercising your own app is inconvenient, the skill can also confirm the wiring end-to-end with a throwaway [`telemetrygen`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen) probe — committed, run against your Collector over its own network, then reverted — flagging first if the teed pipeline also feeds a real backend.
+`collector-config` is generated from otelq's pinned constants, so it never drifts from the contract; `doctor` checks a telemetry directory against it. The `file` exporter requires the `*-contrib` Collector image. The **otelq-collector-setup** skill automates all of this and asks for the target project's path; see below. When exercising your own app is inconvenient, the skill can also confirm the wiring end-to-end with a throwaway [`telemetrygen`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen) probe — committed, run against your Collector over its own network, then reverted — flagging first if the teed pipeline also feeds a real backend.
 
 > **No Collector yet?** otelq bundles one purely so you can try the tool without instrumenting anything — see [Give it a try](#give-it-a-try). That bundled stack (and the Compose files and optional `just` recipes that manage it) is a **demo and local-dev aid, not a deployment model**: in real use the Collector lives in your project, and otelq just reads what it writes.
 
@@ -176,7 +176,7 @@ This repo is built to be driven by AI coding agents:
 - **[`AGENTS.md`](AGENTS.md)** — start here. The entry point for agents working in this repo.
 - **[`context/CONTEXT.md`](context/CONTEXT.md)** — the documentation system (PRD / SPEC / ADR / CONTRACT routing rules).
 - **[`.agents/skills/query-telemetry`](.agents/skills/query-telemetry/SKILL.md)** — the query-telemetry skill: capture OTEL signals from the dev Collector and query them with otelq. A `.claude` shim (`.claude/skills/query-telemetry`) mirrors it for Claude Code.
-- **[`.agents/skills/integrate-collector`](.agents/skills/integrate-collector/SKILL.md)** — the integrate-collector skill: run from this repo to wire otelq's file-export pipeline into *another* project's existing Collector (the integrated setup above). It asks for the target project's absolute path and verifies the result with `otelq doctor`.
+- **[`.agents/skills/otelq-collector-setup`](.agents/skills/otelq-collector-setup/SKILL.md)** — the otelq-collector-setup skill: run from this repo to wire otelq's file-export pipeline into *another* project's existing Collector (the integrated setup above). It asks for the target project's absolute path and verifies the result with `otelq doctor`.
 
 The `.claude-plugin` manifest (`.claude-plugin/plugin.json`, `marketplace.json`) is an early distribution path for shipping otelq and its skill as an installable plugin.
 
@@ -198,6 +198,20 @@ the PR checklist. Participation is governed by the
 [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md); report vulnerabilities per
 [`SECURITY.md`](SECURITY.md). Issues and pull requests welcome at
 [github.com/robertgartman/otelq](https://github.com/robertgartman/otelq).
+
+## Acknowledgements
+
+otelq stands on the shoulders of two outstanding open-source projects:
+
+- **[DuckDB](https://duckdb.org/)** — the in-process analytical database that makes
+  otelq's fast, dependency-light querying possible. Heartfelt thanks to the DuckDB
+  team and its contributors for building such a remarkable engine.
+- **[`duckdb-otlp`](https://github.com/smithclay/duckdb-otlp)** — the community
+  extension that teaches DuckDB to read OTLP telemetry. Thanks to
+  [Clay Smith](https://github.com/smithclay) and the duckdb-otlp contributors for the
+  work that otelq builds directly upon.
+
+This project would not exist without their craftsmanship. 🦆
 
 ## License
 

@@ -1,5 +1,5 @@
 ---
-name: integrate-collector
+name: otelq-collector-setup
 description: "Use from the otelq repo to wire otelq into your project on the same host — adds otelq's file-export pipeline to your project's existing OpenTelemetry Collector (or scaffolds one) so otelq can read its telemetry, then verifies the wiring. Asks for the target project's absolute path."
 ---
 
