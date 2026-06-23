@@ -77,20 +77,25 @@ extension**, and govern its version as follows:
    determinism-sensitive environments, the extension may be loaded from a mirror
    or a local directory instead of the community network repository.
 
-### Live drift to record explicitly
+### Version drift: validated 2026-06-23 — stay on 1.5.3
 
-There is a **known, tracked version drift** at the time of writing, and it is
-recorded here deliberately rather than silently resolved:
+The `otlp` *source* manifest (v0.5.0) declares support for DuckDB `>=1.5.4`, which
+suggested a bump. That bump was **validated end-to-end on 2026-06-23 and
+rejected** — there is **no published `otlp` build for DuckDB 1.5.4**. Evidence:
 
-- The code pins **`duckdb==1.5.3`**.
-- The current community build, **`otlp` v0.5.0**, now **declares DuckDB
-  `>=1.5.4`**.
+- `community-extensions.duckdb.org/v1.5.4/<platform>/otlp.duckdb_extension.gz`
+  returns **HTTP 404** on both `osx_arm64` and `linux_amd64`; the `v1.5.3` URL
+  returns **200** on both.
+- `INSTALL otlp FROM community; LOAD otlp` under `duckdb==1.5.4` fails with
+  `HTTPException (HTTP 404)`; the full suite drops from **44 passed** to
+  **20 passed / 24 failed** (only the extension-free cache-logic tests survive).
+- `duckdb==1.5.3` loads `otlp` cleanly and keeps all **44 tests green**.
 
-A bump to **`duckdb==1.5.4`** is therefore a **tracked follow-up** that must be
-**validated end-to-end before it is taken** — it must **not** be bumped blindly.
-The scheduled extension-probe workflow exists precisely to surface this kind of
-mismatch; the bump is gated on the validation checklist below, not on the
-existence of a newer number.
+**Conclusion:** `duckdb==1.5.3` remains the newest DuckDB with a loadable `otlp`
+build and is the correct pin. A move to 1.5.4 is **deferred, not pending** — it is
+the per-version build lag described in the Context, observed in the wild. Revisit
+only when the extension-probe (which loads `otlp` against the pinned version)
+shows a published 1.5.4 build; then run the checklist below.
 
 ## Alternatives Considered
 
@@ -123,9 +128,9 @@ existence of a newer number.
      that workaround depends on `read_otlp_*` behavior the new version could alter
      (see [ADR-006](ADR-006-read-otlp-extension-quirks.md)).
 - **A scheduled extension-probe workflow governs the pin continuously.** It is the
-  early-warning system for both the current `1.5.3 → 1.5.4` drift and any future
-  divergence; the pin is only ever moved through the checklist above, never
-  reactively.
+  early-warning system for the deferred 1.5.4 bump (it surfaces when a published
+  1.5.4 `otlp` build appears) and any future divergence; the pin is only ever moved
+  through the checklist above, never reactively.
 - **An offline / air-gapped path is available and deterministic.** The extension
   can be loaded without the community network repository by installing from a
   mirror or local directory — `INSTALL otlp FROM '<mirror-or-local-dir>'` — or by

@@ -6,7 +6,9 @@
 
 import sys
 from argparse import Namespace
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pytest
@@ -18,7 +20,7 @@ TESTDATA = Path(__file__).resolve().parent / "testdata"
 
 
 @pytest.fixture
-def synth_conn():
+def synth_conn() -> duckdb.DuckDBPyConnection:
     """In-memory DuckDB with the duckdb-otlp schema and known rows."""
     conn = duckdb.connect(":memory:")
     conn.execute(
@@ -92,35 +94,35 @@ def synth_conn():
     return conn
 
 
-def test_format_output_json():
+def test_format_output_json() -> None:
     out = otelq.format_output(["a", "b"], [(1, "x")], "json")
     import json as _json
 
     assert _json.loads(out) == [{"a": 1, "b": "x"}]
 
 
-def test_format_output_csv():
+def test_format_output_csv() -> None:
     out = otelq.format_output(["a", "b"], [(1, "x")], "csv")
     assert out == "a,b\r\n1,x"
 
 
-def test_format_output_table_empty():
+def test_format_output_table_empty() -> None:
     assert otelq.format_output(["a"], [], "table") == "(no rows)"
 
 
-def test_summary_counts(synth_conn):
-    columns, rows = otelq.cmd_summary(synth_conn, Namespace())
+def test_summary_counts(synth_conn: duckdb.DuckDBPyConnection) -> None:
+    _columns, rows = otelq.cmd_summary(synth_conn, Namespace())
     by_signal = {r[0]: r[1] for r in rows}
     assert by_signal == {"traces": 3, "logs": 2, "metrics": 3}
 
 
-def test_summary_raises_when_empty():
+def test_summary_raises_when_empty() -> None:
     conn = duckdb.connect(":memory:")
     with pytest.raises(otelq.NoTelemetryError):
         otelq.cmd_summary(conn, Namespace())
 
 
-def test_sql_passthrough(synth_conn):
+def test_sql_passthrough(synth_conn: duckdb.DuckDBPyConnection) -> None:
     columns, rows = otelq.cmd_sql(
         synth_conn, Namespace(query="SELECT count(*) AS n FROM traces")
     )
@@ -128,69 +130,77 @@ def test_sql_passthrough(synth_conn):
     assert rows == [(3,)]
 
 
-def test_integration_reads_real_fixture():
+def test_integration_reads_real_fixture() -> None:
     """connect() + the duckdb-otlp extension read genuine Collector output."""
     conn = otelq.connect(TESTDATA)
-    columns, rows = otelq.cmd_summary(conn, Namespace())
+    _columns, rows = otelq.cmd_summary(conn, Namespace())
     by_signal = {r[0]: r[1] for r in rows}
     assert by_signal.get("traces", 0) > 0
 
 
-def test_errors_finds_error_span_and_log(synth_conn):
-    columns, rows = otelq.cmd_errors(synth_conn, Namespace(since=None))
+def test_errors_finds_error_span_and_log(
+    synth_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    _columns, rows = otelq.cmd_errors(synth_conn, Namespace(since=None))
     kinds = sorted(r[0] for r in rows)
     assert kinds == ["log", "span"]
     assert all(r[2] == "catalog-api" for r in rows)
 
 
-def test_slow_orders_by_duration_desc(synth_conn):
-    columns, rows = otelq.cmd_slow(synth_conn, Namespace(top=2))
+def test_slow_orders_by_duration_desc(
+    synth_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    _columns, rows = otelq.cmd_slow(synth_conn, Namespace(top=2))
     assert len(rows) == 2
     assert rows[0][2] == "SELECT orders"  # 90ms span first
     assert rows[0][3] >= rows[1][3]  # duration_ms descending
 
 
-def test_trace_returns_tree_for_one_trace(synth_conn):
-    columns, rows = otelq.cmd_trace(synth_conn, Namespace(trace_id="trace-a"))
+def test_trace_returns_tree_for_one_trace(
+    synth_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    _columns, rows = otelq.cmd_trace(synth_conn, Namespace(trace_id="trace-a"))
     assert len(rows) == 2
     assert rows[0][0] == 0 and rows[1][0] == 1  # depth: root then child
 
 
-def test_trace_unknown_id_raises(synth_conn):
+def test_trace_unknown_id_raises(synth_conn: duckdb.DuckDBPyConnection) -> None:
     with pytest.raises(otelq.NoTelemetryError):
         otelq.cmd_trace(synth_conn, Namespace(trace_id="does-not-exist"))
 
 
-def test_logs_filter_by_service(synth_conn):
-    columns, rows = otelq.cmd_logs(
+def test_logs_filter_by_service(synth_conn: duckdb.DuckDBPyConnection) -> None:
+    _columns, rows = otelq.cmd_logs(
         synth_conn, Namespace(service="catalog-api", level=None, grep=None)
     )
     assert len(rows) == 1
     assert rows[0][1] == "catalog-api"
 
 
-def test_logs_filter_by_level(synth_conn):
-    columns, rows = otelq.cmd_logs(
+def test_logs_filter_by_level(synth_conn: duckdb.DuckDBPyConnection) -> None:
+    _columns, rows = otelq.cmd_logs(
         synth_conn, Namespace(service=None, level="error", grep=None)
     )
     assert len(rows) == 1
     assert rows[0][2] == "ERROR"
 
 
-def test_logs_filter_by_grep(synth_conn):
-    columns, rows = otelq.cmd_logs(
+def test_logs_filter_by_grep(synth_conn: duckdb.DuckDBPyConnection) -> None:
+    _columns, rows = otelq.cmd_logs(
         synth_conn, Namespace(service=None, level=None, grep="save")
     )
     assert len(rows) == 1
     assert "save" in rows[0][3].lower()  # body column
 
 
-def test_metric_returns_time_series(synth_conn):
-    columns, rows = otelq.cmd_metric(synth_conn, Namespace(name="db.pool.in_use"))
+def test_metric_returns_time_series(
+    synth_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    _columns, rows = otelq.cmd_metric(synth_conn, Namespace(name="db.pool.in_use"))
     assert [r[4] for r in rows] == [4.0, 7.0]  # value column, time-ordered
 
 
-def test_integration_timestamps_are_scaled():
+def test_integration_timestamps_are_scaled() -> None:
     """Timestamps from real Collector output must be in 2026, not year ~58358.
 
     The duckdb-otlp extension stores nanoseconds in a TIMESTAMP_MS column;
@@ -198,8 +208,9 @@ def test_integration_timestamps_are_scaled():
     This test uses the real fixture to guard that register_views applies the fix.
     """
     conn = otelq.connect(TESTDATA)
-    earliest = conn.execute("SELECT min(timestamp) FROM traces").fetchone()[0]
-    assert earliest.year == 2026
+    row = conn.execute("SELECT min(timestamp) FROM traces").fetchone()
+    assert row is not None
+    assert row[0].year == 2026
 
 
 # =============================================================================
@@ -227,24 +238,24 @@ def _ns(dt: datetime) -> str:
     return str(int(dt.timestamp() * 1_000_000_000))
 
 
-def _resource(service: str) -> dict:
+def _resource(service: str) -> dict[str, Any]:
     return {"attributes": [{"key": "service.name", "value": {"stringValue": service}}]}
 
 
 def make_span(
-    ts,
-    trace_id="t1",
-    span_id="s1",
-    parent="",
-    name="GET /x",
-    service="app-test",
-    kind=2,
-    status_code=0,
-    status_msg="",
-    duration_ms=5,
-):
+    ts: datetime,
+    trace_id: str = "t1",
+    span_id: str = "s1",
+    parent: str = "",
+    name: str = "GET /x",
+    service: str = "app-test",
+    kind: int = 2,
+    status_code: int = 0,
+    status_msg: str = "",
+    duration_ms: int = 5,
+) -> dict[str, Any]:
     end = ts + timedelta(milliseconds=duration_ms)
-    span = {
+    span: dict[str, Any] = {
         "traceId": trace_hex(trace_id),
         "spanId": span_hex(span_id),
         "parentSpanId": span_hex(parent) if parent else "",
@@ -266,7 +277,14 @@ def make_span(
     }
 
 
-def make_log(ts, service="app-test", severity="INFO", sevnum=9, body="hi", trace_id=""):
+def make_log(
+    ts: datetime,
+    service: str = "app-test",
+    severity: str = "INFO",
+    sevnum: int = 9,
+    body: str = "hi",
+    trace_id: str = "",
+) -> dict[str, Any]:
     return {
         "resourceLogs": [
             {
@@ -291,7 +309,13 @@ def make_log(ts, service="app-test", severity="INFO", sevnum=9, body="hi", trace
     }
 
 
-def make_gauge(ts, name="db.pool", unit="{c}", value=4.0, service="app-test"):
+def make_gauge(
+    ts: datetime,
+    name: str = "db.pool",
+    unit: str = "{c}",
+    value: float = 4.0,
+    service: str = "app-test",
+) -> dict[str, Any]:
     return {
         "resourceMetrics": [
             {
@@ -322,7 +346,13 @@ def make_gauge(ts, name="db.pool", unit="{c}", value=4.0, service="app-test"):
     }
 
 
-def make_sum(ts, name="reqs", unit="{r}", value=42, service="app-test"):
+def make_sum(
+    ts: datetime,
+    name: str = "reqs",
+    unit: str = "{r}",
+    value: int = 42,
+    service: str = "app-test",
+) -> dict[str, Any]:
     return {
         "resourceMetrics": [
             {
@@ -355,21 +385,22 @@ def make_sum(ts, name="reqs", unit="{r}", value=42, service="app-test"):
     }
 
 
-def write_jsonl(path: Path, objs, append=False):
+def write_jsonl(
+    path: Path, objs: Iterable[dict[str, Any]], append: bool = False
+) -> None:
     text = "".join(_json.dumps(o) + "\n" for o in objs)
-    mode = "a" if append else "w"
-    with open(path, mode, encoding="utf-8") as fh:
+    with open(path, "a" if append else "w", encoding="utf-8") as fh:
         fh.write(text)
 
 
 @pytest.fixture
-def temp_telemetry(tmp_path):
+def temp_telemetry(tmp_path: Path) -> Path:
     d = tmp_path / "telemetry"
     d.mkdir()
     return d
 
 
-def _run(dirpath, *argv):
+def _run(dirpath: Path, *argv: str) -> str:
     """Run the CLI in-process; return its stdout string."""
     import io as _io
     from contextlib import redirect_stdout
@@ -383,7 +414,7 @@ def _run(dirpath, *argv):
 # --- fabrication smoke test (validates OTLP shapes against the real extension) -
 
 
-def test_fabricated_corpus_roundtrips(temp_telemetry):
+def test_fabricated_corpus_roundtrips(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     write_jsonl(
         temp_telemetry / "traces.jsonl",
@@ -396,13 +427,15 @@ def test_fabricated_corpus_roundtrips(temp_telemetry):
     conn = otelq.connect(temp_telemetry)
     by = {r[0]: r[1] for r in otelq.cmd_summary(conn, Namespace())[1]}
     assert by == {"traces": 1, "logs": 1, "metrics": 2}
-    assert conn.execute("SELECT min(timestamp) FROM traces").fetchone()[0].year == 2026
+    row = conn.execute("SELECT min(timestamp) FROM traces").fetchone()
+    assert row is not None
+    assert row[0].year == 2026
 
 
 # --- AC-1 / FR-1, FR-5: sealing produces per-minute partitions ----------------
 
 
-def test_ac1_seals_complete_minutes(temp_telemetry):
+def test_ac1_seals_complete_minutes(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     spans = [
         make_span(base + timedelta(seconds=i * 10), trace_id=f"t{i}", span_id=f"s{i}")
@@ -422,9 +455,11 @@ def test_ac1_seals_complete_minutes(temp_telemetry):
 # --- AC-11 / FR-11 / INV-1, INV-4: cached == --no-cache (the keystone) ---------
 
 
-def test_ac11_cached_equals_no_cache(temp_telemetry):
+def test_ac11_cached_equals_no_cache(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
-    spans, logs, gauges = [], [], []
+    spans: list[dict[str, Any]] = []
+    logs: list[dict[str, Any]] = []
+    gauges: list[dict[str, Any]] = []
     for i in range(20):  # 20 minutes, all inside the 30-min hot window
         t = base + timedelta(minutes=i, seconds=5)
         err = i % 5 == 0
@@ -468,7 +503,7 @@ def test_ac11_cached_equals_no_cache(temp_telemetry):
 # --- AC-17 / FR-17: --no-cache writes nothing ---------------------------------
 
 
-def test_ac17_no_cache_leaves_cache_untouched(temp_telemetry):
+def test_ac17_no_cache_leaves_cache_untouched(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     write_jsonl(
         temp_telemetry / "traces.jsonl",
@@ -486,7 +521,7 @@ def test_ac17_no_cache_leaves_cache_untouched(temp_telemetry):
 # --- AC-2 / FR-2: a second run reads no new raw bytes -------------------------
 
 
-def test_ac2_incremental_no_rebytes(temp_telemetry):
+def test_ac2_incremental_no_rebytes(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     write_jsonl(
         temp_telemetry / "traces.jsonl",
@@ -515,7 +550,7 @@ def test_ac2_incremental_no_rebytes(temp_telemetry):
 # --- AC-13 / FR-13: cross-platform source guards ------------------------------
 
 
-def test_ac13_portable_file_ops():
+def test_ac13_portable_file_ops() -> None:
     src = Path(str(otelq.__file__)).read_text()
     assert "fcntl" not in src
     assert "os.rename(" not in src  # must use os.replace
@@ -527,7 +562,7 @@ def test_ac13_portable_file_ops():
 # --- AC-16 / FR-16: otel-clean removes the cache subtree ----------------------
 
 
-def test_ac16_otel_clean_recipe_removes_cache():
+def test_ac16_otel_clean_recipe_removes_cache() -> None:
     justfile = (Path(__file__).resolve().parents[1] / "justfile").read_text()
     assert "rm -rf telemetry/.otelq-cache" in justfile
 
@@ -536,12 +571,17 @@ import os as _os  # noqa: E402
 import time as _time  # noqa: E402
 
 
-def _build(dirpath, route="HOT", window_min=30, use_cache=True):
+def _build(
+    dirpath: Path,
+    route: str = "HOT",
+    window_min: int | None = 30,
+    use_cache: bool = True,
+) -> duckdb.DuckDBPyConnection:
     win = None if window_min is None else timedelta(minutes=window_min)
     return otelq.build_connection(dirpath, otelq.Plan(route, win, use_cache))
 
 
-def _run_both(dirpath, *argv):
+def _run_both(dirpath: Path, *argv: str) -> tuple[str, str]:
     import io as _io
     from contextlib import redirect_stderr, redirect_stdout
 
@@ -551,15 +591,16 @@ def _run_both(dirpath, *argv):
     return out.getvalue(), err.getvalue()
 
 
-def _signal_count(dirpath, signal, *argv):
+def _signal_count(dirpath: Path, signal: str, *argv: str) -> int:
     out = _run(dirpath, *argv)
     for row in _json.loads(out):
         if row["signal"] == signal:
-            return row["count"]
+            count: int = row["count"]
+            return count
     return 0
 
 
-def _minutes_per_minute(base, n):
+def _minutes_per_minute(base: datetime, n: int) -> list[dict[str, Any]]:
     return [
         make_span(base + timedelta(minutes=i), trace_id=f"t{i}", span_id=f"s{i}")
         for i in range(n)
@@ -569,7 +610,7 @@ def _minutes_per_minute(base, n):
 # --- AC-3 / FR-3 / EC-1: rotation mid-stream loses/duplicates nothing ---------
 
 
-def test_ac3_rotation_no_gap_no_dup(temp_telemetry):
+def test_ac3_rotation_no_gap_no_dup(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     traces = temp_telemetry / "traces.jsonl"
     write_jsonl(traces, _minutes_per_minute(base, 6))  # minutes 0..5
@@ -596,13 +637,15 @@ def test_ac3_rotation_no_gap_no_dup(temp_telemetry):
 # --- AC-5 / FR-5 / EC-2: cold start seals only the hot window ------------------
 
 
-def test_ac5_cold_start_seals_only_hot_window(temp_telemetry):
+def test_ac5_cold_start_seals_only_hot_window(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 10, 0, 0, tzinfo=timezone.utc)
     write_jsonl(temp_telemetry / "traces.jsonl", _minutes_per_minute(base, 90))
     _build(temp_telemetry)
     sealed = sorted((temp_telemetry / CACHE / "traces").glob("*.parquet"))
     assert 20 < len(sealed) < 40, f"expected ~30 sealed minutes, got {len(sealed)}"
-    oldest = min(otelq.parse_minute_key(p.stem) for p in sealed)
+    keys = [otelq.parse_minute_key(p.stem) for p in sealed]
+    assert all(k is not None for k in keys)
+    oldest = min(k for k in keys if k is not None)
     floor = (base + timedelta(minutes=55)).replace(tzinfo=None)
     assert oldest >= floor  # nothing older than the window
 
@@ -610,7 +653,7 @@ def test_ac5_cold_start_seals_only_hot_window(temp_telemetry):
 # --- AC-6 / FR-6: a later run evicts partitions that fell out of the window ----
 
 
-def test_ac6_eviction_drops_stale_partitions(temp_telemetry):
+def test_ac6_eviction_drops_stale_partitions(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     traces = temp_telemetry / "traces.jsonl"
     write_jsonl(traces, _minutes_per_minute(base, 6))  # minutes 0..5
@@ -636,13 +679,13 @@ def test_ac6_eviction_drops_stale_partitions(temp_telemetry):
         for p in (temp_telemetry / CACHE / "traces").glob("*.parquet")
     ]
     floor = (base + timedelta(minutes=10)).replace(tzinfo=None)
-    assert all(m >= floor for m in sealed)
+    assert all(m is not None and m >= floor for m in sealed)
 
 
 # --- AC-9 / FR-9: recent-by-default, --all widens -----------------------------
 
 
-def test_ac9_recent_default_vs_all(temp_telemetry):
+def test_ac9_recent_default_vs_all(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 10, 0, 0, tzinfo=timezone.utc)
     write_jsonl(temp_telemetry / "traces.jsonl", _minutes_per_minute(base, 90))
     default = _signal_count(temp_telemetry, "traces", "summary")
@@ -655,7 +698,7 @@ def test_ac9_recent_default_vs_all(temp_telemetry):
 # --- AC-8 / FR-8: --since beyond the window reaches old data (cold path) -------
 
 
-def test_ac8_since_beyond_window_is_cold(temp_telemetry):
+def test_ac8_since_beyond_window_is_cold(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 10, 0, 0, tzinfo=timezone.utc)
     write_jsonl(temp_telemetry / "traces.jsonl", _minutes_per_minute(base, 90))
     far = _signal_count(temp_telemetry, "traces", "summary", "--since", "120m")
@@ -665,7 +708,7 @@ def test_ac8_since_beyond_window_is_cold(temp_telemetry):
 # --- AC-10 / FR-10: trace lookup falls back to cold for an old id -------------
 
 
-def test_ac10_trace_cold_fallback(temp_telemetry):
+def test_ac10_trace_cold_fallback(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 10, 0, 0, tzinfo=timezone.utc)
     write_jsonl(temp_telemetry / "traces.jsonl", _minutes_per_minute(base, 90))
     # t5 is ~85 minutes old: absent from the hot cache, found via cold fallback
@@ -677,7 +720,7 @@ def test_ac10_trace_cold_fallback(temp_telemetry):
 # --- AC-14 / FR-14 / EC-7, EC-8: version mismatch self-wipes and rebuilds ------
 
 
-def test_ac14_version_mismatch_self_heals(temp_telemetry):
+def test_ac14_version_mismatch_self_heals(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     write_jsonl(temp_telemetry / "traces.jsonl", _minutes_per_minute(base, 6))
     _build(temp_telemetry)
@@ -695,7 +738,7 @@ def test_ac14_version_mismatch_self_heals(temp_telemetry):
 # --- AC-15 / FR-15 / EC-4, EC-5: partial line + oversized batch are skipped ----
 
 
-def test_ac15_robust_tail_parsing(temp_telemetry):
+def test_ac15_robust_tail_parsing(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     traces = temp_telemetry / "traces.jsonl"
     write_jsonl(traces, _minutes_per_minute(base, 5))  # 5 valid spans
@@ -728,7 +771,7 @@ def test_ac15_robust_tail_parsing(temp_telemetry):
 # --- AC-18 / INV-6: raw files are never modified ------------------------------
 
 
-def test_ac18_raw_files_unmodified(temp_telemetry):
+def test_ac18_raw_files_unmodified(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     traces = temp_telemetry / "traces.jsonl"
     write_jsonl(traces, _minutes_per_minute(base, 30))
@@ -741,7 +784,9 @@ def test_ac18_raw_files_unmodified(temp_telemetry):
 # --- AC-20 / EC-6: zeroed st_ino still disambiguates two files -----------------
 
 
-def test_ac20_zeroed_st_ino_disambiguates(temp_telemetry, monkeypatch):
+def test_ac20_zeroed_st_ino_disambiguates(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     write_jsonl(temp_telemetry / "traces.jsonl", _minutes_per_minute(base, 5))
     write_jsonl(
@@ -757,7 +802,7 @@ def test_ac20_zeroed_st_ino_disambiguates(temp_telemetry, monkeypatch):
     )
     real_stat = _os.stat
 
-    def zeroed(path, *a, **k):
+    def zeroed(path: Any, *a: Any, **k: Any) -> _os.stat_result:
         s = real_stat(path, *a, **k)
         vals = list(s)
         vals[1] = 0  # st_ino -> 0; fingerprint+size must disambiguate
@@ -774,7 +819,7 @@ def test_ac20_zeroed_st_ino_disambiguates(temp_telemetry, monkeypatch):
 # --- AC-12 / FR-12 / INV-5: lock contention still answers, skips sealing -------
 
 
-def test_ac12_lock_contention_reads_without_sealing(temp_telemetry):
+def test_ac12_lock_contention_reads_without_sealing(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     write_jsonl(temp_telemetry / "traces.jsonl", _minutes_per_minute(base, 40))
     cdir = temp_telemetry / CACHE
@@ -791,7 +836,7 @@ def test_ac12_lock_contention_reads_without_sealing(temp_telemetry):
 # (the bug the adversarial review found; AC-11's in-order data missed it)
 
 
-def test_late_arrival_to_sealed_minute_stays_queryable(temp_telemetry):
+def test_late_arrival_to_sealed_minute_stays_queryable(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     traces = temp_telemetry / "traces.jsonl"
     write_jsonl(traces, _minutes_per_minute(base, 6))  # minute 12:00 will seal
@@ -809,7 +854,7 @@ def test_late_arrival_to_sealed_minute_stays_queryable(temp_telemetry):
     assert _json.loads(cached)[0]["count"] == 7
 
 
-def test_clock_skew_outlier_does_not_drop_records(temp_telemetry):
+def test_clock_skew_outlier_does_not_drop_records(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     traces = temp_telemetry / "traces.jsonl"
     # a single far-future span yanks the watermark to 12:10, sealing 12:00 early
@@ -838,7 +883,7 @@ def test_clock_skew_outlier_does_not_drop_records(temp_telemetry):
 # --- AC-19 / INV-2 / EC-11: crash between seal and cursor advance --------------
 
 
-def test_ac19_crash_immutability_and_no_loss(temp_telemetry):
+def test_ac19_crash_immutability_and_no_loss(temp_telemetry: Path) -> None:
     """A crash between sealing and the cursor advance (simulated by a cursor
     rollback) keeps sealed partitions immutable (INV-2) and loses no record. A
     pathological full rollback may transiently OVER-count the recent unsealed
@@ -876,7 +921,7 @@ def test_ac19_crash_immutability_and_no_loss(temp_telemetry):
 # --- FR-12/INV-5 regression: live writer's lock is never reaped ----------------
 
 
-def test_live_lock_reaped_only_past_hard_ceiling(temp_telemetry):
+def test_live_lock_reaped_only_past_hard_ceiling(temp_telemetry: Path) -> None:
     cdir = temp_telemetry / CACHE
     cdir.mkdir(parents=True)
     lock = cdir / otelq.LOCK_FILENAME
@@ -901,7 +946,7 @@ def test_live_lock_reaped_only_past_hard_ceiling(temp_telemetry):
 # --- FR-11 regression: lock-loser's stale-offset tail must not double-count ----
 
 
-def test_tail_does_not_double_count_sealed(temp_telemetry):
+def test_tail_does_not_double_count_sealed(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     write_jsonl(temp_telemetry / "traces.jsonl", _minutes_per_minute(base, 8))
     _build(temp_telemetry)  # seals minutes + writes pending + advances cursor
@@ -920,7 +965,7 @@ def test_tail_does_not_double_count_sealed(temp_telemetry):
 # --- FR-11 regression: sub-minute window boundary (found by the live check) ----
 
 
-def test_subminute_window_boundary_equivalence(temp_telemetry):
+def test_subminute_window_boundary_equivalence(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     # 13s spacing over ~37 min, so the 30-min window lower bound (now - 30min)
     # lands mid-minute — the minute straddling it must not be evicted away.
@@ -938,7 +983,7 @@ def test_subminute_window_boundary_equivalence(temp_telemetry):
 # (EXCEPT vs EXCEPT ALL — the second adversarial pass found this)
 
 
-def test_identical_late_records_kept(temp_telemetry):
+def test_identical_late_records_kept(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     logs_path = temp_telemetry / "logs.jsonl"
     write_jsonl(
@@ -961,7 +1006,7 @@ def test_identical_late_records_kept(temp_telemetry):
 # collector when traces were flowing fine and only logs.jsonl was missing.
 
 
-def test_require_names_missing_signal_when_others_present():
+def test_require_names_missing_signal_when_others_present() -> None:
     conn = duckdb.connect(":memory:")
     conn.execute("CREATE TABLE traces(timestamp TIMESTAMP)")  # traces present, no logs
     with pytest.raises(otelq.NoTelemetryError) as exc:
@@ -972,14 +1017,14 @@ def test_require_names_missing_signal_when_others_present():
     assert "traces" in msg  # names what IS present
 
 
-def test_require_keeps_generic_message_when_nothing_present():
+def test_require_keeps_generic_message_when_nothing_present() -> None:
     conn = duckdb.connect(":memory:")  # no relations at all -> collector likely down
     with pytest.raises(otelq.NoTelemetryError) as exc:
         otelq.cmd_logs(conn, Namespace(service=None, level=None, grep=None))
     assert str(exc.value) == otelq._NO_TELEMETRY_MSG
 
 
-def test_errors_names_gap_when_only_metrics_present():
+def test_errors_names_gap_when_only_metrics_present() -> None:
     conn = duckdb.connect(":memory:")
     conn.execute("CREATE TABLE metrics(timestamp TIMESTAMP)")  # metrics only
     with pytest.raises(otelq.NoTelemetryError) as exc:

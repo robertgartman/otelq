@@ -22,7 +22,7 @@ Creates `telemetry/` and brings up the dev OTel Collector (OTLP gRPC `:4317` / H
 - **The justfile is the single execution gateway** — never invent parallel scripts or call `otelq.py`/`docker compose` ad hoc in a way that bypasses the recipes.
 - **EXACT DuckDB pin** — `duckdb==1.5.3`, never floated (see **ADR-003**). otelq depends on the `otlp` *community* extension, which is built per DuckDB version and lags releases; an unpinned bump can land on a version with no published extension and break every command.
 - **Fail FRIENDLY, not silent** — no telemetry captured ⇒ a clear human-readable message and **exit 0**, never a stack trace. Errors are explanatory, not raw tracebacks.
-- **Strict typing** throughout — full type hints, no `Any`, no `# type: ignore`.
+- **Strict typing** throughout — pyright `strict` passes clean (enforced via `[tool.pyright]`), full type hints, and **no** `# type: ignore` / `# pyright: ignore`. Explicit `Any` is confined to the two genuinely dynamic boundaries — parsed OTLP-JSON payloads and DuckDB result rows — and must never spread beyond them.
 - **No solution-name leakage** — keep code neutral; do not embed any external/solution project name in otelq code or filenames.
 
 **5. Common pitfalls** (cost you cycles if missed):

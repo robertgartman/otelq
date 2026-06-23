@@ -42,6 +42,17 @@ include = ["otelq.py", "tests/", "README.md", "LICENSE", "pyproject.toml"]
 pythonpath = ["."]
 testpaths = ["tests"]
 
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.11"
+include = ["otelq.py", "tests"]
+# otelq.py is imported by tests/ as a top-level module (sys.path hack), and the
+# duckdb/pytest deps live in the project .venv — point pyright at both so its
+# strict run resolves the same imports the interpreter does.
+extraPaths = ["."]
+venvPath = "."
+venv = ".venv"
+
 [tool.ruff]
 line-length = 120
 target-version = "py311"

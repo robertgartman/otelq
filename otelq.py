@@ -49,11 +49,51 @@ import shutil
 import sys
 import tempfile
 import time
+from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict, cast
 
 import duckdb
+
+# Public surface of this single-file module. The CLI entry is `main`; the rest
+# is the API the test suite pins. The trailing group is deliberately exported
+# despite the leading underscore: it is internal to normal callers but part of
+# the behaviour the tests verify directly (lock reaping, the no-telemetry text),
+# so listing it here makes that test-visible contract explicit.
+__all__ = [
+    "main",
+    "build_parser",
+    "build_connection",
+    "connect",
+    "run_command",
+    "format_output",
+    "create_unified_metrics_view",
+    "parse_minute_key",
+    "minute_key",
+    "sealed_path",
+    "pending_path",
+    "stream_of",
+    "Plan",
+    "NoTelemetryError",
+    "cmd_summary",
+    "cmd_sql",
+    "cmd_errors",
+    "cmd_slow",
+    "cmd_trace",
+    "cmd_logs",
+    "cmd_metric",
+    "CACHE_DIRNAME",
+    "PENDING_DIRNAME",
+    "CURSOR_FILENAME",
+    "CURSOR_SCHEMA_VERSION",
+    "LOCK_FILENAME",
+    # tested internals
+    "_reap_if_stale",
+    "_LOCK_STALE_SECS",
+    "_LOCK_HARD_STALE_SECS",
+    "_NO_TELEMETRY_MSG",
+]
 
 # otelq.py lives at the repo root; telemetry/ is its sibling.
 DEFAULT_DIR = Path(__file__).resolve().parent / "telemetry"
@@ -189,7 +229,9 @@ def _decode_line(signal: str, line: str) -> tuple[dict[str, Any], int] | None:
     return obj, rows
 
 
-def _buffer_to_chunks(signal: str, lines, tmp_dir: str, tag: str) -> list[str]:
+def _buffer_to_chunks(
+    signal: str, lines: Iterable[str], tmp_dir: str, tag: str
+) -> list[str]:
     """Slice an iterable of JSONL lines into <=_SAFE_CHUNK-row chunk files.
 
     Each chunk file stays under the duckdb-otlp 2048-row crash boundary, so a
@@ -232,7 +274,7 @@ def _chunk_signal(signal: str, telemetry_dir: Path, tmp_dir: str) -> list[str]:
     if not sources:
         return []
 
-    def line_iter():
+    def line_iter() -> Iterator[str]:
         for src in sources:
             with open(src, encoding="utf-8") as handle:
                 yield from handle
@@ -283,6 +325,34 @@ def _materialize(
 
 
 # --- small helpers -----------------------------------------------------------
+
+# DuckDB query results are dynamically typed at the SQL boundary: a row is a
+# tuple of column values whose Python types depend on the query, so the element
+# type is genuinely `Any` (mirrors the duckdb stub's own `tuple[Any, ...]`).
+Row = tuple[Any, ...]
+# Every command returns its column headers and the result rows.
+CommandResult = tuple[list[str], list[Row]]
+# A subcommand handler: a built connection + parsed args -> a CommandResult.
+Command = Callable[["duckdb.DuckDBPyConnection", argparse.Namespace], CommandResult]
+
+
+def _one_row(rel: duckdb.DuckDBPyConnection) -> Row:
+    """The single row of a query guaranteed to return exactly one.
+
+    A bare aggregate (no GROUP BY) always yields one row, so fetchone() is never
+    None here; assert it so the `tuple | None` Optional is discharged at this one
+    seam rather than leaking into callers that unpack the columns."""
+    row = rel.fetchone()
+    assert row is not None, "aggregate query returned no row"
+    return row
+
+
+def _scalar(rel: duckdb.DuckDBPyConnection) -> Any:
+    """First column of a query that returns exactly one row.
+
+    Returns `Any` because the value's type is the SQL expression's type (a count
+    is int, max(timestamp) is datetime|None, ...) — the dynamic result boundary."""
+    return _one_row(rel)[0]
 
 
 def _existing_relations(conn: duckdb.DuckDBPyConnection) -> set[str]:
@@ -380,7 +450,28 @@ def sealed_path(telemetry_dir: Path, signal: str, minute: datetime) -> Path:
 # --- cursor + self-heal ------------------------------------------------------
 
 
-def _fresh_cursor() -> dict[str, Any]:
+class FileState(TypedDict):
+    """Per raw-file progress: bytes consumed from its head."""
+
+    bytes_consumed: int
+
+
+class StreamState(TypedDict):
+    """Per-stream cursor state: file offsets keyed by file identity, plus the
+    max event-time ever observed in the stream (the seal/evict watermark)."""
+
+    files: dict[str, FileState]
+    max_event_ts_seen: str | None
+
+
+class Cursor(TypedDict):
+    """The persisted incremental-cache cursor (cache_dir/cursor.json)."""
+
+    version: int
+    streams: dict[str, StreamState]
+
+
+def _fresh_cursor() -> Cursor:
     return {
         "version": CURSOR_SCHEMA_VERSION,
         "streams": {
@@ -389,22 +480,28 @@ def _fresh_cursor() -> dict[str, Any]:
     }
 
 
-def _load_cursor(telemetry_dir: Path) -> dict[str, Any] | None:
+def _load_cursor(telemetry_dir: Path) -> Cursor | None:
     """Return the persisted cursor, or None when missing/corrupt/wrong-version."""
     path = cache_dir(telemetry_dir) / CURSOR_FILENAME
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # json.loads is dynamically typed; bind as `object` and narrow by shape.
+        data: object = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    if not isinstance(data, dict) or data.get("version") != CURSOR_SCHEMA_VERSION:
+    if not isinstance(data, dict):
         return None
-    streams = data.get("streams")
+    payload = cast(dict[str, Any], data)
+    if payload.get("version") != CURSOR_SCHEMA_VERSION:
+        return None
+    streams = payload.get("streams")
     if not isinstance(streams, dict) or any(s not in streams for s in CURSOR_STREAMS):
         return None
-    return data
+    # Shape validated above (version + every stream present); the JSON payload is
+    # dynamic, so narrow to the Cursor contract at this trust boundary.
+    return cast(Cursor, payload)
 
 
-def _write_cursor(telemetry_dir: Path, cursor: dict[str, Any]) -> None:
+def _write_cursor(telemetry_dir: Path, cursor: Cursor) -> None:
     cdir = cache_dir(telemetry_dir)
     cdir.mkdir(parents=True, exist_ok=True)
     path = cdir / CURSOR_FILENAME
@@ -432,7 +529,7 @@ def _reap_tmp(telemetry_dir: Path) -> None:
             pass
 
 
-def _self_heal(telemetry_dir: Path) -> dict[str, Any]:
+def _self_heal(telemetry_dir: Path) -> Cursor:
     """Load the cursor; wipe + rebuild on corruption/version mismatch; reap tmp."""
     cur = _load_cursor(telemetry_dir)
     if cur is None and (cache_dir(telemetry_dir) / CURSOR_FILENAME).exists():
@@ -529,9 +626,9 @@ _READ_BLOCK = (
 def _iter_stream_delta(
     telemetry_dir: Path,
     stream: str,
-    files_state: dict[str, Any],
-    new_state_out: dict[str, Any],
-):
+    files_state: dict[str, FileState],
+    new_state_out: dict[str, FileState],
+) -> Iterator[str]:
     """Yield each not-yet-consumed complete line of a stream's files, streaming in
     bounded blocks so a cold-start over a multi-GB corpus never holds a whole file
     in memory (SPEC FR-2). Rotation-aware: files are keyed by identity, offsets
@@ -549,7 +646,8 @@ def _iter_stream_delta(
             fh = open(path, "rb")
         except OSError:
             continue
-        offset = files_state.get(key, {}).get("bytes_consumed", 0)
+        prior = files_state.get(key)
+        offset = prior["bytes_consumed"] if prior is not None else 0
         with fh:
             fh.seek(offset)
             buf = b""
@@ -608,7 +706,7 @@ def _build_staging(
 def _ingest_and_seal(
     conn: duckdb.DuckDBPyConnection,
     telemetry_dir: Path,
-    cursor: dict[str, Any],
+    cursor: Cursor,
     tmp_dir: str,
 ) -> None:
     """Read each stream's delta, seal newly-complete minutes, rewrite pending,
@@ -616,7 +714,7 @@ def _ingest_and_seal(
     writer lock."""
     stream_chunks: dict[str, list[str]] = {}
     for stream in CURSOR_STREAMS:
-        new_state: dict[str, Any] = {}
+        new_state: dict[str, FileState] = {}
         stream_chunks[stream] = _buffer_to_chunks(
             stream,
             _iter_stream_delta(
@@ -640,9 +738,9 @@ def _ingest_and_seal(
             candidates.append(prev)
         for signal in STREAM_SIGNALS[stream]:
             if signal in staged:
-                hi = conn.execute(
-                    f"SELECT max(timestamp) FROM _stage_{signal}"
-                ).fetchone()[0]
+                hi = _scalar(
+                    conn.execute(f"SELECT max(timestamp) FROM _stage_{signal}")
+                )
                 if hi is not None:
                     candidates.append(hi)
         if candidates:
@@ -748,7 +846,7 @@ def _rewrite_pending(
             f"({candidate}) EXCEPT ALL "
             f"(SELECT * FROM read_parquet({_sql_file_list(overlap)}))"
         )
-    count = conn.execute(f"SELECT count(*) FROM ({final})").fetchone()[0]
+    count = _scalar(conn.execute(f"SELECT count(*) FROM ({final})"))
     if count:
         tmp = pending.with_suffix(pending.suffix + _TMP_SUFFIX)
         conn.execute(f"COPY ({final}) TO '{tmp.as_posix()}' (FORMAT PARQUET)")
@@ -813,7 +911,7 @@ def _finalize_relations(
         return
     maxes: list[datetime] = []
     for s in present:
-        v = conn.execute(f"SELECT max(timestamp) FROM _all_{s}").fetchone()[0]
+        v = _scalar(conn.execute(f"SELECT max(timestamp) FROM _all_{s}"))
         if v is not None:
             maxes.append(v)
     now_evt = max(maxes) if maxes else None
@@ -970,7 +1068,7 @@ def build_connection(telemetry_dir: Path, plan: Plan) -> duckdb.DuckDBPyConnecti
     return conn
 
 
-def run_command(args: argparse.Namespace):
+def run_command(args: argparse.Namespace) -> CommandResult:
     """Plan, build the connection, dispatch, and apply trace/metric cold-fallback."""
     plan = plan_range(args)
     command = COMMANDS[args.command]
@@ -1006,31 +1104,37 @@ def format_output(columns: list[str], rows: list[tuple[Any, ...]], fmt: str) -> 
         for i, value in enumerate(row):
             widths[i] = max(widths[i], len(str(value)))
 
-    def render(vals):
+    def render(vals: Iterable[Any]) -> str:
         return "  ".join(str(v).ljust(w) for v, w in zip(vals, widths))
 
     separator = "  ".join("-" * w for w in widths)
     return "\n".join([render(columns), separator] + [render(r) for r in rows])
 
 
-def cmd_summary(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
+def cmd_summary(
+    conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
+) -> CommandResult:
     have = _existing_relations(conn)
     columns = ["signal", "count", "earliest", "latest", "services"]
-    rows = []
+    rows: list[Row] = []
     for signal in ("traces", "logs", "metrics"):
         if signal not in have:
             continue
-        count, lo, hi, services = conn.execute(
-            f"SELECT count(*), min(timestamp), max(timestamp), "
-            f"count(DISTINCT service_name) FROM {signal}"
-        ).fetchone()
+        count, lo, hi, services = _one_row(
+            conn.execute(
+                f"SELECT count(*), min(timestamp), max(timestamp), "
+                f"count(DISTINCT service_name) FROM {signal}"
+            )
+        )
         rows.append((signal, count, lo, hi, services))
     if not rows:
         raise NoTelemetryError(_NO_TELEMETRY_MSG)
     return columns, rows
 
 
-def cmd_sql(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
+def cmd_sql(
+    conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
+) -> CommandResult:
     try:
         result = conn.execute(args.query)
         columns = [d[0] for d in result.description] if result.description else []
@@ -1040,7 +1144,9 @@ def cmd_sql(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
     return columns, rows
 
 
-def cmd_errors(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
+def cmd_errors(
+    conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
+) -> CommandResult:
     have = _existing_relations(conn)
     if "traces" not in have and "logs" not in have:
         # errors are derived from error spans and ERROR/FATAL logs; metrics
@@ -1051,7 +1157,7 @@ def cmd_errors(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
     # The time window is applied by the relation builder (SPEC INV-7), so the
     # command queries the already-scoped relations.
     columns = ["kind", "timestamp", "service_name", "label", "detail"]
-    rows = []
+    rows: list[Row] = []
     if "traces" in have:
         rows += conn.execute(
             "SELECT 'span', timestamp, service_name, span_name, status_message "
@@ -1066,7 +1172,9 @@ def cmd_errors(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
     return columns, rows
 
 
-def cmd_slow(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
+def cmd_slow(
+    conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
+) -> CommandResult:
     _require(conn, "traces")
     columns = ["timestamp", "service_name", "span_name", "duration_ms", "trace_id"]
     rows = conn.execute(
@@ -1078,7 +1186,9 @@ def cmd_slow(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
     return columns, rows
 
 
-def cmd_trace(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
+def cmd_trace(
+    conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
+) -> CommandResult:
     _require(conn, "traces")
     spans = conn.execute(
         "SELECT span_id, parent_span_id, span_name, service_name, "
@@ -1089,7 +1199,7 @@ def cmd_trace(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
     if not spans:
         raise NoTelemetryError(f"no spans found for trace_id '{args.trace_id}'")
     span_ids = {s[0] for s in spans}
-    children: dict[str | None, list] = {}
+    children: dict[str | None, list[Row]] = {}
     for span in spans:
         parent = span[1] if (span[1] and span[1] in span_ids) else None
         children.setdefault(parent, []).append(span)
@@ -1101,7 +1211,7 @@ def cmd_trace(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
         "status_code",
         "span_id",
     ]
-    rows: list[tuple] = []
+    rows: list[Row] = []
 
     def walk(parent_key: str | None, depth: int) -> None:
         for span in sorted(children.get(parent_key, []), key=lambda s: s[6]):
@@ -1114,9 +1224,12 @@ def cmd_trace(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
     return columns, rows
 
 
-def cmd_logs(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
+def cmd_logs(
+    conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
+) -> CommandResult:
     _require(conn, "logs")
-    where, params = [], []
+    where: list[str] = []
+    params: list[str] = []
     if args.service:
         where.append("service_name = ?")
         params.append(args.service)
@@ -1136,7 +1249,9 @@ def cmd_logs(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
     return columns, rows
 
 
-def cmd_metric(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
+def cmd_metric(
+    conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
+) -> CommandResult:
     _require(conn, "metrics")
     columns = [
         "timestamp",
@@ -1154,7 +1269,7 @@ def cmd_metric(conn: duckdb.DuckDBPyConnection, args: argparse.Namespace):
     return columns, rows
 
 
-COMMANDS = {
+COMMANDS: dict[str, Command] = {
     "summary": cmd_summary,
     "sql": cmd_sql,
     "errors": cmd_errors,
