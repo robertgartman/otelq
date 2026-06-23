@@ -1137,3 +1137,19 @@ def test_collector_config_via_main_prints_fragment() -> None:
     with redirect_stdout(buf):
         assert otelq.main(["collector-config"]) == 0
     assert "exporters:" in buf.getvalue()
+
+
+# --- broken pipe: `otelq ... | head` must exit cleanly, not dump a traceback ---
+
+
+def test_main_handles_broken_pipe() -> None:
+    import io as _io
+    from contextlib import redirect_stdout
+
+    class _BrokenStream(_io.TextIOBase):
+        def write(self, s: str) -> int:
+            raise BrokenPipeError()
+
+    with redirect_stdout(_BrokenStream()):
+        rc = otelq.main(["collector-config"])  # prints, so it hits the broken write
+    assert rc == 0  # swallowed, no traceback escaped

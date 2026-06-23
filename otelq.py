@@ -1467,8 +1467,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "collector-config":
         print(render_collector_config())
         return 0
@@ -1483,6 +1482,22 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     print(format_output(columns, rows, args.format))
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return _dispatch(args)
+    except BrokenPipeError:
+        # Downstream closed the pipe (e.g. `otelq ... | head`). Point stdout at
+        # /dev/null so the interpreter's flush-on-exit doesn't re-raise, and exit
+        # cleanly. (When stdout has no real fd — e.g. under test capture — the
+        # dup2 is simply skipped.)
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except (OSError, ValueError):
+            pass
+        return 0
 
 
 if __name__ == "__main__":

@@ -1,0 +1,18 @@
+# Overlay for `just otel-demo` (used together with compose.yaml).
+#
+# Runs the demo as its own Compose project, "otelq-demo", fully isolated from the
+# standalone `just otel-up` project ("otelq"): separate network, and a distinct
+# collector container name. The otelgen generators still reach the collector by
+# its SERVICE name (otel-collector:4317) over the project network, so renaming the
+# container does not affect them.
+#
+# The demo collector publishes NO host ports: the generators reach it over the
+# Docker project network, not via localhost. So clear the host-port mapping here.
+# This lets the demo run even when another project's collector already owns host
+# ports 4317/4318 — the demo never competes for them. (Standalone `just otel-up`
+# still publishes 4317/4318 for a real app on the host; only the demo drops them.)
+name: otelq-demo
+services:
+  otel-collector:
+    container_name: otelq-demo-collector
+    ports: !override []
