@@ -37,12 +37,13 @@ start, stop, or clean it. otelq only reads the telemetry dir and owns the
 an integrated setup (those target otelq's *bundled* Collector and `otel-clean`
 truncates the JSONL files).
 
-**Never add otelgen or the demo to `$TARGET`.** The synthetic-telemetry generators
-(the `demo` Compose profile / `just otel-demo`) exist **only in the otelq repo** as
-a way to try otelq without instrumenting an app. They are a testing aid for this
-project, not part of any integration. Into `$TARGET` you add **only** the three
-`file/*` exporters, the pipeline wiring, and the bind mount — nothing else. The
-real telemetry comes from `$TARGET`'s own application; otelgen has no place there.
+**Never add telemetrygen or the demo to `$TARGET`.** The synthetic-telemetry
+generators (the `demo` Compose profile / `just otel-demo`) exist **only in the
+otelq repo** as a way to try otelq without instrumenting an app. They are a testing
+aid for this project, not part of any integration. Into `$TARGET` you add **only**
+the three `file/*` exporters, the pipeline wiring, and the bind mount — nothing
+else. The real telemetry comes from `$TARGET`'s own application; telemetrygen has
+no place there.
 
 ## Steps
 

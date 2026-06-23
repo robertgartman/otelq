@@ -55,14 +55,15 @@ Run `just otel-clean` to reset captured telemetry (empties the active JSONL file
 No app to instrument yet? Generate synthetic telemetry with one command:
 
 ```sh
-just otel-demo        # starts the Collector, then runs otelgen for ~15s
-just otelq summary    # now there is traces + logs data to query
+just otel-demo        # starts the Collector, then runs telemetrygen for ~15s
+just otelq summary    # now there is traces + metrics + logs data to query
 just otelq slow --top 5
+just otelq metric gen # the synthetic gauge telemetrygen emits
 ```
 
-`just otel-demo` brings up the Collector and runs [otelgen](https://github.com/krzko/otelgen) (the `demo` Compose profile) to push ~15s of synthetic **traces and logs** through it, populating `telemetry/`. It's the fastest way to exercise otelq — and the `query-telemetry` skill — on a fresh clone. (Metrics aren't generated: otelgen's metrics CLI is broken upstream at the pinned version.)
+`just otel-demo` brings up the Collector and runs [telemetrygen](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen) — the official OpenTelemetry load generator, part of `opentelemetry-collector-contrib` — under the `demo` Compose profile to push ~15s of synthetic **traces, metrics, and logs** through the Collector, populating `telemetry/`. It's the fastest way to exercise otelq and the `query-telemetry` skill on a fresh clone.
 
-> The demo generators live **only in this repo** as a testing aid. They are **not** part of integrating otelq into another project — that path adds only the Collector's file exporters (see [Collector: standalone or integrated](#collector-standalone-or-integrated)), never otelgen.
+> The demo generators live **only in this repo** as a testing aid. They are **not** part of integrating otelq into another project — that path adds only the Collector's file exporters (see [Collector: standalone or integrated](#collector-standalone-or-integrated)), never telemetrygen.
 
 ## Install / run options
 

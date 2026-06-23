@@ -2,7 +2,7 @@
 #
 # Runs the demo as its own Compose project, "otelq-demo", fully isolated from the
 # standalone `just otel-up` project ("otelq"): separate network, and a distinct
-# collector container name. The otelgen generators still reach the collector by
+# collector container name. The telemetrygen generators still reach the collector by
 # its SERVICE name (otel-collector:4317) over the project network, so renaming the
 # container does not affect them.
 #
