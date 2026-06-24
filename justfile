@@ -13,7 +13,7 @@ otel-up:
 # published host ports, via compose.demo.yaml, so it never collides with another
 # collector on 4317), then runs telemetrygen generators that push ~15s of traces,
 # metrics, and logs through it over the Docker network, populating telemetry/ so
-# otelq (and the query-telemetry skill) can be tried on a fresh clone.
+# otelq (and the otelq skill) can be tried on a fresh clone.
 otel-demo:
     mkdir -p telemetry
     docker compose -f compose.yaml -f compose.demo.yaml --profile otel up -d

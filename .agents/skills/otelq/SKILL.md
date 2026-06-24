@@ -1,5 +1,5 @@
 ---
-name: query-telemetry
+name: otelq
 description: "Query logs, metrics, and traces captured from the OpenTelemetry feed using the otelq CLI."
 ---
 
@@ -12,7 +12,7 @@ behaved as intended.
 ## Running otelq
 
 Throughout this skill, **`otelq …`** is shorthand for running the CLI straight
-from the repo with `uvx` — no `just`, no global install, no clone:
+from GitHub with `uvx` — no global install, no clone:
 
 ```
 uvx --from git+https://github.com/robertgartman/otelq otelq --dir telemetry …
@@ -23,19 +23,24 @@ uvx --from git+https://github.com/robertgartman/otelq otelq --dir telemetry …
   extension; both are cached, so later runs are fast (and the build needs
   network once).
 - `--dir telemetry` is required. It is a *global* flag and points otelq at the
-  Collector's output folder (the repo's `telemetry/`). Because `uvx` runs otelq
-  from an isolated build, the default would not resolve to the repo — always
-  pass `--dir`.
+  Collector's output folder — the `telemetry/` directory at this project's root,
+  where the Collector writes its JSONL (the bind-mounted dir set up when otelq was
+  wired in). Because `uvx` runs otelq from an isolated build, the default would
+  not resolve to your project — always pass `--dir`. Adjust the path if your
+  Collector writes elsewhere.
 - To pin a version, append a ref: `…/otelq@v0.1.0 otelq …`.
 
-The Collector itself is still brought up and reset with `just` (see The loop) —
-only the otelq *queries* run through `uvx`.
+otelq only *reads* that directory; bringing the Collector up and resetting it is
+the project's own concern (see The loop).
 
 ## The loop
 
-1. **Start the dev stack** (the Collector starts with it): `just otel-up`
-2. **Enable export:** ensure `OTEL_ENABLED=true` in `.env`, then (re)start the
-   app(s) you are exercising.
+1. **Start the Collector** that writes to `telemetry/`, however this project
+   starts it. *(In the otelq repo itself that is `just otel-up`; in a project that
+   wired otelq into its own Collector, start that Collector the usual way.)*
+2. **Export telemetry:** make sure the app(s) you are exercising are configured to
+   send OTLP to that Collector (e.g. `OTEL_EXPORTER_OTLP_ENDPOINT` points at it),
+   then (re)start them.
 3. **Reproduce** the behaviour (hit an endpoint, run a flow, run a test).
 4. **Query:** `otelq --format json <command>` (the `--format` flag goes *before*
    the subcommand — see Commands below).
@@ -77,7 +82,10 @@ Always prefer `--format json` so output is parsed structurally, not scraped.
 
 ## Troubleshooting
 
-- **Empty output / "no telemetry captured":** the Collector is not running
-  (`just otel-up`), or apps started with `OTEL_ENABLED=false`. Fix both, then
-  reproduce again.
-- **Stale data:** `just otel-clean` clears `telemetry/` before a fresh run.
+- **Empty output / "no telemetry captured":** the Collector is not running, or the
+  apps are not exporting OTLP to it. Start the Collector and confirm the app's OTLP
+  export is enabled and pointed at it, then reproduce again. *(In the otelq repo:
+  `just otel-up` and `OTEL_ENABLED=true` in `.env`.)*
+- **Stale data:** clear `telemetry/` before a fresh run. Stop the Collector first —
+  truncating those files while it is writing corrupts them — then empty the dir
+  while it is down. *(In the otelq repo: `just otel-clean` does this safely.)*

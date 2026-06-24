@@ -1,6 +1,6 @@
 ---
 name: otelq-collector-setup
-description: "Use from the otelq repo to wire otelq into your project on the same host — adds otelq's file-export pipeline to your project's existing OpenTelemetry Collector (or scaffolds one) so otelq can read its telemetry, then verifies the wiring. Asks for the target project's absolute path."
+description: "Use from the otelq repo to wire otelq into your project on the same host — adds otelq's file-export pipeline to your project's existing OpenTelemetry Collector (or scaffolds one) so otelq can read its telemetry, verifies the wiring, and installs the otelq query skill into the target so its AI agent can drive the otelq CLI. Asks for the target project's absolute path."
 ---
 
 # Integrate otelq with your project's Collector
@@ -13,10 +13,12 @@ to the **target project's** Collector so otelq can read what that project emits.
 
 **Before doing anything, ask the user for the absolute path to the target
 project** (the project whose Collector should be wired up), e.g.
-`/Users/me/dev/my-service`. Call it `$TARGET`. Every file you read or edit in the
-steps below lives under `$TARGET` — **never** edit files inside the otelq repo for
-this task. The only otelq command you run is `otelq collector-config` (and the
-read-only `doctor` / `summary` checks).
+`/Users/me/dev/my-service`. Call it `$TARGET`. Every file you **edit** in the steps
+below lives under `$TARGET` — **never** edit files inside the otelq repo for this
+task. (One step *reads* a file from the otelq repo — the canonical query skill — and
+copies it into `$TARGET`; reading the otelq repo is fine, editing it is not.) The
+only otelq command you run is `otelq collector-config` (and the read-only `doctor` /
+`summary` checks).
 
 otelq reads OTLP signals as JSONL from a shared `telemetry/` directory — that
 directory is the entire contract (see
@@ -119,8 +121,27 @@ pin a version, append a ref: `…/otelq@v0.1.0 otelq …`.
    the pipeline wiring. It is generated from otelq's own constants, so it always
    matches the contract — prefer it over hand-writing the config.
 
-4. **Merge it — tee, don't replace.** Add the three `file/*` exporters, then
-   **append** `file/traces` / `file/logs` / `file/metrics` to the **existing**
+4. **Reconcile any existing `file/*` exporters — otelq owns these definitions.**
+   Before merging, check whether `$TARGET`'s config **already defines** `file/traces`,
+   `file/logs`, or `file/metrics` exporter blocks (a prior integration, a hand-rolled
+   setup, or an older otelq version may have left them). If so, **diff each existing
+   block against the canonical fragment from step 3** — the `path`, `flush_interval`,
+   and `rotation` (`max_megabytes` / `max_backups`) settings in particular.
+   - **Identical** → leave it; nothing to do for that exporter.
+   - **Differs in any field** → **replace the whole exporter block with otelq's
+     canonical version.** otelq is the master for these definitions: the rotation
+     and path settings are generated from otelq's own constants and the contract
+     depends on them (e.g. `send_batch_max_size`/rotation interplay, the exact
+     `/telemetry/<signal>.jsonl` paths otelq reads). A stale local copy that merely
+     *looks* wired up can silently break `doctor`/queries, so do not preserve the
+     target's drifted values — overwrite them.
+
+   This reconcile is about the exporter **definitions** only. Pipeline membership is
+   still additive (next step) — never drop the target's *other* exporters.
+
+5. **Merge it — tee, don't replace.** Ensure the three `file/*` exporters exist
+   (added fresh, or reconciled per step 4), then **append** `file/traces` /
+   `file/logs` / `file/metrics` to the **existing**
    `service.pipelines.<signal>.exporters` lists. Keep every exporter that is
    already there:
 
@@ -132,7 +153,7 @@ pin a version, append a ref: `…/otelq@v0.1.0 otelq …`.
    so this tee is what makes otelq see the data — and is also why the verify probe
    needs the blast-radius check below.
 
-5. **Create the host telemetry dir and bind-mount it** into the Collector service:
+6. **Create the host telemetry dir and bind-mount it** into the Collector service:
 
    ```sh
    mkdir -p "$TARGET/telemetry"          # create it first, or Docker makes it root-owned
@@ -142,7 +163,7 @@ pin a version, append a ref: `…/otelq@v0.1.0 otelq …`.
      - ./telemetry:/telemetry            # host dir : the contract mount path
    ```
 
-6. **Gitignore the captured telemetry** in `$TARGET` (mirror otelq's own rule), so
+7. **Gitignore the captured telemetry** in `$TARGET` (mirror otelq's own rule), so
    neither the Collector output nor otelq's cache is committed:
 
    ```gitignore
@@ -170,7 +191,7 @@ otelq), modelled on otelq's reference producer:
    (`4317`/`4318`). `otelq collector-config` documents the same exporters/mount for
    cross-reference.
 3. `mkdir -p "$TARGET/telemetry"` and add the **same gitignore** rule as Path A
-   step 6.
+   step 7.
 
 The app then points `OTEL_EXPORTER_OTLP_ENDPOINT` at this Collector. Because this
 Collector is `$TARGET`'s, `$TARGET` owns its lifecycle — otelq still only reads the
@@ -181,7 +202,8 @@ directory.
 ## Present the plan, then apply
 
 Before editing, **show the user the concrete changes** (which files, the exporter +
-pipeline edits, the bind mount, the gitignore) and ask whether to **apply
+pipeline edits, the bind mount, the gitignore, and the otelq query skill copied in —
+see below) and ask whether to **apply
 step-by-step (confirm each)** or **run to the end**. Then make the edits and have
 `$TARGET`'s Collector **(re)start to load the new config** — a one-time, consented
 setup action on the project's own service. This does not change the lifecycle
@@ -278,6 +300,48 @@ emits.
    avoids by stopping the Collector first). To actually clear it, let `$TARGET`'s
    owner restart its Collector and empty the files while it is down — otelq must not
    stop a Collector it does not own.
+
+## Install the otelq query skill into `$TARGET`
+
+Wiring the Collector only gets telemetry onto disk. For `$TARGET`'s AI coding agent
+to actually *use* otelq — to know the `otelq` commands and the query loop — the
+target project needs the **otelq query skill** as well. Without it the CLI is wired
+up but the agent has no instructions for it, so the `otelq` command is effectively
+dead weight in that project. Install a **verbatim copy** of this repo's canonical
+query skill, `.agents/skills/otelq/SKILL.md`, into `$TARGET`.
+
+This is the one step that **reads** a file inside the otelq repo (the canonical
+skill) and **writes** it into `$TARGET` — it still never *edits* anything in the
+otelq repo, and otelq stays the master for the skill's content.
+
+1. **Ask the user where to install it — this is driven by their AI coding agent,**
+   because different agents discover skills in different places, and from the otelq
+   repo we cannot know which agent `$TARGET` uses. Offer:
+   - **`.agents/skills/otelq/SKILL.md`** — the cross-agent `.agents/skills` standard.
+     The most portable choice; **recommend this** unless the user knows their agent
+     needs something else.
+   - **`.claude/skills/otelq/SKILL.md`** — Claude Code's project-scoped skills dir.
+   - **An agent-specific path the user names** — e.g. another tool's skills
+     directory. Take the location from the user rather than guessing.
+
+   Whatever they pick, keep the trailing `otelq/SKILL.md` shape (a directory named
+   `otelq` containing `SKILL.md`), and install **project-scoped inside `$TARGET`**
+   (not into a global/user skills dir) so the skill travels with the repo.
+
+2. **Copy it verbatim** from the otelq repo into the chosen location under `$TARGET`.
+   Do not rewrite, trim, or "adapt" the content — otelq is the master for this skill,
+   exactly as it is for the `collector-config` fragment, so a copy that drifts is a
+   bug:
+
+   ```sh
+   DEST="$TARGET/.agents/skills/otelq"          # or the location the user chose
+   mkdir -p "$DEST"
+   cp .agents/skills/otelq/SKILL.md "$DEST/SKILL.md"
+   ```
+
+3. **Confirm it landed** — `git -C "$TARGET" status` should show the new skill file,
+   so it is committed alongside the integration (the commit in the verify step picks
+   it up). Tell the user the otelq command is now usable by `$TARGET`'s agent.
 
 ## When something is off
 

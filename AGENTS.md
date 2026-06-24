@@ -13,7 +13,7 @@ Creates `telemetry/` and brings up the dev OTel Collector (OTLP gRPC `:4317` / H
 **2. Find the canonical truth.** All design decisions live in [`context/`](./context/CONTEXT.md). Read [CONTEXT.md](./context/CONTEXT.md) **first** — it routes you to the right doc by task type. Document precedence is **ADR > CONTRACT > SPEC > PRD** when in conflict.
 
 **3. Pick the right skill for your task**:
-- Capturing + inspecting telemetry to verify a change works → `query-telemetry` (the canonical loop: emit signals at the Collector, then query them with `otelq`)
+- Capturing + inspecting telemetry to verify a change works → `otelq` (the canonical loop: emit signals at the Collector, then query them with `otelq`)
 - Creating or updating context docs (PRD/SPEC/ADR/CONTRACT) → follow [CONTEXT.md](./context/CONTEXT.md) discipline (right type, right folder, frontmatter, precedence)
 
 **4. Architectural non-negotiables** (deviations require an ADR):

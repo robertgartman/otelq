@@ -1,6 +1,6 @@
 ---
 name: otelq-collector-setup
-description: "Run from the otelq repo to wire otelq into your project on the same host: add otelq's file-export pipeline to your project's existing OpenTelemetry Collector (or scaffold one) so otelq can read its telemetry, then verify the wiring. Asks for the target project's absolute path first."
+description: "Run from the otelq repo to wire otelq into your project on the same host: add otelq's file-export pipeline to your project's existing OpenTelemetry Collector (or scaffold one) so otelq can read its telemetry, verify the wiring, and install the otelq query skill into the target so its AI agent can drive the otelq CLI. Asks for the target project's absolute path first."
 allowed-tools: Bash, Read, Edit, Write
 user-invocable: true
 ---

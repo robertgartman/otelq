@@ -5,16 +5,16 @@
 
 **Give your AI coding agent eyes on your app's traces, logs, and metrics.**
 
-otelq is a tiny command-line tool that turns the OpenTelemetry signals your application already emits into answers — straight from the terminal, in the same loop your AI agent codes in. Run the app, then ask *"did the request error?"*, *"what was slow?"*, *"show me trace X"* and get a structured answer back. No Jaeger, no Grafana, no SigNoz, no server, no UI.
+otelq is a tiny command-line tool that turns the OpenTelemetry signals your application already emits into answers — straight from the terminal, in the same loop your AI agent codes in. Run your code, then have your agent ask *"did the request error?"*, *"what was slow?"*, *"show me trace X"* and get a structured answer back. No Jaeger, no Grafana, no SigNoz, no server, no UI.
 
 ## Why otelq
 
 - **Built for AI coding agents.** Feed close-the-loop verification with real traces, logs, and metrics from any OpenTelemetry-compliant app: make a change, run it, and let the agent confirm from telemetry that it actually worked.
-- **Lightweight, fast, token-efficient.** A single-file CLI invoked on demand — structured `json`/`csv`/`table` output an agent can parse, not dashboards to scrape. No always-on services burning resources or context.
-- **Zero heavy infrastructure.** A stock OpenTelemetry Collector writes signals to plain JSONL files; otelq reads them in-process with DuckDB. Nothing to deploy, nothing to run between queries. A one-shot bundled demo gets you querying real signals in seconds.
+- **Lightweight, fast, token-efficient.** A single-file CLI invoked on demand — structured `json`/`csv`/`table` output an agent can parse, not dashboards to scrape, no MCPs crunching your tokens. No always-on services burning resources or context.
+- **Zero heavy infrastructure.** A stock [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) writes signals to plain JSONL files; otelq reads them in-process with DuckDB. Nothing to deploy, nothing to run between queries. A one-shot bundled demo gets you querying real signals in seconds.
 - **Fully local, fully isolated.** Telemetry never leaves your machine — it lives in a directory you own and read directly. Nothing is shipped to a backend, a vendor, or the cloud.
 
-## Give it a try
+## Give it a dry run
 
 See it work in under a minute — no app to instrument. Clone the repo and run the demo: it starts the Collector and pushes ~15s of synthetic traces, metrics, and logs through it with [telemetrygen](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen), the official OpenTelemetry load generator.
 
@@ -57,7 +57,7 @@ flowchart TB
   subgraph host["Local host — nothing leaves your machine"]
     apps["Applications generating OpenTelemetry<br/>(your services, tests, scripts)"]
     collector["OpenTelemetry Collector<br/>· Docker container ·"]
-    skill["query-telemetry skill"]
+    skill["otelq skill"]
     otelq["otelq · host CLI"]
 
     subgraph project["Your project"]
@@ -73,7 +73,7 @@ flowchart TB
   otelq -->|"reads / writes"| cache
 ```
 
-Your application(s) send OpenTelemetry over OTLP to a Collector running in Docker. The Collector writes each signal as plain JSONL into a `telemetry/` directory bind-mounted from your project. otelq runs on the host — invoked directly or by the `query-telemetry` skill — and reads those `.jsonl` files in-process with DuckDB, keeping an incremental parquet cache under `telemetry/.otelq-cache/` for fast repeat queries.
+Your application(s) send OpenTelemetry over OTLP to a Collector running in Docker. The Collector writes each signal as plain JSONL into a `telemetry/` directory bind-mounted from your project. otelq runs on the host — invoked directly or by the `otelq` skill — and reads those `.jsonl` files in-process with DuckDB, keeping an incremental parquet cache under `telemetry/.otelq-cache/` for fast repeat queries.
 
 The bind-mounted directory is the entire contract: the Collector writes `traces.jsonl`, `logs.jsonl`, and `metrics.jsonl`; otelq reads those same files. There is no network coupling between the Collector and the CLI — the shared directory is the API.
 
@@ -187,15 +187,10 @@ This repo is built to be driven by AI coding agents:
 
 - **[`AGENTS.md`](AGENTS.md)** — start here. The entry point for agents working in this repo.
 - **[`context/CONTEXT.md`](context/CONTEXT.md)** — the documentation system (PRD / SPEC / ADR / CONTRACT routing rules).
-- **[`.agents/skills/query-telemetry`](.agents/skills/query-telemetry/SKILL.md)** — the query-telemetry skill: capture OTEL signals from the dev Collector and query them with otelq. A `.claude` shim (`.claude/skills/query-telemetry`) mirrors it for Claude Code.
+- **[`.agents/skills/otelq`](.agents/skills/otelq/SKILL.md)** — the otelq skill: capture OTEL signals from the dev Collector and query them with otelq. A `.claude` shim (`.claude/skills/otelq`) mirrors it for Claude Code.
 - **[`.agents/skills/otelq-collector-setup`](.agents/skills/otelq-collector-setup/SKILL.md)** — the otelq-collector-setup skill: run from this repo to wire otelq's file-export pipeline into *another* project's existing Collector (the integrated setup above). It asks for the target project's absolute path and verifies the result with `otelq doctor`.
 
 The `.claude-plugin` manifest (`.claude-plugin/plugin.json`, `marketplace.json`) is an early distribution path for shipping otelq and its skill as an installable plugin.
-
-## Requirements
-
-- **Docker** — to run the dev OpenTelemetry Collector.
-- **[uv](https://docs.astral.sh/uv/)** — to run the CLI (it provisions Python and DuckDB; no separate Python setup needed).
 
 ## Contributing
 

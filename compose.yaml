@@ -9,7 +9,7 @@
 #
 # The "demo" profile adds telemetrygen generators that push synthetic traces,
 # metrics, and logs through the Collector — a zero-instrumentation way to populate
-# telemetry/ so otelq (and the query-telemetry skill) can be tried on a fresh
+# telemetry/ so otelq (and the otelq skill) can be tried on a fresh
 # clone. Driven by `just otel-demo` (which starts the Collector first, then runs
 # the generators).
 
