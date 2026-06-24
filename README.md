@@ -81,7 +81,7 @@ The bind-mounted directory is the entire contract: the Collector writes `traces.
 
 otelq is a pure *consumer* of the telemetry directory — it never owns or runs a Collector. In any real setup the Collector belongs to **your** project: it is the one your application already sends OTLP to. You connect otelq by **teeing that Collector's output to a directory otelq can read** — add otelq's `file` exporters to the Collector so it also writes `traces.jsonl` / `logs.jsonl` / `metrics.jsonl`, then point otelq at that directory. otelq never starts, stops, or cleans that Collector; it only reads the files and owns its `.otelq-cache/` subtree.
 
-The direction matters: you work **from the otelq repo** and integrate otelq **into your target project** (identified by its absolute path, e.g. `/Users/me/dev/my-service`) — not the other way around. You invoke *your* coding agent onto a skill (otelq-collector-setup) in *this* repo.
+The direction matters: you work **from the otelq repo** and integrate otelq **into your target project** (identified by its absolute path, e.g. `/Users/me/dev/my-service`) — not the other way around. You invoke *your* coding agent onto a skill (target-project-setup) in *this* repo.
 
 ```sh
 # otelq runs straight from GitHub via uvx — no clone, no install:
@@ -92,7 +92,7 @@ otelq collector-config                      # prints the exporters + pipeline wi
 otelq --dir /Users/me/dev/my-service/telemetry doctor    # verify your wiring satisfies the contract
 ```
 
-`collector-config` is generated from otelq's pinned constants, so it never drifts from the contract; `doctor` checks a telemetry directory against it. The `file` exporter requires the `*-contrib` Collector image. The **otelq-collector-setup** skill automates all of this and asks for the target project's path; see below. When exercising your own app is inconvenient, the skill can also confirm the wiring end-to-end with a throwaway [`telemetrygen`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen) probe — committed, run against your Collector over its own network, then reverted — flagging first if the teed pipeline also feeds a real backend.
+`collector-config` is generated from otelq's pinned constants, so it never drifts from the contract; `doctor` checks a telemetry directory against it. The `file` exporter requires the `*-contrib` Collector image. The **target-project-setup** skill automates all of this and asks for the target project's path; see below. When exercising your own app is inconvenient, the skill can also confirm the wiring end-to-end with a throwaway [`telemetrygen`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen) probe — committed, run against your Collector over its own network, then reverted — flagging first if the teed pipeline also feeds a real backend.
 
 > **No Collector yet?** otelq bundles one purely so you can try the tool without instrumenting anything — see [Give it a try](#give-it-a-try). That bundled stack (and the Compose files and optional `just` recipes that manage it) is a **demo and local-dev aid, not a deployment model**: in real use the Collector lives in your project, and otelq just reads what it writes.
 
@@ -188,7 +188,7 @@ This repo is built to be driven by AI coding agents:
 - **[`AGENTS.md`](AGENTS.md)** — start here. The entry point for agents working in this repo.
 - **[`context/CONTEXT.md`](context/CONTEXT.md)** — the documentation system (PRD / SPEC / ADR / CONTRACT routing rules).
 - **[`.agents/skills/otelq`](.agents/skills/otelq/SKILL.md)** — the otelq skill: capture OTEL signals from the dev Collector and query them with otelq. A `.claude` shim (`.claude/skills/otelq`) mirrors it for Claude Code.
-- **[`.agents/skills/otelq-collector-setup`](.agents/skills/otelq-collector-setup/SKILL.md)** — the otelq-collector-setup skill: run from this repo to wire otelq's file-export pipeline into *another* project's existing Collector (the integrated setup above). It asks for the target project's absolute path and verifies the result with `otelq doctor`.
+- **[`.agents/skills/target-project-setup`](.agents/skills/target-project-setup/SKILL.md)** — the target-project-setup skill: run from this repo to wire otelq's file-export pipeline into *another* project's existing Collector (the integrated setup above). It asks for the target project's absolute path and verifies the result with `otelq doctor`.
 
 The `.claude-plugin` manifest (`.claude-plugin/plugin.json`, `marketplace.json`) is an early distribution path for shipping otelq and its skill as an installable plugin.
 

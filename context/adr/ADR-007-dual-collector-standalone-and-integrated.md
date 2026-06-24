@@ -68,7 +68,7 @@ producer topologies** behind the one contract:
   contract layout. This is the normal case for an instrumented project. The
   integration is driven **from the otelq repo onto the target project** (addressed
   by its absolute path): otelq is the tool, the target project is operated on — not
-  the reverse. The `otelq-collector-setup` skill encodes this direction and asks for
+  the reverse. The `target-project-setup` skill encodes this direction and asks for
   the target path before touching anything.
 
 Two CLI affordances make the integrated path reliable:
@@ -102,7 +102,7 @@ a Collector pipeline fans every item out to all of its exporters, synthetic data
 injected into a teed pipeline also reaches that pipeline's other, real exporters; so
 the probe is gated on the teed pipeline's exporter set — unrestricted when only
 `file/*` exporters share the pipeline, flagged when a real backend does. This is
-operational guidance owned by the `otelq-collector-setup` skill; **`doctor` itself
+operational guidance owned by the `target-project-setup` skill; **`doctor` itself
 stays a pure, read-only conformance check and never generates data.**
 
 ## Alternatives Considered

@@ -1,5 +1,5 @@
 ---
-name: otelq-collector-setup
+name: target-project-setup
 description: "Use from the otelq repo to wire otelq into your project on the same host — adds otelq's file-export pipeline to your project's existing OpenTelemetry Collector (or scaffolds one) so otelq can read its telemetry, verifies the wiring, and installs the otelq query skill into the target so its AI agent can drive the otelq CLI. Asks for the target project's absolute path."
 ---
 
@@ -74,7 +74,7 @@ pin a version, append a ref: `…/otelq@v0.1.0 otelq …`.
      so their in-flight work is saved and the tree is clean before otelq touches
      anything — otherwise your edits and the verify probe entangle with theirs.
    - **Either way** → recommend doing the integration on a **dedicated branch**
-     (e.g. `otelq-collector-setup`) rather than on their working branch, so the whole
+   (e.g. `target-project-setup`) rather than on their working branch, so the whole
      change set — including the probe's commit and revert — stays isolated and is
      trivial to review or drop.
    - **Not a git repo** → say so: the commit/revert verify model needs git. Offer to
