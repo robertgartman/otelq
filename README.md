@@ -200,8 +200,9 @@ just otelq-test    # pytest suite
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full setup, the project-specific
-rules (strict typing, the load-bearing `duckdb` pin, the `justfile` gateway), and
-the PR checklist. Participation is governed by the
+rules (strict typing, the load-bearing `duckdb` pin, the `justfile` gateway), the
+maintainer branch/PR/merge workflow for this public repo, and the PR checklist.
+Participation is governed by the
 [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md); report vulnerabilities per
 [`SECURITY.md`](SECURITY.md). Issues and pull requests welcome at
 [github.com/robertgartman/otelq](https://github.com/robertgartman/otelq).
