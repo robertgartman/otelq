@@ -1,0 +1,14 @@
+{
+  "name": "otelq",
+  "description": "Capture and query local OpenTelemetry traces/logs/metrics with the otelq CLI.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Robert Gartman"
+  },
+  "homepage": "https://github.com/robertgartman/otelq",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/robertgartman/otelq.git"
+  },
+  "license": "MIT"
+}

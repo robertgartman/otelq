@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "otelq"
+version = "0.1.0"
+description = "Feed your agentic development setup with Open Telemetry — query OTLP traces/logs/metrics captured by a local dev Collector."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Robert Gartman" }]
+keywords = ["opentelemetry", "otlp", "observability", "duckdb", "cli", "telemetry"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Debuggers",
+]
+dependencies = ["duckdb==1.5.3"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff"]
+
+[project.urls]
+Homepage = "https://github.com/robertgartman/otelq"
+Repository = "https://github.com/robertgartman/otelq"
+Issues = "https://github.com/robertgartman/otelq/issues"
+
+[project.scripts]
+otelq = "otelq:main"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["otelq.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["otelq.py", "tests/", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.11"
+include = ["otelq.py", "tests"]
+# otelq.py is imported by tests/ as a top-level module (sys.path hack), and the
+# duckdb/pytest deps live in the project .venv — point pyright at both so its
+# strict run resolves the same imports the interpreter does.
+extraPaths = ["."]
+venvPath = "."
+venv = ".venv"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]

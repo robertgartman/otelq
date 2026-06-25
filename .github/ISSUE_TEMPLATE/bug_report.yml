@@ -1,0 +1,48 @@
+name: Bug report
+description: Report something in otelq that isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please don't report security
+        issues here — see [SECURITY.md](../blob/main/SECURITY.md) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: Running `uv run otelq.py errors` printed … but I expected …
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran, in order.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: otelq-version
+    attributes:
+      label: otelq version / commit
+      description: Output of `git rev-parse --short HEAD`, or the released version.
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      description: OS, `uv --version`, and the pinned `duckdb` version.
+      placeholder: macOS 15.5, uv 0.7.0, duckdb 1.5.3
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output / errors
+      description: Any traceback or error text. This will be rendered as code.
+      render: shell
+    validations:
+      required: false

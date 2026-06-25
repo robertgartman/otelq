@@ -1,0 +1,30 @@
+name: Dependency Review
+
+# Scans dependency changes in pull requests for known vulnerabilities and
+# disallowed licenses, and fails the PR before a problem dependency is merged.
+# Docs: https://docs.github.com/code-security/supply-chain-security/understanding-your-software-supply-chain/about-dependency-review
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    name: dependency review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v5
+        with:
+          # Block PRs that introduce moderate-or-worse known vulnerabilities.
+          fail-on-severity: moderate
+          # License compliance: only permissive licenses compatible with MIT.
+          # An incoming dependency under any other license fails the check.
+          allow-licenses: Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, MIT, MPL-2.0, Python-2.0, Unlicense, 0BSD, CC0-1.0
+          comment-summary-in-pr: on-failure

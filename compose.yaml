@@ -1,0 +1,60 @@
+# Standalone dev OpenTelemetry Collector for otelq.
+#
+# The contract is the bind mount: the Collector writes OTLP signals as JSONL into
+# ./telemetry on the host, and the otelq CLI reads those same files. There is no
+# network coupling between collector and CLI — the shared directory IS the API.
+#
+# The "otel" profile keeps the Collector opt-in: it only starts when explicitly
+# selected (`docker compose --profile otel up`), so `docker compose up` alone is a no-op.
+#
+# The "demo" profile adds telemetrygen generators that push synthetic traces,
+# metrics, and logs through the Collector — a zero-instrumentation way to populate
+# telemetry/ so otelq (and the otelq skill) can be tried on a fresh
+# clone. Driven by `just otel-demo` (which starts the Collector first, then runs
+# the generators).
+
+# Shared settings for the telemetrygen generator services (profile "demo").
+# telemetrygen is the official OpenTelemetry load generator, part of
+# opentelemetry-collector-contrib (same project as the Collector image above):
+# https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen
+# It reliably emits all three signals. The image is published only as :latest
+# upstream, so it is pinned by immutable digest (multi-arch: amd64 + arm64).
+x-telemetrygen: &telemetrygen
+  image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen@sha256:6bb6a56e325b8e8a600a9d6a5acb7e08a96cfefac08ddab052af540633abce77
+  profiles: ["demo"]
+  restart: "no" # one-shot: emit for --duration, then exit
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.119.0
+    profiles: ["otel"]
+    container_name: otel-collector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-dev.yaml:/etc/otelcol/config.yaml:ro
+      - ./telemetry:/telemetry
+    ports: ["4317:4317", "4318:4318"]
+    restart: unless-stopped
+
+  # telemetrygen generators: each sends ONE signal over OTLP gRPC to the
+  # Collector, which writes it to telemetry/<signal>.jsonl. The signal subcommand
+  # comes first, then flags. The gRPC exporter retries while the Collector comes
+  # up, so no depends_on gate is needed (the just recipe starts the Collector
+  # first regardless).
+  telemetrygen-traces:
+    <<: *telemetrygen
+    command:
+      ["traces", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
+       "--duration", "15s", "--rate", "5", "--service", "otelq-demo"]
+
+  telemetrygen-metrics:
+    <<: *telemetrygen
+    command:
+      ["metrics", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
+       "--duration", "15s", "--rate", "5", "--service", "otelq-demo"]
+
+  telemetrygen-logs:
+    <<: *telemetrygen
+    command:
+      ["logs", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
+       "--duration", "15s", "--rate", "5", "--service", "otelq-demo"]

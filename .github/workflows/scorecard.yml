@@ -1,0 +1,51 @@
+name: Scorecard supply-chain security
+
+# OpenSSF Scorecard runs automated supply-chain security checks and publishes
+# the results to the Security tab (code scanning) plus an auto-updating badge.
+# Docs: https://github.com/ossf/scorecard-action
+
+on:
+  branch_protection_rule:
+  schedule:
+    # Weekly, so the published score and badge stay current.
+    - cron: "27 4 * * 1"
+  push:
+    branches: [main]
+
+# Top-level permissions are read-only; the job below adds only what it needs.
+permissions: read-all
+
+jobs:
+  analysis:
+    name: scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed to upload the results to the code-scanning dashboard.
+      security-events: write
+      # Needed to publish results and get a badge (uses the GitHub OIDC token).
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@v2.4.3
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # Publish results so the repository earns an auto-updating badge.
+          publish_results: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SARIF file
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload to code-scanning
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: results.sarif

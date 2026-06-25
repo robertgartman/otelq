@@ -1,0 +1,16 @@
+{
+  "name": "otelq",
+  "owner": {
+    "name": "Robert Gartman"
+  },
+  "plugins": [
+    {
+      "name": "otelq",
+      "source": {
+        "type": "git",
+        "url": "https://github.com/robertgartman/otelq.git"
+      },
+      "description": "otelq dev-telemetry skill + CLI guidance."
+    }
+  ]
+}
