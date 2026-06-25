@@ -12,7 +12,7 @@ must_not_contain:
   - architectural_rationale
   - external_data_schemas
 created: 2026-06-23
-last_updated: 2026-06-23
+last_updated: 2026-06-25
 related_documents:
   - PRD-otelq
   - SPEC-otelq-incremental-cache
@@ -106,7 +106,13 @@ configuration that produces the raw files.
     `parent_span_id`, `service_name`, `span_name`, `span_kind`, `status_code`
     (`0`=unset, `1`=ok, `2`=error), `status_message`.
   - **`logs`**: `timestamp`, `trace_id`, `service_name`, `severity_text`,
-    `body`.
+    `severity_number`, `body`. `severity_number` is the OTel numeric severity;
+    otelq maps it to a canonical level for `summary` (FR-3) using the standard
+    ranges **TRACE** `1–4`, **DEBUG** `5–8`, **INFO** `9–12`, **WARN** `13–16`,
+    **ERROR** `17–20`, **FATAL** `21–24` (values outside `1–24`, including `0`
+    and null, are **UNSET**). The level is derived from `severity_number`, not
+    the free-form `severity_text`, which carries inconsistent casing in practice
+    (e.g. `Info`).
   - **`metrics`** (and the underlying `metrics_gauge` / `metrics_sum`):
     `timestamp`, `service_name`, `metric_name`, `metric_type`, `value`,
     `metric_unit`. `metric_type` **must** be `gauge` for rows originating from
@@ -119,11 +125,30 @@ configuration that produces the raw files.
 
 ### The seven commands
 
-- **FR-3 — `summary`.** `summary` **must** report, per present signal
-  (`traces`, `logs`, `metrics`), a row containing the record count, the earliest
-  and latest `timestamp`, and the distinct `service_name` count. A signal with no
-  captured data **must** be omitted from the output rows rather than reported as
-  zero.
+- **FR-3 — `summary`.** `summary` **must** report a per-signal breakdown whose
+  columns are, in order, `signal`, `details`, `count`, earliest `timestamp`,
+  latest `timestamp`, and the distinct `service_name` count. Every numeric/time
+  column **must** be scoped to its own row's subset (the count, span, and
+  service count of just those records). Rows are produced **only for present
+  signals**, as follows:
+  - **`traces`** (when present): exactly two rows that partition spans by
+    `duration` — `details = ">1s"` for `duration > 1s` (`> 1e9` ns) and
+    `details = "=<1s"` for the remainder. **Both** rows **must** appear even when
+    a bucket's count is zero.
+  - **`logs`** (when present): one row per canonical severity level
+    (`TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`), the level derived from
+    `severity_number` per the ranges in FR-2. **All six** rows **must** appear
+    even at zero count. Log records whose `severity_number` is outside the
+    canonical ranges **must** contribute an additional `details = "UNSET"` row,
+    shown **only** when its count is non-zero.
+  - **`metrics`** (when present): a single row with an empty `details` (metrics
+    have no meaningful sub-categorization here).
+
+  A signal with **no captured data** contributes **no rows** (its zero-count
+  skeleton is not emitted). When **no** signal is present at all, the friendly
+  empty-telemetry behavior applies (FR-18). The zero-count rule thus governs
+  *sub-rows within a present signal* (e.g. an `ERROR` level with no records), not
+  absent signals.
 - **FR-4 — `errors`.** `errors` **must** return error-status spans
   (`traces` rows with `status_code == 2`) and error/fatal logs (`logs` rows with
   `severity_text` in `{ERROR, FATAL}`), combined into one result and ordered
@@ -244,6 +269,14 @@ configuration that produces the raw files.
 - **EC-10 — Format does not change rows.** Running the same command with
   `--format table`, `--format json`, and `--format csv` yields the same logical
   rows in the same order; only the rendering differs. (INV-3)
+- **EC-11 — Sparse `summary` sub-rows.** Logs present but only at one level (e.g.
+  all `INFO`), and all spans `=<1s`: `summary` still emits the full skeleton for
+  each present signal — the other five log levels and the `>1s` trace bucket
+  appear with count `0` (and null earliest/latest, `0` services). (FR-3)
+- **EC-12 — Level from `severity_number`, not text.** Logs whose `severity_text`
+  is mixed-case (`Info`) but whose `severity_number` is `9` are counted under the
+  `INFO` row; a log whose `severity_number` is outside `1–24` adds an `UNSET`
+  row, which is absent when no such record exists. (FR-3, FR-2)
 
 ## Acceptance Criteria
 
@@ -260,12 +293,15 @@ configuration that produces the raw files.
   `metric_type` rows.
   *Verification hint: `cmd_sql` with `SELECT * FROM <relation> LIMIT 1` per
   relation; assert column names and the `metric_type` set.*
-- **AC-2** (Verifies FR-3): Given a corpus with all three signals, when `summary`
-  runs, then it returns one row per present signal with `count`, earliest/latest
-  `timestamp`, and a distinct-`service_name` count; an absent signal contributes
-  no row.
-  *Verification hint: `test_summary_counts`; assert the present signals and their
-  counts.*
+- **AC-2** (Verifies FR-3): Given a corpus with traces of differing duration,
+  logs across several levels, and metrics, when `summary` runs, then the columns
+  are `signal, details, count, earliest, latest, services` in that order; traces
+  yield a `>1s` and a `=<1s` row; logs yield one row for each of
+  `TRACE/DEBUG/INFO/WARN/ERROR/FATAL`; metrics yield a single row with empty
+  `details`; and each row's count/earliest/latest/services are scoped to that
+  row's subset.
+  *Verification hint: `test_summary_breakdown_rows`; assert the column order, the
+  present (signal, details) pairs, and per-subset counts.*
 - **AC-3** (Verifies FR-4): Given a span with `status_code == 2` and an `ERROR`
   log, when `errors` runs, then both appear in one result, each tagged as a span
   or a log, ordered newest-first by `timestamp`.
@@ -368,6 +404,25 @@ configuration that produces the raw files.
   completes (including the empty-telemetry and skip paths), then no raw `*.jsonl`
   file has been modified or deleted by otelq.
   *Verification hint: `test_ac18_raw_files_unmodified` (checksum before/after).*
+- **AC-23** (Verifies FR-3, EC-11): Given logs all at `INFO` and spans all
+  `=<1s`, when `summary` runs, then the `logs` rows still include
+  `WARN`/`ERROR`/`FATAL`/`DEBUG`/`TRACE` at count `0`, and the `traces` `>1s` row
+  appears at count `0`; the present buckets carry the real counts.
+  *Verification hint: `test_summary_zero_count_skeleton`; assert all six log
+  levels and both trace buckets present with the expected counts.*
+- **AC-24** (Verifies FR-3, FR-2, EC-12): Given logs whose `severity_text` is
+  `Info` but `severity_number` is `9`, plus one log with an out-of-range
+  `severity_number`, when `summary` runs, then the mixed-case records are counted
+  under `INFO` (level taken from `severity_number`) and an `UNSET` row appears
+  with the out-of-range record's count; with no out-of-range record, no `UNSET`
+  row appears.
+  *Verification hint: `test_summary_level_from_severity_number`,
+  `test_summary_unset_row_only_when_present`.*
+- **AC-25** (Verifies FR-3): Given a corpus where only `metrics` is present, when
+  `summary` runs, then it returns exactly the single `metrics` row (empty
+  `details`) and emits no zero-count log/trace skeleton; an absent signal
+  contributes no rows.
+  *Verification hint: `test_summary_absent_signal_has_no_rows`.*
 
 ### Examples
 

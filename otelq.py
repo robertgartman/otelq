@@ -48,6 +48,7 @@ import os
 import shutil
 import sys
 import tempfile
+import textwrap
 import time
 from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timedelta
@@ -1141,23 +1142,76 @@ def format_output(columns: list[str], rows: list[tuple[Any, ...]], fmt: str) -> 
     return "\n".join([render(columns), separator] + [render(r) for r in rows])
 
 
+# Canonical OTel severity levels by severity_number range. `summary` buckets
+# logs by these rather than by the free-form severity_text, which carries
+# inconsistent casing in practice (e.g. "Info"). See SPEC-otelq-cli FR-2/FR-3.
+_LOG_LEVELS: tuple[tuple[str, int, int], ...] = (
+    ("TRACE", 1, 4),
+    ("DEBUG", 5, 8),
+    ("INFO", 9, 12),
+    ("WARN", 13, 16),
+    ("ERROR", 17, 20),
+    ("FATAL", 21, 24),
+)
+_TRACE_SLOW_NS = 1_000_000_000  # 1s in nanoseconds; the >1s / =<1s span split
+# Per-subset aggregates every summary row carries (count, span, distinct services).
+_SUMMARY_AGG = "count(*), min(timestamp), max(timestamp), count(DISTINCT service_name)"
+_SUMMARY_ZERO = (0, None, None, 0)  # a bucket/level present but with no records
+
+
+def _summary_traces(conn: duckdb.DuckDBPyConnection) -> list[Row]:
+    """Two duration buckets; both rows present even when one is empty (FR-3)."""
+    bucket = f"CASE WHEN duration > {_TRACE_SLOW_NS} THEN '>1s' ELSE '=<1s' END"
+    got = {
+        r[0]: r[1:]
+        for r in conn.execute(
+            f"SELECT {bucket} AS b, {_SUMMARY_AGG} FROM traces GROUP BY b"
+        ).fetchall()
+    }
+    return [("traces", b, *got.get(b, _SUMMARY_ZERO)) for b in (">1s", "=<1s")]
+
+
+def _summary_logs(conn: duckdb.DuckDBPyConnection) -> list[Row]:
+    """One row per canonical level (all six present, zeros included), plus an
+    UNSET row only when out-of-range severities exist (FR-3). Level is derived
+    from severity_number, not severity_text (FR-2)."""
+    cases = " ".join(
+        f"WHEN severity_number BETWEEN {lo} AND {hi} THEN '{name}'"
+        for name, lo, hi in _LOG_LEVELS
+    )
+    level = f"CASE {cases} ELSE 'UNSET' END"
+    got = {
+        r[0]: r[1:]
+        for r in conn.execute(
+            f"SELECT {level} AS lvl, {_SUMMARY_AGG} FROM logs GROUP BY lvl"
+        ).fetchall()
+    }
+    rows: list[Row] = [
+        ("logs", name, *got.get(name, _SUMMARY_ZERO)) for name, _lo, _hi in _LOG_LEVELS
+    ]
+    if "UNSET" in got:
+        rows.append(("logs", "UNSET", *got["UNSET"]))
+    return rows
+
+
+def _summary_metrics(conn: duckdb.DuckDBPyConnection) -> Row:
+    """A single row; metrics carry no meaningful sub-categorization (FR-3)."""
+    return ("metrics", "", *_one_row(conn.execute(f"SELECT {_SUMMARY_AGG} FROM metrics")))
+
+
 def cmd_summary(
     conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
 ) -> CommandResult:
     have = _existing_relations(conn)
-    columns = ["signal", "count", "earliest", "latest", "services"]
+    columns = ["signal", "details", "count", "earliest", "latest", "services"]
     rows: list[Row] = []
-    for signal in ("traces", "logs", "metrics"):
-        if signal not in have:
-            continue
-        count, lo, hi, services = _one_row(
-            conn.execute(
-                f"SELECT count(*), min(timestamp), max(timestamp), "
-                f"count(DISTINCT service_name) FROM {signal}"
-            )
-        )
-        rows.append((signal, count, lo, hi, services))
-    if not rows:
+    if "traces" in have:
+        rows += _summary_traces(conn)
+    if "logs" in have:
+        rows += _summary_logs(conn)
+    if "metrics" in have:
+        rows.append(_summary_metrics(conn))
+    if not rows:  # no signal present at all -> friendly empty-telemetry path (FR-18)
         raise NoTelemetryError(_NO_TELEMETRY_MSG)
     return columns, rows
 
@@ -1354,6 +1408,44 @@ def render_collector_config() -> str:
     )
 
 
+def render_troubleshooting() -> str:
+    """Emit the capture → query loop and the common fixes.
+
+    Project-agnostic on purpose: this command ships in the CLI and is the
+    single home for the loop/fixes guidance, so the query skill can stay a
+    thin pointer (`otelq troubleshoot`) instead of restating it.
+    """
+    return "\n".join(
+        [
+            "The capture → query loop",
+            "",
+            "  1. Start the Collector that writes to your telemetry dir, however this",
+            "     project starts it.",
+            "  2. Make sure the apps you are exercising export OTLP to that Collector",
+            "     (e.g. OTEL_EXPORTER_OTLP_ENDPOINT points at it), then (re)start them.",
+            "  3. Reproduce the behaviour (hit an endpoint, run a flow, run a test).",
+            "  4. Query:  otelq --dir <dir> --format json <command>",
+            "  5. Inspect the JSON, then iterate.",
+            "",
+            "otelq only *reads* the telemetry dir; bringing the Collector up and",
+            "resetting it is the project's own concern.",
+            "",
+            "Fixes",
+            "",
+            '  Empty output / "no telemetry captured"',
+            "      The Collector is not running, or the apps are not exporting OTLP to",
+            "      it. Start the Collector, confirm the app's OTLP export is enabled and",
+            "      pointed at it, then reproduce again. Run `otelq doctor` to check the",
+            "      dir against the contract.",
+            "",
+            "  Stale data",
+            "      Clear the telemetry dir before a fresh run. Stop the Collector first —",
+            "      truncating those files while it is writing corrupts them — then empty",
+            "      the dir while it is down.",
+        ]
+    )
+
+
 def _validate_active_file(path: Path, signal: str) -> tuple[str, str]:
     """Check one signal's active .jsonl against the contract framing."""
     if not path.exists():
@@ -1421,6 +1513,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="otelq",
         description="Query OTLP telemetry captured by the dev OTel Collector.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(
+            """\
+            argument order:
+              --dir / --format / --all / --no-cache are GLOBAL flags and must come
+              BEFORE the subcommand:  otelq --format json errors   (not: otelq errors
+              --format json). Subcommand flags (--since, --top, --service, ...) go
+              after. Prefer --format json so output is parsed, not scraped.
+
+            sql views (for `otelq sql "<query>"`):
+              traces   timestamp, duration (ns), trace_id, span_id, parent_span_id,
+                       service_name, span_name, span_kind,
+                       status_code (0=unset,1=ok,2=error), status_message
+              logs     timestamp, trace_id, service_name, severity_text, body
+              metrics  timestamp, service_name, metric_name, metric_type, value,
+                       metric_unit
+              also: metrics_gauge, metrics_sum
+
+            Run `otelq troubleshoot` for the capture → query loop and common fixes.
+            """
+        ),
     )
     parser.add_argument(
         "--dir",
@@ -1477,12 +1590,19 @@ def build_parser() -> argparse.ArgumentParser:
         "doctor",
         help="check that --dir satisfies the telemetry contract",
     )
+    sub.add_parser(
+        "troubleshoot",
+        help="print the capture → query loop and common fixes",
+    )
     return parser
 
 
 def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "collector-config":
         print(render_collector_config())
+        return 0
+    if args.command == "troubleshoot":
+        print(render_troubleshooting())
         return 0
     if args.command == "doctor":
         rows, ok = doctor_report(args.dir)

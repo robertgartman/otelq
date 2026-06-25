@@ -166,6 +166,7 @@ docker compose --profile otel up -d
 | `sql`     | Ad-hoc SQL over the `traces`/`logs`/`metrics` views       |
 | `collector-config` | Print the file-export fragment to add to an existing Collector |
 | `doctor`  | Check that a telemetry dir satisfies the contract (`--dir`) |
+| `troubleshoot` | Print the capture → query loop and common fixes |
 
 **Argument-order rule:** `--format` (`table` \| `json` \| `csv`) is a global flag and goes **before** the subcommand. The same applies to `--all` and `--no-cache`. The `--since` window (e.g. `10m`, `2h`, `1d`) goes after the subcommand.
 

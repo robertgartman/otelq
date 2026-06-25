@@ -110,10 +110,104 @@ def test_format_output_table_empty() -> None:
     assert otelq.format_output(["a"], [], "table") == "(no rows)"
 
 
-def test_summary_counts(synth_conn: duckdb.DuckDBPyConnection) -> None:
+def _summary_conn(
+    *,
+    traces: list[tuple[str, int, str]] | None = None,
+    logs: list[tuple[str, int, str, str]] | None = None,
+    with_metrics: bool = False,
+) -> duckdb.DuckDBPyConnection:
+    """Minimal in-memory conn for summary tests: only the columns cmd_summary
+    reads (traces.duration, logs.severity_number, the metrics view)."""
+    conn = duckdb.connect(":memory:")
+    if traces is not None:
+        conn.execute(
+            "CREATE TABLE traces "
+            "(timestamp TIMESTAMP_MS, duration BIGINT, service_name VARCHAR)"
+        )
+        if traces:
+            conn.executemany("INSERT INTO traces VALUES (?, ?, ?)", traces)
+    if logs is not None:
+        conn.execute(
+            "CREATE TABLE logs (timestamp TIMESTAMP_MS, severity_number INTEGER, "
+            "severity_text VARCHAR, service_name VARCHAR)"
+        )
+        if logs:
+            conn.executemany("INSERT INTO logs VALUES (?, ?, ?, ?)", logs)
+    if with_metrics:
+        conn.execute(
+            "CREATE TABLE metrics_gauge (timestamp TIMESTAMP_MS, service_name VARCHAR, "
+            "metric_name VARCHAR, metric_unit VARCHAR, value DOUBLE)"
+        )
+        conn.execute("INSERT INTO metrics_gauge VALUES ('2026-05-22 10:00:00','svc','m','1',1.0)")
+        otelq.create_unified_metrics_view(conn)
+    return conn
+
+
+def test_summary_breakdown_rows(synth_conn: duckdb.DuckDBPyConnection) -> None:
+    # AC-2 / FR-3: details column + per-signal breakdown, scoped per row.
+    columns, rows = otelq.cmd_summary(synth_conn, Namespace())
+    assert columns == ["signal", "details", "count", "earliest", "latest", "services"]
+    count = {(r[0], r[1]): r[2] for r in rows}
+    # traces (5/90/12 ms) all fall in =<1s
+    assert count[("traces", ">1s")] == 0
+    assert count[("traces", "=<1s")] == 3
+    # logs: one INFO (sevnum 9), one ERROR (sevnum 17)
+    assert count[("logs", "INFO")] == 1
+    assert count[("logs", "ERROR")] == 1
+    # metrics: single row, empty details, 2 gauge + 1 sum = 3
+    assert count[("metrics", "")] == 3
+    # per-subset services: ERROR logs came only from catalog-api
+    err = next(r for r in rows if r[:2] == ("logs", "ERROR"))
+    assert err[5] == 1
+
+
+def test_summary_zero_count_skeleton(synth_conn: duckdb.DuckDBPyConnection) -> None:
+    # AC-23 / EC-11: present signals show their full skeleton, zeros included.
     _columns, rows = otelq.cmd_summary(synth_conn, Namespace())
-    by_signal = {r[0]: r[1] for r in rows}
-    assert by_signal == {"traces": 3, "logs": 2, "metrics": 3}
+    levels = [r[1] for r in rows if r[0] == "logs"]
+    assert levels == ["TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"]
+    by = {(r[0], r[1]): r for r in rows}
+    for lvl in ("TRACE", "DEBUG", "WARN", "FATAL"):
+        row = by[("logs", lvl)]
+        assert row[2] == 0  # count
+        assert row[3] is None and row[4] is None  # earliest / latest
+        assert row[5] == 0  # services
+    assert by[("traces", ">1s")][2] == 0  # both buckets present, >1s empty
+
+
+def test_summary_level_from_severity_number() -> None:
+    # AC-24 / EC-12: level comes from severity_number, not mixed-case text.
+    conn = _summary_conn(
+        logs=[
+            ("2026-05-22 10:00:00", 9, "Info", "svc"),
+            ("2026-05-22 10:00:01", 9, "info", "svc"),
+        ]
+    )
+    count = {(r[0], r[1]): r[2] for r in otelq.cmd_summary(conn, Namespace())[1]}
+    assert count[("logs", "INFO")] == 2
+    assert ("logs", "UNSET") not in count  # no out-of-range record
+
+
+def test_summary_unset_row_only_when_present() -> None:
+    # AC-24 / EC-12: out-of-range severities surface as an UNSET row.
+    conn = _summary_conn(
+        logs=[
+            ("2026-05-22 10:00:00", 9, "Info", "svc"),
+            ("2026-05-22 10:00:01", 0, "", "svc"),  # 0 -> UNSET
+            ("2026-05-22 10:00:02", 99, "WAT", "svc"),  # out of range -> UNSET
+        ]
+    )
+    count = {(r[0], r[1]): r[2] for r in otelq.cmd_summary(conn, Namespace())[1]}
+    assert count[("logs", "INFO")] == 1
+    assert count[("logs", "UNSET")] == 2
+
+
+def test_summary_absent_signal_has_no_rows() -> None:
+    # AC-25 / FR-3: a wholly-absent signal contributes no zero-count skeleton.
+    conn = _summary_conn(with_metrics=True)  # only metrics present
+    _columns, rows = otelq.cmd_summary(conn, Namespace())
+    assert len(rows) == 1
+    assert rows[0][:3] == ("metrics", "", 1)
 
 
 def test_summary_raises_when_empty() -> None:
@@ -134,8 +228,7 @@ def test_integration_reads_real_fixture() -> None:
     """connect() + the duckdb-otlp extension read genuine Collector output."""
     conn = otelq.connect(TESTDATA)
     _columns, rows = otelq.cmd_summary(conn, Namespace())
-    by_signal = {r[0]: r[1] for r in rows}
-    assert by_signal.get("traces", 0) > 0
+    assert sum(r[2] for r in rows if r[0] == "traces") > 0
 
 
 def test_errors_finds_error_span_and_log(
@@ -425,7 +518,9 @@ def test_fabricated_corpus_roundtrips(temp_telemetry: Path) -> None:
     )
     write_jsonl(temp_telemetry / "metrics.jsonl", [make_gauge(base), make_sum(base)])
     conn = otelq.connect(temp_telemetry)
-    by = {r[0]: r[1] for r in otelq.cmd_summary(conn, Namespace())[1]}
+    by: dict[str, int] = {}
+    for r in otelq.cmd_summary(conn, Namespace())[1]:  # sum the per-signal breakdown
+        by[r[0]] = by.get(r[0], 0) + r[2]
     assert by == {"traces": 1, "logs": 1, "metrics": 2}
     row = conn.execute("SELECT min(timestamp) FROM traces").fetchone()
     assert row is not None
@@ -592,12 +687,14 @@ def _run_both(dirpath: Path, *argv: str) -> tuple[str, str]:
 
 
 def _signal_count(dirpath: Path, signal: str, *argv: str) -> int:
-    out = _run(dirpath, *argv)
-    for row in _json.loads(out):
-        if row["signal"] == signal:
-            count: int = row["count"]
-            return count
-    return 0
+    # summary breaks a signal into several rows (trace buckets, log levels), so
+    # the signal's total is the sum of its rows' counts.
+    return _sum_signal(_run(dirpath, *argv), signal)
+
+
+def _sum_signal(out: str, signal: str = "traces") -> int:
+    """Total count for a signal across summary's per-row breakdown."""
+    return sum(r["count"] for r in _json.loads(out) if r["signal"] == signal)
 
 
 def _minutes_per_minute(base: datetime, n: int) -> list[dict[str, Any]]:
@@ -631,7 +728,7 @@ def test_ac3_rotation_no_gap_no_dup(temp_telemetry: Path) -> None:
     cached = _run(temp_telemetry, "summary")  # HOT route — exercises the cache
     nocache = _run(temp_telemetry, "--no-cache", "summary")
     assert cached == nocache
-    assert _json.loads(cached)[0]["count"] == 9  # all 9 spans, none lost/duplicated
+    assert _sum_signal(cached) == 9  # all 9 spans, none lost/duplicated
 
 
 # --- AC-5 / FR-5 / EC-2: cold start seals only the hot window ------------------
@@ -732,7 +829,7 @@ def test_ac14_version_mismatch_self_heals(temp_telemetry: Path) -> None:
     cur = _json.loads((cdir / otelq.CURSOR_FILENAME).read_text())
     assert cur["version"] == otelq.CURSOR_SCHEMA_VERSION
     assert not stray.exists()  # wiped
-    assert _json.loads(_run(temp_telemetry, "summary"))[0]["count"] == 6
+    assert _signal_count(temp_telemetry, "traces", "summary") == 6
 
 
 # --- AC-15 / FR-15 / EC-4, EC-5: partial line + oversized batch are skipped ----
@@ -764,7 +861,7 @@ def test_ac15_robust_tail_parsing(temp_telemetry: Path) -> None:
         fh.write(_json.dumps(big) + "\n")
         fh.write('{"resourceSpans": [ {"partial"')  # truncated trailing line
     out, err = _run_both(temp_telemetry, "--all", "summary")
-    assert _json.loads(out)[0]["count"] == 5  # only the valid spans
+    assert _sum_signal(out) == 5  # only the valid spans
     assert "exceeds the 2048-row" in err  # oversized batch warned + skipped
 
 
@@ -813,7 +910,7 @@ def test_ac20_zeroed_st_ino_disambiguates(
     monkeypatch.undo()
     nocache = _run(temp_telemetry, "--no-cache", "summary")
     assert cached == nocache
-    assert _json.loads(cached)[0]["count"] == 10  # both files read, none collided
+    assert _sum_signal(cached) == 10  # both files read, none collided
 
 
 # --- AC-12 / FR-12 / INV-5: lock contention still answers, skips sealing -------
@@ -851,7 +948,7 @@ def test_late_arrival_to_sealed_minute_stays_queryable(temp_telemetry: Path) -> 
     cached = _run(temp_telemetry, "summary")  # HOT route
     nocache = _run(temp_telemetry, "--no-cache", "summary")
     assert cached == nocache  # late record must remain on the hot path
-    assert _json.loads(cached)[0]["count"] == 7
+    assert _sum_signal(cached) == 7
 
 
 def test_clock_skew_outlier_does_not_drop_records(temp_telemetry: Path) -> None:
@@ -877,7 +974,7 @@ def test_clock_skew_outlier_does_not_drop_records(temp_telemetry: Path) -> None:
     )
     cached = _run(temp_telemetry, "summary")  # HOT route
     assert cached == _run(temp_telemetry, "--no-cache", "summary")
-    assert _json.loads(cached)[0]["count"] == 4
+    assert _sum_signal(cached) == 4
 
 
 # --- AC-19 / INV-2 / EC-11: crash between seal and cursor advance --------------
@@ -911,8 +1008,8 @@ def test_ac19_crash_immutability_and_no_loss(temp_telemetry: Path) -> None:
     }
     for name, digest in before.items():
         assert after.get(name) == digest, f"sealed partition {name} mutated (INV-2)"
-    cached_n = _json.loads(_run(temp_telemetry, "summary"))[0]["count"]
-    cold_n = _json.loads(_run(temp_telemetry, "--no-cache", "summary"))[0]["count"]
+    cached_n = _signal_count(temp_telemetry, "traces", "summary")
+    cold_n = _signal_count(temp_telemetry, "traces", "--no-cache", "summary")
     assert (
         cached_n >= cold_n
     )  # no data LOSS (a full rollback may transiently over-count)
@@ -959,7 +1056,7 @@ def test_tail_does_not_double_count_sealed(temp_telemetry: Path) -> None:
     (cdir / otelq.LOCK_FILENAME).write_text(str(_os.getpid()))  # force the reader path
     cached = _run(temp_telemetry, "summary")  # hot: sealed ∪ pending ∪ bounded tail
     assert cached == _run(temp_telemetry, "--no-cache", "summary")
-    assert _json.loads(cached)[0]["count"] == 8  # not 16 — tail bounded past sealed
+    assert _sum_signal(cached) == 8  # not 16 — tail bounded past sealed
 
 
 # --- FR-11 regression: sub-minute window boundary (found by the live check) ----
@@ -996,8 +1093,7 @@ def test_identical_late_records_kept(temp_telemetry: Path) -> None:
     cached = _run(temp_telemetry, "summary")  # HOT route
     nocache = _run(temp_telemetry, "--no-cache", "summary")
     assert cached == nocache  # EXCEPT ALL keeps both; plain EXCEPT would drop one
-    by = {r["signal"]: r["count"] for r in _json.loads(cached)}
-    assert by["logs"] == 10  # 8 originals + 2 identical late records
+    assert _sum_signal(cached, "logs") == 10  # 8 originals + 2 identical late records
 
 
 # --- error-message clarity: name the missing signal, don't cry "collector down" -
@@ -1137,6 +1233,39 @@ def test_collector_config_via_main_prints_fragment() -> None:
     with redirect_stdout(buf):
         assert otelq.main(["collector-config"]) == 0
     assert "exporters:" in buf.getvalue()
+
+
+# --- troubleshoot: the capture loop + fixes, moved out of the query skill ----
+# `otelq troubleshoot` is the single home for the loop/fixes guidance so the
+# query skill can stay a thin pointer instead of restating it.
+
+
+def test_troubleshoot_emits_loop_and_fixes() -> None:
+    out = otelq.render_troubleshooting()
+    assert "capture" in out and "loop" in out  # the loop
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT" in out  # export step
+    assert "Stale data" in out  # a fix
+    assert "doctor" in out  # points at the real verification command
+
+
+def test_troubleshoot_via_main_prints() -> None:
+    import io as _io
+    from contextlib import redirect_stdout
+
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        assert otelq.main(["troubleshoot"]) == 0
+    assert "capture" in buf.getvalue()
+
+
+def test_help_epilog_documents_argument_order_and_sql_schema() -> None:
+    # The query skill points agents at `otelq --help`; the reference it needs
+    # (global-flags-first rule + sql view schema) must actually be there.
+    help_text = otelq.build_parser().format_help()
+    assert "GLOBAL flags" in help_text
+    assert "BEFORE the subcommand" in help_text
+    for view in ("traces", "logs", "metrics", "metrics_gauge", "metrics_sum"):
+        assert view in help_text
 
 
 # --- broken pipe: `otelq ... | head` must exit cleanly, not dump a traceback ---
