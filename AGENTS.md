@@ -51,12 +51,6 @@ Typical verify-a-change loop: `just otel-up` → run your instrumented code agai
 
 ---
 
-# Adding Context Docs
+# Canonical truth
 
-Read [CONTEXT.md](./context/CONTEXT.md) first; it is the authoritative routing guide. Quick rules:
-
-- Place each doc under `context/<type>/` per its type: PRDs in `context/prd/`, SPECs in `context/spec/`, ADRs in `context/adr/`, CONTRACTs in `context/contract/`. Follow the naming patterns (`PRD-<name>.md`, `SPEC-<name>.md`, `ADR-NNN-<short-title>.md`, `CONTRACT-<name>.md`).
-- **A document answers exactly one** Decision-Matrix question. PRD = *why*; SPEC = *what exactly the system does*; ADR = *why this technical approach*; CONTRACT = *how systems exchange data*. Don't mix product vision or architectural rationale into a SPEC.
-- **Every SPEC functional requirement (FR) needs at least one acceptance criterion** that traces to it; every edge case should also have AC coverage.
-- **ADR numbers are sequential, zero-padded, and gap-free**; check the highest existing number before assigning. ADR/SPEC requirement IDs (FR/INV/AC/EC) are **append-only**. Never modify an accepted ADR — supersede it with a new one.
-- Fill all required frontmatter fields; use `2026-06-23`-style `YYYY-MM-DD` dates for `created`/`last_updated`. Validate that `related_documents`/`depends_on` references exist.
+Read [CONTEXT.md](./context/CONTEXT.md). The rules in CoNTEXT.md **must** be followed.
