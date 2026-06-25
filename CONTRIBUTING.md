@@ -6,6 +6,41 @@ Thanks for your interest in otelq. Issues and pull requests are welcome at
 This is a deliberately small, single-file CLI. A few project-specific rules keep
 it that way — please read these before opening a PR.
 
+## Maintainer workflow for a public repo
+
+If you are a maintainer, prefer a branch + PR flow even for your own changes. It
+keeps CI, review context, and merge history consistent.
+
+1. Create a feature branch from `main`.
+2. Make changes, run checks, and commit.
+3. Push the branch and open a PR into `main`.
+4. Merge after required checks pass.
+
+Where to perform step 4 (merge):
+
+- GitHub web UI (most common)
+- VS Code GitHub Pull Requests extension
+- `gh` CLI (`gh pr merge ...`)
+
+Branch protection may require PR-based merges even for maintainers. If a direct
+push is rejected, verify account identity, token/repo scopes, and branch
+protection settings before retrying.
+
+## Agentic maintainer stack (recommended)
+
+Minimum setup:
+
+- VS Code with GitHub Copilot
+- VS Code GitHub Pull Requests and Issues extension
+
+Optional but useful:
+
+- GitHub CLI (`gh`) for scriptable PR workflows (`gh pr create`, `gh pr merge`,
+  `gh pr checkout`)
+
+The workflow does not require `gh`, but `gh` is the fastest path when you want
+terminal-native automation.
+
 ## Ground rules
 
 - **The `justfile` is the single execution gateway.** Run tasks through `just`
@@ -59,6 +94,7 @@ it is cached afterwards.
       `context/spec/` document.
 - [ ] No `# type: ignore` / `# pyright: ignore`; no casual `duckdb` pin bump.
 - [ ] Commits are scoped to one area of work with a clear message.
+- [ ] Branch and PR follow the maintainer workflow above (or explain exceptions).
 
 ## License
 
