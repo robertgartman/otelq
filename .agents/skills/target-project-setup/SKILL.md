@@ -1,6 +1,6 @@
 ---
 name: target-project-setup
-description: "Use from the otelq repo to wire otelq into your project on the same host — adds otelq's file-export pipeline to your project's existing OpenTelemetry Collector (or scaffolds one) so otelq can read its telemetry, verifies the wiring, and installs the otelq query skill into the target so its AI agent can drive the otelq CLI. Asks for the target project's absolute path."
+description: "Use from the otelq repo to idempotently wire otelq into your project on the same host — adds otelq's file-export pipeline to your project's existing OpenTelemetry Collector (or scaffolds one) only when missing or drifted, verifies the wiring, and installs the otelq query skill into the target so its AI agent can drive the otelq CLI. Asks for the target project's absolute path."
 ---
 
 # Integrate otelq with your project's Collector
@@ -24,6 +24,15 @@ otelq reads OTLP signals as JSONL from a shared `telemetry/` directory — that
 directory is the entire contract (see
 `context/contract/CONTRACT-telemetry-directory.md`). Any Collector that writes the
 right files works; otelq does not need to own the Collector.
+
+**Idempotence requirement:** treat this skill as safe to run repeatedly. If
+`$TARGET` is already compliant with these setup instructions, the correct result
+is **no file edits, no duplicate config entries, no new commit, and no Collector
+restart**. Inspect first, compare against the canonical otelq fragments/skill, and
+only change files that are missing required setup or have drifted from the current
+contract. When everything already matches, report that the target is already wired
+for otelq and proceed only to optional read-only verification (`doctor` /
+`summary`) if the user wants it.
 
 There are **two cases**, both covered here:
 
@@ -172,7 +181,9 @@ pin a version, append a ref: `…/otelq@v0.1.0 otelq …`.
    !/telemetry/.gitkeep
    ```
 
-Then go to **Present the plan**.
+If every exporter definition, pipeline membership entry, bind mount, telemetry
+directory, and gitignore rule already matches this section, make no edits for Path
+A and record the integration as already compliant. Then go to **Present the plan**.
 
 ---
 
@@ -193,6 +204,10 @@ otelq), modelled on otelq's reference producer:
 3. `mkdir -p "$TARGET/telemetry"` and add the **same gitignore** rule as Path A
    step 7.
 
+If `$TARGET` already has this scaffold with the canonical config, service, mount,
+telemetry directory, and gitignore rule, make no edits for Path B and record the
+scaffold as already compliant.
+
 The app then points `OTEL_EXPORTER_OTLP_ENDPOINT` at this Collector. Because this
 Collector is `$TARGET`'s, `$TARGET` owns its lifecycle — otelq still only reads the
 directory.
@@ -204,11 +219,12 @@ directory.
 Before editing, **show the user the concrete changes** (which files, the exporter +
 pipeline edits, the bind mount, the gitignore, and the otelq query skill copied in —
 see below) and ask whether to **apply
-step-by-step (confirm each)** or **run to the end**. Then make the edits and have
-`$TARGET`'s Collector **(re)start to load the new config** — a one-time, consented
-setup action on the project's own service. This does not change the lifecycle
-boundary: otelq's *runtime* (the CLI) still never starts, stops, or cleans that
-Collector.
+step-by-step (confirm each)** or **run to the end**. If the inspection found no
+changes because `$TARGET` is already compliant, say so explicitly and skip the
+apply/restart path. Otherwise, make the edits and have `$TARGET`'s Collector
+**(re)start to load the new config** — a one-time, consented setup action on the
+project's own service. This does not change the lifecycle boundary: otelq's
+*runtime* (the CLI) still never starts, stops, or cleans that Collector.
 
 ## Verify the wiring
 
@@ -331,7 +347,8 @@ otelq repo, and otelq stays the master for the skill's content.
 2. **Copy it verbatim** from the otelq repo into the chosen location under `$TARGET`.
    Do not rewrite, trim, or "adapt" the content — otelq is the master for this skill,
    exactly as it is for the `collector-config` fragment, so a copy that drifts is a
-   bug:
+   bug. If the destination file already exists and is byte-for-byte identical, leave
+   it untouched; if it exists but differs, replace it with the canonical copy:
 
    ```sh
    DEST="$TARGET/.agents/skills/otelq"          # or the location the user chose

@@ -9,6 +9,14 @@ Inspect real OpenTelemetry signals from the running system. Use this to close
 the loop after a change: run the code, then confirm from telemetry that it
 behaved as intended.
 
+## Quickstart
+
+Get a quick view of the telemetry captured by the Collector. **start** here if you do not exactly know what you want to query.
+
+```
+uvx --from git+https://github.com/robertgartman/otelq otelq --dir telemetry --format json summary
+```
+
 ## Running otelq
 ```
 uvx --from git+https://github.com/robertgartman/otelq otelq --dir telemetry ...
@@ -22,7 +30,7 @@ uvx --from git+https://github.com/robertgartman/otelq otelq --dir telemetry ...
 - To pin a version, append a ref: `…/otelq@v0.1.0 otelq …`.
 
 ## Discovering commands
-
+To see the available commands and options, run:
 ```
 uvx --from git+https://github.com/robertgartman/otelq otelq --help
 ```
