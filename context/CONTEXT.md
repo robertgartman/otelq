@@ -19,7 +19,7 @@ must_not_contain:
   - implementation_details
 retrieval_priority: high
 created: 2026-06-23
-last_updated: 2026-06-23
+last_updated: 2026-06-25
 ---
 # Context Documentation Guide
 
@@ -37,7 +37,7 @@ All context documents **must** include YAML frontmatter with these fields:
 | Field | Required | Description |
 |-------|----------|-------------|
 | `doc_type` | Yes | Document classification (see valid values below) |
-| `authoritative` | Yes | Whether this is the source of truth (`true` for all except ephemeral) |
+| `authoritative` | Yes | Whether this document is a source of truth |
 | `stability` | Yes | How often this changes (see valid values below) |
 | `status` | Yes | Document lifecycle (see valid values below) |
 | `created` | Yes | Creation date in `YYYY-MM-DD` format |
@@ -53,7 +53,6 @@ All context documents **must** include YAML frontmatter with these fields:
 | `semantic_tags` | No | List of keywords for embedding similarity and search (e.g., `[authentication, oauth, security]`) |
 | `depends_on` | No | List of hard dependencies (documents that must exist for this to be valid) |
 | `version` | No | (Contracts only) Semantic version of the interface (e.g., `"1.0"`, `"2.1"`) |
-| `expires` | No | (Ephemeral only) Expiration date in `YYYY-MM-DD` format, or `"manual"` for no auto-expiration |
 | `purpose` | No | Brief description of the document's intent (used for context guides and READMEs) |
 | `change_policy` | No | Guidance on how/when this document should be modified |
 
@@ -61,11 +60,11 @@ All context documents **must** include YAML frontmatter with these fields:
 
 | Field | Valid Values |
 |-------|--------------|
-| `doc_type` | `prd`, `spec`, `adr`, `contract`, `model_card`, `datasheet`, `ephemeral`, `context_guide`|
-| `stability` | `stable` (rarely changes), `evolving` (changes with features), `volatile` (changes frequently) |
+| `doc_type` | `prd`, `spec`, `adr`, `contract`, `context_guide` |
+| `stability` | `stable` (rarely changes), `evolving` (changes with features) |
 | `status` | `draft` (work in progress), `active` (authoritative), `deprecated` (no longer valid), `superseded` (replaced) |
-| `decision_scope` | `documentation_system`, `product`, `feature`, `architecture`, `interface`, `ai_model`, `dataset` |
-| `audience` | `ai`, `engineering`, `product`, `compliance` (use list format: `[ai, engineering]`) |
+| `decision_scope` | `documentation_system`, `product`, `feature`, `architecture`, `interface` |
+| `audience` | `ai`, `engineering`, `product` (use list format: `[ai, engineering]`) |
 | `retrieval_priority` | `high`, `normal`, `low` (see guidance below) |
 
 ### Retrieval Priority Guidance
@@ -74,8 +73,8 @@ Use `retrieval_priority` to help AI agents prioritize which documents to read fi
 
 | Priority | When to Use | Examples |
 |----------|-------------|----------|
-| `high` | Active constraints, safety rules, critical interfaces, breaking changes | Active ADRs, security contracts, model safety cards |
-| `normal` | Standard feature documentation, typical specs | Most SPECs, PRDs, datasheets |
+| `high` | Active constraints, safety rules, critical interfaces, breaking changes | Active ADRs, critical contracts |
+| `normal` | Standard feature documentation, typical specs | Most SPECs, PRDs |
 | `low` | Background context, historical reference, rarely needed | Deprecated docs, detailed appendices |
 
 When `retrieval_priority` is omitted, AI agents **should** treat it as `normal`.
@@ -205,8 +204,6 @@ When creating new documents:
 - New feature or capability → new PRD, then SPEC
 - Significant architectural decision → new ADR (never modify accepted ADRs)
 - New interface boundary → new CONTRACT
-- New AI model integration → new MODEL_CARD
-- New dataset introduction → new DATASHEET
 
 ### When to UPDATE an existing document
 - Clarifying existing scope → PRD, SPEC
@@ -215,10 +212,10 @@ When creating new documents:
 - Correcting factual errors → any document type
 
 ### Never update
-- **Accepted ADRs** — create a new ADR that supersedes the old one
+- **Accepted ADRs** — Updates are allowed if they **amend** the ADR; otherwise, create a new ADR that supersedes the old one
 - **Deprecated documents** — archive instead of modifying
 
-### Archiving documents
+### Deprecating or superseding documents
 When a document is deprecated or superseded:
 1. Set `status: deprecated` or `status: superseded` in frontmatter
 2. Add `superseded_by` field pointing to the replacement (if applicable)
@@ -278,8 +275,7 @@ Define **exact system behavior** so it can be implemented and tested.
 - Architectural decisions (see ADRs)
 - **External** API or data schemas (see Contracts)
 
-> **Note:** Internal domain models and data structures that are not exposed
-> as interfaces **may** be documented in SPECs.
+> **Note:** Internal data structures that are not exposed as interfaces **may** be documented in SPECs.
 
 **Decision rule:**
 Use a Spec when describing **what the system must do** in precise terms.
@@ -365,64 +361,6 @@ All Contract documents **must** follow the template [CONTRACT.md](contract/CONTR
 
 ---
 
-## 5. Model Cards
-
-Not used yet — otelq integrates no AI models or curated datasets; add when first needed.
-
----
-
-## 6. Datasheets (for Datasets)
-
-Not used yet — otelq integrates no AI models or curated datasets; add when first needed.
-
-## 7. Ephemeral Notes
-
-**Purpose:**  
-Document short-term notes or temporary information that does not fit into other formal documentation categories.
-
-**Contains:**
-- Implementation ideas
-- Implementation plans
-- Temporary workarounds
-- Scratch notes for ongoing work
-- Informal observations
-
-**Does NOT contain:**
-- Any context meant for long-term reference. Does **not** constitute authoritative documentation.
-
-**Decision rule:**
-Use Ephemeral Notes when documenting **short-term or temporary information**.
-It may be deleted or archived once no longer needed.
-
-**Target folder:**
-All Ephemeral Note documents **must** be placed in `context/ephemeral/`.
-
-**Naming standard:**
-Ephemeral Notes have **no strict naming convention**. Naming is free-form and not bound to rules.
-Use descriptive filenames that reflect the content or purpose.
-Example: `refactoring-ideas.md`, `meeting-notes-2024-01.md`, `scratch.md`
-
-**Template:**
-Ephemeral Notes have no dedicated template file — the reduced-frontmatter shape shown below is sufficient.
-
-**Reduced frontmatter requirements:**
-Ephemeral notes have intentionally minimal frontmatter to reduce friction for temporary work.
-Only these fields are **required**:
-- `doc_type: ephemeral`
-- `authoritative: false`
-- `stability: volatile`
-- `created`
-- `expires` (date or `"manual"`)
-
-Fields like `status`, `last_updated`, and `must_not_contain` are optional but recommended.
-
-**Lifecycle:**
-- Review ephemeral notes periodically
-- Delete when no longer needed, or migrate content to a permanent document type
-- Documents past their `expires` date should be archived to `context/archive/` or deleted
-
----
-
 ## Summary Decision Matrix
 
 | Question | Document Type |
@@ -431,11 +369,7 @@ Fields like `status`, `last_updated`, and `must_not_contain` are optional but re
 | What exactly must the system do? | Spec |
 | Why was this technical approach chosen? | ADR |
 | How do systems exchange data? | API/Data Contract |
-| How is an AI model used safely and correctly? | Model Card |
-| Where does the data come from and what are its limits? | Datasheet |
-| Short term / temporary / scratch pad? | Ephemeral |
 | How should documents be classified and organized? | Context Guide |
-| Where do deprecated/superseded documents go? | Archive |
 
 ---
 
@@ -447,13 +381,7 @@ Fields like `status`, `last_updated`, and `must_not_contain` are optional but re
 | Spec | `context/spec/` | `SPEC-<feature-name>.md` | Yes |
 | ADR | `context/adr/` | `ADR-NNN-<short-title>.md` | Yes (sequential) |
 | Contract | `context/contract/` | `CONTRACT-<interface-name>.md` | Yes |
-| Model Card | `context/model-card/` | `MODEL-CARD-<model-identifier>.md` | Yes |
-| Datasheet | `context/datasheet/` | `DATASHEET-<dataset-name>.md` | Yes |
-| Ephemeral | `context/ephemeral/` | Free-form | No |
 | Context Guide | `context/` | `CONTEXT.md` (singleton) | Yes |
-| Archive | `context/archive/` | Preserve original filename | N/A |
-
-> **Naming Convention Note:** File names use UPPERCASE with hyphens (e.g., `MODEL-CARD-*.md`) following filesystem conventions, while frontmatter `doc_type` uses lowercase with underscores (e.g., `model_card`) following YAML/code conventions. This is intentional.
 
 ---
 
