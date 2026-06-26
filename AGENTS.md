@@ -39,7 +39,7 @@ Creates `telemetry/` and brings up the dev OTel Collector (OTLP gRPC `:4317` / H
 |---------|--------------|
 | `just otel-up` | Create `telemetry/` and start the dev Collector (OTLP `:4317`/`:4318`). |
 | `just otel-down` | Stop the Collector. |
-| `just otelq <cmd>` | Run the CLI, e.g. `just otelq summary`, `just otelq logs --since 10m`. |
+| `just otelq <cmd>` | Run the CLI, e.g. `just otelq summary`, `just otelq --since 10m logs`. |
 | `just otelq-sql "<query>"` | Run an ad-hoc SQL query against captured telemetry. |
 | `just otelq-test` | Run the test suite (`tests/`) under the pinned DuckDB. |
 | `just otel-clean` | Reset captured telemetry: stop Collector → empty active jsonl in place → drop rotated backups + the parquet cache → restart. **Destructive and unrecoverable** (`telemetry/` is gitignored). |

@@ -72,7 +72,8 @@ configuration that produces the raw files.
 ### Definitions
 
 - **Relation / view** — a queryable table or view name exposed to SQL:
-  `traces`, `logs`, `metrics`, `metrics_gauge`, `metrics_sum`.
+  `traces`, `logs`, `metrics`, `metrics_gauge`, `metrics_sum`,
+  `metrics_histogram`, `metrics_exp_histogram`.
 - **Signal** — a user-facing telemetry kind: `traces`, `logs`, `metrics`.
 - **Subcommand / command** — one of the seven verbs otelq accepts
   (`summary`, `errors`, `slow`, `trace`, `logs`, `metric`, `sql`).
@@ -80,10 +81,13 @@ configuration that produces the raw files.
   `--all`, `--no-cache`, `--since`); contrast subcommand-specific flags
   (`--top`, `--service`, `--level`, `--grep`, the `trace_id`/`name`/`query`
   positionals), which follow the subcommand.
-- **Default telemetry dir** — the `telemetry/` directory resolved relative to
-  the `otelq.py` script location (two parents up, per
+- **Default telemetry dir** — the `telemetry/` directory under the current
+  working directory (`<cwd>/telemetry`, per
   [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md)),
-  used when `--dir` is not given.
+  used when `--dir` is not given. A cwd-relative default works both for
+  `uv run otelq.py` from a checkout (run from the repo root) and for an installed
+  copy (`uvx`/`pipx`) run from a project directory; a script-relative default
+  would resolve into the install location (e.g. site-packages).
 - **Event-time** — a record's own timestamp, as corrected and presented in the
   `timestamp` column (see FR-16).
 - **Result** — the `(columns, rows)` pair a command produces, rendered by the
@@ -95,14 +99,28 @@ configuration that produces the raw files.
 
 - **FR-1 — Exposed relations.** otelq **must** expose exactly these query
   relations over the captured telemetry: `traces`, `logs`, `metrics`,
-  `metrics_gauge`, and `metrics_sum`. `metrics` **must** be the union of
-  `metrics_gauge` and `metrics_sum` (whichever are present). All five **must** be
-  queryable by the `sql` command; the built-in commands query the subset they
-  need.
+  `metrics_gauge`, `metrics_sum`, `metrics_histogram`, and
+  `metrics_exp_histogram`. `metrics` **must** be the union of whichever of the
+  four per-type metric relations are present. All seven **must** be queryable by
+  the `sql` command; the built-in commands query the subset they need.
+  **Expose-empty:** **all seven** relations **must** always resolve — a signal or
+  metric type with no captured rows resolves to an empty (0-row) result, **not** a
+  "table does not exist" catalog error. This holds for a metrics-only corpus
+  (`sql "SELECT * FROM traces"` → 0 rows) **and** for a valid-but-empty or absent
+  `--dir` (where the schema is probed from an embedded sample), so a "table does
+  not exist" error is never surfaced. The set of relations and the empty-vs-error
+  outcome **must** be identical with the cache and with `--no-cache`. Presence for
+  the built-in commands is judged by **row count**, not by relation existence, so
+  an all-empty corpus still takes the friendly empty-telemetry path (FR-18) and
+  emits no zero-count skeleton (FR-3). The OTel **Summary** metric type is **not**
+  supported (the `duckdb-otlp` reader for it is an unimplemented stub) and is
+  never exposed.
 - **FR-2 — Relation columns.** Each relation **must** present at least the
   following columns (the `sql` cheat-sheet), with `timestamp` carrying the
   corrected wall-clock event-time (FR-16):
-  - **`traces`**: `timestamp`, `duration` (nanoseconds), `trace_id`, `span_id`,
+  - **`traces`**: `timestamp`, `duration` (integer **milliseconds** — the
+    duckdb-otlp extension reports span duration in ms, so sub-millisecond spans
+    truncate to `0`), `trace_id`, `span_id`,
     `parent_span_id`, `service_name`, `span_name`, `span_kind`, `status_code`
     (`0`=unset, `1`=ok, `2`=error), `status_message`.
   - **`logs`**: `timestamp`, `trace_id`, `service_name`, `severity_text`,
@@ -113,10 +131,26 @@ configuration that produces the raw files.
     and null, are **UNSET**). The level is derived from `severity_number`, not
     the free-form `severity_text`, which carries inconsistent casing in practice
     (e.g. `Info`).
-  - **`metrics`** (and the underlying `metrics_gauge` / `metrics_sum`):
+  - **`metrics`** (the union view over the per-type relations):
     `timestamp`, `service_name`, `metric_name`, `metric_type`, `value`,
-    `metric_unit`. `metric_type` **must** be `gauge` for rows originating from
-    `metrics_gauge` and `sum` for rows from `metrics_sum`.
+    `metric_unit`. `metric_type` **must** be one of `gauge`, `sum`, `histogram`,
+    or `exp_histogram`, naming the per-type relation each row originates from
+    (`metrics_gauge`, `metrics_sum`, `metrics_histogram`,
+    `metrics_exp_histogram`). The unified `value` **must** be the row's own
+    `value` for `gauge`/`sum` rows and its `sum` for `histogram`/`exp_histogram`
+    rows (the histogram types have no scalar value, so their distribution `sum`
+    is surfaced as `value`).
+  - **`metrics_gauge`** / **`metrics_sum`**: at least `timestamp`,
+    `service_name`, `metric_name`, `metric_unit`, and a scalar `value`
+    (`metrics_sum` additionally carries `aggregation_temporality`,
+    `is_monotonic`).
+  - **`metrics_histogram`**: at least `timestamp`, `service_name`,
+    `metric_name`, `metric_unit`, `count`, `sum`, `min`, `max`, `bucket_counts`,
+    `explicit_bounds`, and `aggregation_temporality`.
+  - **`metrics_exp_histogram`**: at least `timestamp`, `service_name`,
+    `metric_name`, `metric_unit`, `count`, `sum`, `min`, `max`, `scale`,
+    `zero_count`, `zero_threshold`, the positive/negative bucket offsets and
+    counts, and `aggregation_temporality`.
 
   The precise field semantics of the underlying raw records are owned by
   [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md);
@@ -132,7 +166,7 @@ configuration that produces the raw files.
   service count of just those records). Rows are produced **only for present
   signals**, as follows:
   - **`traces`** (when present): exactly two rows that partition spans by
-    `duration` — `details = ">1s"` for `duration > 1s` (`> 1e9` ns) and
+    `duration` — `details = ">1s"` for `duration > 1s` (`> 1000` ms) and
     `details = "=<1s"` for the remainder. **Both** rows **must** appear even when
     a bucket's count is zero.
   - **`logs`** (when present): one row per canonical severity level
@@ -141,19 +175,27 @@ configuration that produces the raw files.
     even at zero count. Log records whose `severity_number` is outside the
     canonical ranges **must** contribute an additional `details = "UNSET"` row,
     shown **only** when its count is non-zero.
-  - **`metrics`** (when present): a single row with an empty `details` (metrics
-    have no meaningful sub-categorization here).
+  - **`metrics`** (when present): one row per metric type, with `details` set to
+    the type — `gauge`, `sum`, `histogram`, `exp_histogram`. **All four** rows
+    **must** appear even when a type's count is zero (a fixed skeleton like the
+    log levels), and each row's count/earliest/latest/services **must** be scoped
+    to that type.
 
   A signal with **no captured data** contributes **no rows** (its zero-count
-  skeleton is not emitted). When **no** signal is present at all, the friendly
-  empty-telemetry behavior applies (FR-18). The zero-count rule thus governs
-  *sub-rows within a present signal* (e.g. an `ERROR` level with no records), not
-  absent signals.
+  skeleton is not emitted) — "present" here means the signal **has captured rows**,
+  not merely that its relation resolves: under expose-empty (FR-1) an absent
+  signal's relation still resolves empty, yet **must not** emit a skeleton (e.g.
+  metrics-only telemetry yields the four metric rows and **no** trace/log
+  buckets). When **no** signal has any data at all, the friendly empty-telemetry
+  behavior applies (FR-18). The zero-count rule thus governs *sub-rows within a
+  signal that has data* (e.g. an `ERROR` level with no records), not signals
+  without data.
 - **FR-4 — `errors`.** `errors` **must** return error-status spans
   (`traces` rows with `status_code == 2`) and error/fatal logs (`logs` rows with
-  `severity_text` in `{ERROR, FATAL}`), combined into one result and ordered
-  newest-first by `timestamp`. Each row **must** identify whether it is a span or
-  a log.
+  `severity_text` in `{ERROR, FATAL}`, matched **case-insensitively** since
+  `severity_text` carries inconsistent casing in practice — see FR-2), combined
+  into one result and ordered newest-first by `timestamp`. Each row **must**
+  identify whether it is a span or a log.
 - **FR-5 — `slow`.** `slow` **must** return spans ordered by `duration`
   descending, limited to the top `N` where `N` is the value of `--top`
   (default **20**). The presented duration **must** be expressed in milliseconds.
@@ -211,20 +253,27 @@ configuration that produces the raw files.
   [ADR-006](../adr/ADR-006-read-otlp-extension-quirks.md)); a raw 2026 event
   **must not** render as a far-future year.
 - **FR-17 — Exit codes.** otelq **must** exit `0` on success, including when a
-  command produces zero result rows or prints a friendly "no telemetry" message
-  (FR-18, FR-19). A non-zero exit **must** occur only on a real error — e.g.
-  malformed SQL (FR-9) or a malformed `--since`/argument-order parse failure
-  (FR-11, FR-15).
+  command produces zero result rows, prints a friendly "no telemetry" message
+  (FR-18, FR-19), or prints help (a bare `otelq` or `otelq help`, FR-22). A
+  non-zero exit **must** occur only on a real error — e.g. malformed SQL (FR-9),
+  a malformed `--since`/argument-order parse failure (FR-11, FR-15), or an unknown
+  `help` topic (FR-22).
 - **FR-18 — Friendly empty-telemetry message.** When a command's required
-  signal(s) are entirely absent (nothing captured), otelq **must** print a
-  short, friendly message to **stderr** (pointing at the Collector / export
-  toggle) and exit `0`. It **must not** surface a reader/DuckDB stack trace.
+  signal(s) carry **no captured data** — and **no** other signal does either
+  (nothing captured at all) — otelq **must** print a short, friendly message to
+  **stderr** (pointing at the Collector / export toggle) and exit `0`. It **must
+  not** surface a reader/DuckDB stack trace. "Has data" (row count), not mere
+  relation existence, governs this: under expose-empty (FR-1) a required signal's
+  relation may resolve empty, which **must** still trigger the friendly path (or
+  the gap message of FR-19 when another signal does have data).
 - **FR-19 — Name the gap, don't blame the Collector.** When a command's required
-  signal is absent **but other signals are present**, otelq **must** print a
-  message that names the missing signal (and its likely cause: the apps aren't
-  emitting it, or its file was deleted under the running Collector) rather than
-  the generic "is the Collector running?" text. `errors` (which needs `traces`
-  or `logs`) **must** name "traces or logs" when only `metrics` is present.
+  signal has **no captured rows** **but another signal does have data**, otelq
+  **must** print a message that names the missing signal (and its likely cause:
+  the apps aren't emitting it, or its file was deleted under the running
+  Collector) rather than the generic "is the Collector running?" text. `errors`
+  (which needs `traces` or `logs`) **must** name "traces or logs" when only
+  `metrics` has data. A required signal whose relation resolves empty (FR-1) is
+  treated as absent here — presence is by row count, not table existence.
 - **FR-20 — Oversized export batch is skipped.** A single export batch whose
   record count exceeds the reader's 2048-row limit **must** be skipped, with a
   warning printed to stderr, rather than crashing the run. (The limit and its
@@ -235,16 +284,29 @@ configuration that produces the raw files.
 - **FR-21 — Partial trailing line is skipped.** A partially-written trailing
   JSONL line (one that does not parse) **must** be skipped, and the run **must**
   still succeed; the line is re-read once complete on a later run.
+- **FR-22 — Help affordances.** Beyond the seven query verbs, otelq **must** keep
+  its help discoverable. A bare `otelq` (no command) **must** print the full
+  top-level help and exit `0` — not the terse argparse "required: command" error.
+  otelq **must** also accept a `help` meta-command: `otelq help` prints that same
+  top-level help, and `otelq help <command>` prints the named command's own help
+  (equivalent to `otelq <command> -h`). An unknown topic (`otelq help <unknown>`)
+  **must** be rejected as a real error (FR-17) carrying argparse's invalid-choice
+  message that names the valid commands. The `-h`/`--help` flags (top-level and
+  per-subcommand) remain available and unchanged.
 
 ## Edge Cases & Failure Modes
 
 - **EC-1 — Nothing captured.** No matching `*.jsonl` files exist (Collector down
-  or export disabled): every command prints the friendly stderr message and exits
-  `0`; no stack trace is shown. (FR-18)
+  or export disabled): every built-in command prints the friendly stderr message
+  and exits `0`; no stack trace is shown. The relations still resolve empty
+  (seeded from the embedded schema probe), so `sql "SELECT count(*) FROM traces"`
+  returns `0` rather than a catalog error. (FR-1, FR-18)
 - **EC-2 — One signal missing, others present.** `metrics` captured but no
   `traces`/`logs`: `errors`, `slow`, and `trace` name the missing signal instead
-  of blaming the Collector; `metric`/`summary` still answer from `metrics`.
-  (FR-19)
+  of blaming the Collector; `metric`/`summary` still answer from `metrics`; and
+  the `traces`/`logs` relations still **resolve empty** (FR-1), so
+  `sql "SELECT * FROM traces"` returns 0 rows rather than a catalog error.
+  (FR-1, FR-19)
 - **EC-3 — Empty result, valid query.** A well-formed query that matches no rows
   (e.g. `trace <unknown-id>`, a `logs --grep` with no hits, a `metric <name>`
   with no series) exits `0`. `trace <unknown-id>` reports that no spans were found
@@ -277,6 +339,9 @@ configuration that produces the raw files.
   is mixed-case (`Info`) but whose `severity_number` is `9` are counted under the
   `INFO` row; a log whose `severity_number` is outside `1–24` adds an `UNSET`
   row, which is absent when no such record exists. (FR-3, FR-2)
+- **EC-13 — Unknown help topic.** `otelq help not-a-command` **must** exit
+  non-zero with argparse's invalid-choice error naming the valid commands; it
+  **must not** silently fall back to general help and exit `0`. (FR-22, FR-17)
 
 ## Acceptance Criteria
 
@@ -287,19 +352,20 @@ configuration that produces the raw files.
 > `tests/test_otelq.py`.
 
 - **AC-1** (Verifies FR-1, FR-2): Given a synthetic connection with traces, logs,
-  gauge, and sum metrics, when each relation is queried via `sql`, then
-  `traces`, `logs`, `metrics`, `metrics_gauge`, and `metrics_sum` all resolve and
-  expose the columns listed in FR-2, and `metrics` returns both `gauge` and `sum`
-  `metric_type` rows.
+  and gauge/sum/histogram/exp_histogram metrics, when each relation is queried via
+  `sql`, then `traces`, `logs`, `metrics`, `metrics_gauge`, `metrics_sum`,
+  `metrics_histogram`, and `metrics_exp_histogram` all resolve and expose the
+  columns listed in FR-2; `metrics` returns all four `metric_type` values; and the
+  unified `value` equals the `sum` for the `histogram`/`exp_histogram` rows.
   *Verification hint: `cmd_sql` with `SELECT * FROM <relation> LIMIT 1` per
-  relation; assert column names and the `metric_type` set.*
+  relation; assert column names, the `metric_type` set, and the value-or-sum rule.*
 - **AC-2** (Verifies FR-3): Given a corpus with traces of differing duration,
   logs across several levels, and metrics, when `summary` runs, then the columns
   are `signal, details, count, earliest, latest, services` in that order; traces
   yield a `>1s` and a `=<1s` row; logs yield one row for each of
-  `TRACE/DEBUG/INFO/WARN/ERROR/FATAL`; metrics yield a single row with empty
-  `details`; and each row's count/earliest/latest/services are scoped to that
-  row's subset.
+  `TRACE/DEBUG/INFO/WARN/ERROR/FATAL`; metrics yield one row for each of
+  `gauge/sum/histogram/exp_histogram`; and each row's
+  count/earliest/latest/services are scoped to that row's subset.
   *Verification hint: `test_summary_breakdown_rows`; assert the column order, the
   present (signal, details) pairs, and per-subset counts.*
 - **AC-3** (Verifies FR-4): Given a span with `status_code == 2` and an `ERROR`
@@ -419,27 +485,46 @@ configuration that produces the raw files.
   *Verification hint: `test_summary_level_from_severity_number`,
   `test_summary_unset_row_only_when_present`.*
 - **AC-25** (Verifies FR-3): Given a corpus where only `metrics` is present, when
-  `summary` runs, then it returns exactly the single `metrics` row (empty
-  `details`) and emits no zero-count log/trace skeleton; an absent signal
-  contributes no rows.
+  `summary` runs, then it returns exactly the four metric-type rows
+  (`gauge/sum/histogram/exp_histogram`, types with no captured rows at count `0`)
+  and emits no zero-count log/trace skeleton; an absent signal contributes no
+  rows.
   *Verification hint: `test_summary_absent_signal_has_no_rows`.*
+- **AC-26** (Verifies FR-22, EC-13): Given the parser, when `main([])` or
+  `main(["help"])` runs, then each prints the top-level help (its `usage:` line
+  and the global-flags-first rule) and exits `0`; when `main(["help", "slow"])`
+  runs, it prints `slow`'s own help (its `--top` flag) and exits `0`; and
+  `main(["help", "not-a-command"])` exits `2` with an invalid-choice message.
+  *Verification hint: `test_bare_otelq_prints_full_help`,
+  `test_help_command_prints_general_help`,
+  `test_help_command_topic_prints_subcommand_help`,
+  `test_help_command_unknown_topic_errors`.*
 
 ### Examples
 
 - **Argument order (FR-11).** `just otelq --format json errors` succeeds;
   `just otelq errors --format json` fails with
-  `otelq: error: unrecognized arguments: --format json`. Subcommand flags still
-  follow the subcommand: `just otelq errors --since 10m`,
+  `otelq: error: unrecognized arguments: --format json`. Global flags — including
+  the time-window flag `--since` — precede the subcommand:
+  `just otelq --since 10m errors`; per-command flags still follow it:
   `just otelq slow --top 5`.
 - **Relations for `sql` (FR-1/FR-2).**
   `just otelq-sql "SELECT service_name, count(*) FROM traces WHERE status_code = 2 GROUP BY 1"`
-  groups error spans by service; `metrics` unifies `metrics_gauge` and
-  `metrics_sum`, so `SELECT DISTINCT metric_type FROM metrics` returns
-  `{gauge, sum}`.
+  groups error spans by service; `metrics` unifies the per-type relations, so with
+  all four present `SELECT DISTINCT metric_type FROM metrics` returns
+  `{gauge, sum, histogram, exp_histogram}`. Under expose-empty (FR-1), any
+  documented relation resolves to `0` rows (not a catalog error) when its signal
+  has no data but some other telemetry is present — `SELECT count(*) FROM
+  metrics_histogram` and `SELECT count(*) FROM traces` both return `0` on a
+  gauge/sum-only corpus.
 - **Friendly emptiness (FR-18 vs FR-19).** With nothing captured, every command
   prints "no telemetry captured — is the collector running …?" to stderr and
   exits 0. With only `metrics` captured, `errors` instead prints "no traces or
   logs telemetry captured (present: metrics) …", naming the gap.
+- **Help discoverability (FR-22).** `just otelq` (no command) and `just otelq help`
+  both print the full top-level help; `just otelq help slow` prints `slow`'s own
+  help (its `--top` flag). `just otelq help nope` exits non-zero with an
+  invalid-choice message naming the valid commands.
 
 ## Invariants
 

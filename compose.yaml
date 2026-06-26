@@ -41,20 +41,119 @@ services:
   # comes first, then flags. The gRPC exporter retries while the Collector comes
   # up, so no depends_on gate is needed (the just recipe starts the Collector
   # first regardless).
-  telemetrygen-traces:
+  #
+  # The mix is deliberately nuanced so every otelq view has something to show:
+  #   - traces: a bulk of sub-millisecond spans plus a slower stream whose
+  #     --span-duration (2s) exceeds otelq's 1s slow threshold, populating the
+  #     summary ">1s" bucket and `otelq slow`.
+  #   - logs: a bulk of INFO plus smaller TRACE/DEBUG/WARN/ERROR/FATAL streams, so
+  #     all six summary levels are non-zero and `otelq errors` / `otelq logs
+  #     --level` are meaningful. severity-text is left at telemetrygen's realistic
+  #     mixed case ("Info"/"Warn"/"Fatal"…); otelq derives summary levels from
+  #     --severity-number and matches text case-insensitively (SPEC FR-2/FR-4/FR-7),
+  #     so the two stay consistent.
+  #   - metrics: all four metric kinds — a Gauge stream (bulk) plus smaller Sum,
+  #     Histogram and ExponentialHistogram streams — so the unified `metrics` view
+  #     and the summary per-type split exercise every metric_type, and each per-type
+  #     sql view (metrics_gauge/_sum/_histogram/_exp_histogram) is populated.
+  # The minority streams run at --rate 1 so fast/INFO stays the clear majority.
+
+  # Fast spans — the bulk (default --span-duration ~123µs, well under 1s).
+  telemetrygen-traces-fast:
     <<: *telemetrygen
     command:
       ["traces", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
        "--duration", "15s", "--rate", "5", "--service", "otelq-demo"]
 
-  telemetrygen-metrics:
+  # Slow spans — a minority over otelq's 1s slow threshold.
+  telemetrygen-traces-slow:
+    <<: *telemetrygen
+    command:
+      ["traces", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
+       "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
+       "--span-duration", "2s"]
+
+  # Gauge metrics — the bulk (telemetrygen's default metric type, stated explicitly).
+  telemetrygen-metrics-gauge:
     <<: *telemetrygen
     command:
       ["metrics", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
-       "--duration", "15s", "--rate", "5", "--service", "otelq-demo"]
+       "--duration", "15s", "--rate", "5", "--service", "otelq-demo",
+       "--metric-type", "Gauge"]
 
-  telemetrygen-logs:
+  # Sum metrics — a smaller stream so `metrics_sum` (and {sum} in the metrics view)
+  # is populated too, not just gauge.
+  telemetrygen-metrics-sum:
+    <<: *telemetrygen
+    command:
+      ["metrics", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
+       "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
+       "--metric-type", "Sum"]
+
+  # Histogram metrics — a smaller stream so `metrics_histogram` is populated.
+  telemetrygen-metrics-histogram:
+    <<: *telemetrygen
+    command:
+      ["metrics", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
+       "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
+       "--metric-type", "Histogram"]
+
+  # Exponential-histogram metrics — a smaller stream for `metrics_exp_histogram`.
+  telemetrygen-metrics-exp-histogram:
+    <<: *telemetrygen
+    command:
+      ["metrics", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
+       "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
+       "--metric-type", "ExponentialHistogram"]
+
+  # Logs span all six canonical levels (severity-number ranges TRACE 1-4,
+  # DEBUG 5-8, INFO 9-12, WARN 13-16, ERROR 17-20, FATAL 21-24). INFO is the bulk;
+  # the rest run at --rate 1 so every summary level is non-zero without drowning
+  # out INFO. ERROR + FATAL also feed `otelq errors`.
+
+  # TRACE logs — a smaller stream (severity 1).
+  telemetrygen-logs-trace:
+    <<: *telemetrygen
+    command:
+      ["logs", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
+       "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
+       "--severity-number", "1", "--severity-text", "Trace"]
+
+  # DEBUG logs — a smaller stream (severity 5).
+  telemetrygen-logs-debug:
+    <<: *telemetrygen
+    command:
+      ["logs", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
+       "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
+       "--severity-number", "5", "--severity-text", "Debug"]
+
+  # INFO logs — the bulk (telemetrygen defaults to severity 9 / "Info").
+  telemetrygen-logs-info:
     <<: *telemetrygen
     command:
       ["logs", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
        "--duration", "15s", "--rate", "5", "--service", "otelq-demo"]
+
+  # WARN logs — a smaller stream (severity 13).
+  telemetrygen-logs-warn:
+    <<: *telemetrygen
+    command:
+      ["logs", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
+       "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
+       "--severity-number", "13", "--severity-text", "Warn"]
+
+  # ERROR logs — a smaller stream (severity 17); makes `otelq errors` meaningful.
+  telemetrygen-logs-error:
+    <<: *telemetrygen
+    command:
+      ["logs", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
+       "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
+       "--severity-number", "17", "--severity-text", "Error"]
+
+  # FATAL logs — a smaller stream (severity 21); also surfaced by `otelq errors`.
+  telemetrygen-logs-fatal:
+    <<: *telemetrygen
+    command:
+      ["logs", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
+       "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
+       "--severity-number", "21", "--severity-text", "Fatal"]
