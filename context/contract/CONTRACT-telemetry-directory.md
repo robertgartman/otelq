@@ -35,8 +35,8 @@ no network coupling between the two sides.
 
 The producer and consumer agree on a single **telemetry root** directory:
 
-- Default consumer-side location: the `telemetry/` directory sibling to
-  `otelq.py` (`<otelq.py parent>/telemetry/`).
+- Default consumer-side location: the `telemetry/` directory under the current
+  working directory (`<cwd>/telemetry/`); `--dir` overrides for other layouts.
 - Default producer-side location: the container path `/telemetry`, bind-mounted
   to the same host directory.
 

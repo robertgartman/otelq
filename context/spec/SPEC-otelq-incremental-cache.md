@@ -62,7 +62,11 @@ rationale for the cache (see [ADR-005](../adr/ADR-005-incremental-parquet-cache.
 - **Raw files** — the Collector's append-only, size-rotated JSONL outputs
   (`telemetry/<signal>.jsonl` active file + `telemetry/<signal>-<ts>.jsonl`
   rotated backups). otelq treats these as read-only inputs.
-- **Signal** — one of `traces`, `logs`, `metrics_gauge`, `metrics_sum`.
+- **Signal** — one of the six cache signals: `traces`, `logs`, `metrics_gauge`,
+  `metrics_sum`, `metrics_histogram`, `metrics_exp_histogram`. The single
+  `metrics` raw byte-stream feeds the four per-type metric signals (one
+  `read_otlp_metrics_<type>` reader each); the cursor tracks bytes and a
+  watermark per raw stream, while sealed parquet partitions are kept per signal.
 - **Event-time** — a record's own timestamp (`timeUnixNano`), never wall-clock.
 - **Minute M** — the UTC clock-minute `[M, M+1)`, keyed filename-safe as
   `<date>T<hour>-<minute>` (e.g. `2026-06-22T10-30`; colon-free).
@@ -245,7 +249,7 @@ rationale for the cache (see [ADR-005](../adr/ADR-005-incremental-parquet-cache.
 - **AC-8** (Verifies FR-8, FR-9, INV-7): Given `--since 12h` (beyond the hot window), when
   the query executes, then the cold path scans raw files for the older range and
   the result includes records older than RETENTION.
-  *Verification hint: `just otelq --format json errors --since 12h` returns
+  *Verification hint: `just otelq --format json --since 12h errors` returns
   pre-hot-window rows.*
 - **AC-9** (Verifies FR-9): Given a windowless `summary`, when run with no flags,
   then it reports only the hot window; when run with `--all`, then it reports the
@@ -317,8 +321,8 @@ rationale for the cache (see [ADR-005](../adr/ADR-005-incremental-parquet-cache.
   `10:30:21–…`. The next run resumes the backup from the stored offset, reads the
   new active file from zero, and seals minute `10:30` containing records from both
   files.
-- **Equivalence keystone (FR-11).** `just otelq --format json errors --since 20m`
-  and `just otelq --no-cache --format json errors --since 20m` return byte-identical
+- **Equivalence keystone (FR-11).** `just otelq --format json --since 20m errors`
+  and `just otelq --no-cache --format json --since 20m errors` return byte-identical
   JSON.
 
 ## Invariants

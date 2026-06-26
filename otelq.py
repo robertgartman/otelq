@@ -105,8 +105,12 @@ __all__ = [
     "_NO_TELEMETRY_MSG",
 ]
 
-# otelq.py lives at the repo root; telemetry/ is its sibling.
-DEFAULT_DIR = Path(__file__).resolve().parent / "telemetry"
+# Default to ./telemetry under the *current working directory* so the zero-config
+# default works the same whether otelq is `uv run otelq.py` from a checkout (run
+# from the repo root) or installed via uvx/pipx and run from a project dir. A
+# script-relative default (Path(__file__).parent) would resolve into the install
+# location — e.g. site-packages — for an installed copy. `--dir` overrides.
+DEFAULT_DIR = Path.cwd() / "telemetry"
 
 SIGNAL_GLOBS = {
     "traces": "traces*.jsonl",
@@ -144,21 +148,36 @@ _CRASH_LIMIT = 2048
 _TS_FIX = "make_timestamp(epoch_us(timestamp) // 1000) AS timestamp"
 
 # --- Cache model (SPEC-otelq-incremental-cache) ------------------------------
-# Three raw byte-streams feed four cache signals: the single metrics*.jsonl
-# stream is read by two readers (gauge + sum). The cursor tracks offsets and a
-# watermark per *stream*; parquet partitions are kept per *signal*.
+# Three raw byte-streams feed six cache signals: the single metrics*.jsonl
+# stream is read by four readers (gauge, sum, histogram, exp_histogram). The
+# cursor tracks offsets and a watermark per *stream*; parquet partitions are
+# kept per *signal*.
 CURSOR_STREAMS = ("traces", "logs", "metrics")
-CACHE_SIGNALS = ("traces", "logs", "metrics_gauge", "metrics_sum")
+CACHE_SIGNALS = (
+    "traces",
+    "logs",
+    "metrics_gauge",
+    "metrics_sum",
+    "metrics_histogram",
+    "metrics_exp_histogram",
+)
 STREAM_SIGNALS = {
     "traces": ("traces",),
     "logs": ("logs",),
-    "metrics": ("metrics_gauge", "metrics_sum"),
+    "metrics": (
+        "metrics_gauge",
+        "metrics_sum",
+        "metrics_histogram",
+        "metrics_exp_histogram",
+    ),
 }
 SIGNAL_READERS = {
     "traces": "read_otlp_traces",
     "logs": "read_otlp_logs",
     "metrics_gauge": "read_otlp_metrics_gauge",
     "metrics_sum": "read_otlp_metrics_sum",
+    "metrics_histogram": "read_otlp_metrics_histogram",
+    "metrics_exp_histogram": "read_otlp_metrics_exp_histogram",
 }
 
 CACHE_DIRNAME = ".otelq-cache"
@@ -209,7 +228,8 @@ def _count_rows(signal: str, obj: dict[str, Any]) -> int:
             for ss in rs.get("scopeSpans", [])
         )
     # metrics: count every data point across all metric types, so the chunk
-    # budget bounds both read_otlp_metrics_gauge and read_otlp_metrics_sum.
+    # budget bounds every read_otlp_metrics_<type> call (gauge, sum, histogram,
+    # exp_histogram).
     total = 0
     for rm in obj.get("resourceMetrics", []):
         for sm in rm.get("scopeMetrics", []):
@@ -309,21 +329,112 @@ def _chunk_signal(signal: str, telemetry_dir: Path, tmp_dir: str) -> list[str]:
     return _buffer_to_chunks(signal, line_iter(), tmp_dir, signal)
 
 
+def _schema_probe_chunk(telemetry_dir: Path, tmp_dir: str) -> str | None:
+    """Write one small (crash-safe) chunk from whichever stream has data, usable
+    as a typed-schema probe for ANY read_otlp_* reader.
+
+    The readers are cross-tolerant: each returns its own fixed typed schema — and
+    zero rows — over a batch of any other signal (read_otlp_logs over a traces
+    batch yields the logs columns, empty). So the first decodable batch of the
+    first stream that has one is enough to seed an empty typed relation for ANY
+    absent signal via `read_otlp_<reader>(probe) WHERE false` — drift-free, with
+    no embedded schema. Reads at most that first batch — never the whole corpus —
+    so it stays cheap on the hot path. Returns the chunk path, or None when no
+    telemetry is present at all (a truly empty dir, or all raw files rotated
+    away)."""
+    for stream in CURSOR_STREAMS:
+        for src in sorted(glob.glob(str(telemetry_dir / SIGNAL_GLOBS[stream]))):
+            try:
+                handle = open(src, encoding="utf-8")
+            except OSError:
+                continue
+            with handle:
+                for line in handle:
+                    if _decode_line(stream, line) is None:
+                        continue  # blank/partial/oversized — try the next batch
+                    chunks = _buffer_to_chunks(stream, [line], tmp_dir, "schema_probe")
+                    return chunks[0] if chunks else None
+    return None
+
+
+# A minimal, valid OTLP/JSON metrics line (one gauge data point) used ONLY as a
+# last-resort schema probe when the telemetry dir has no readable raw line of its
+# own (a truly empty or absent dir). Every read_otlp_* reader parses a
+# resourceMetrics-only line and returns its OWN typed schema with zero rows (the
+# readers are cross-tolerant), so reading this sample `WHERE false` probes the
+# schema of all six readers. This stays drift-free: the column types still come
+# from the live extension reading the sample — it is a schema *probe*, never a
+# hard-coded column list. A gauge metric needs no trace/span ids, so there are no
+# id-format pitfalls.
+_EMBEDDED_PROBE_LINE = json.dumps(
+    {
+        "resourceMetrics": [
+            {
+                "resource": {
+                    "attributes": [
+                        {"key": "service.name", "value": {"stringValue": "otelq"}}
+                    ]
+                },
+                "scopeMetrics": [
+                    {
+                        "metrics": [
+                            {
+                                "name": "otelq.schema.probe",
+                                "gauge": {
+                                    "dataPoints": [
+                                        {"timeUnixNano": "0", "asDouble": 0.0}
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                ],
+            }
+        ]
+    }
+)
+
+
+def _embedded_probe_chunk(tmp_dir: str) -> str | None:
+    """Write the embedded schema-probe sample to a chunk file and return its path.
+
+    The schema-source fallback when the telemetry dir offers no readable line of
+    its own, so absent relations can be seeded empty even over a truly empty or
+    absent directory (FR-1: no "table does not exist" ever)."""
+    chunks = _buffer_to_chunks("metrics", [_EMBEDDED_PROBE_LINE], tmp_dir, "schema_probe")
+    return chunks[0] if chunks else None
+
+
+# gauge/sum expose a scalar `value`; histogram/exp_histogram have no scalar
+# value, so the unified `metrics.value` surfaces their `sum` (quoted — it is a
+# column name, not the aggregate). metric_type tags each row by its origin
+# sub-relation; the suffixes match the relation names (metrics_<type>).
+_METRIC_VIEW_PARTS: tuple[tuple[str, str, str], ...] = (
+    ("metrics_gauge", "gauge", "value"),
+    ("metrics_sum", "sum", "value"),
+    ("metrics_histogram", "histogram", '"sum"'),
+    ("metrics_exp_histogram", "exp_histogram", '"sum"'),
+)
+
+
 def create_unified_metrics_view(conn: duckdb.DuckDBPyConnection) -> None:
     """Create the `metrics` view as the union of whichever metric tables exist.
 
-    Self-guarding: builds from metrics_gauge and/or metrics_sum, whichever are
-    present, and no-ops when neither is. This keeps the hot path (which omits a
-    signal that sealed no rows) and the cold path (which materialises an empty
-    table) producing the identical `metrics` view — the FR-11 equivalence lever.
-    Defined in exactly one place; reused by every relation builder and the test
-    fixture.
+    Unions all four per-type sub-relations that are present — gauge, sum,
+    histogram, exp_histogram — projecting the common columns plus a `metric_type`
+    discriminator. The unified `value` is each gauge/sum row's `value` and each
+    histogram/exp_histogram row's `sum`. Self-guarding: builds from whichever
+    sub-relations are present and no-ops when none are. Both the hot and cold
+    paths expose all four sub-relations whenever metrics are present (absent
+    types seeded empty) and none when metrics are absent, so they produce the
+    identical `metrics` view — the FR-11 equivalence lever. Defined in exactly
+    one place; reused by every relation builder and the test fixture.
     """
     have = _existing_relations(conn)
     parts = [
-        f"SELECT timestamp, service_name, metric_name, metric_unit, value, "
-        f"'{mtype}' AS metric_type FROM {tbl}"
-        for tbl, mtype in (("metrics_gauge", "gauge"), ("metrics_sum", "sum"))
+        f"SELECT timestamp, service_name, metric_name, metric_unit, "
+        f"{value} AS value, '{mtype}' AS metric_type FROM {tbl}"
+        for tbl, mtype, value in _METRIC_VIEW_PARTS
         if tbl in have
     ]
     if parts:
@@ -387,12 +498,28 @@ def _existing_relations(conn: duckdb.DuckDBPyConnection) -> set[str]:
     return {r[0] for r in rows}
 
 
-def _present_signals(have: set[str]) -> list[str]:
-    """User-facing signal names (traces/logs/metrics) that have a relation."""
-    return [s for s in ("traces", "logs", "metrics") if s in have]
+def _has_rows(conn: duckdb.DuckDBPyConnection, relation: str) -> bool:
+    """True iff `relation` exists AND holds at least one row.
+
+    Existence is checked first, so this never raises on a missing relation — and,
+    crucially, treats a seeded-empty relation (FR-1 expose-empty) exactly like an
+    absent one. "Present" therefore means *has captured data*, not mere table
+    existence: the presence checks below stay correct now that every documented
+    relation resolves (empty) whenever any telemetry is present."""
+    if relation not in _existing_relations(conn):
+        return False
+    return bool(_scalar(conn.execute(f"SELECT count(*) FROM {relation}")))
 
 
-def _no_signal_msg(have: set[str], missing: str, files: tuple[str, ...]) -> str:
+def _present_signals(conn: duckdb.DuckDBPyConnection) -> list[str]:
+    """User-facing signals (traces/logs/metrics) that have captured DATA (rows),
+    not merely a seeded-empty relation."""
+    return [s for s in ("traces", "logs", "metrics") if _has_rows(conn, s)]
+
+
+def _no_signal_msg(
+    conn: duckdb.DuckDBPyConnection, missing: str, files: tuple[str, ...]
+) -> str:
     """Error text for a required signal that has no captured data.
 
     With NOTHING captured the collector is probably down, so the generic hint
@@ -403,9 +530,10 @@ def _no_signal_msg(have: set[str], missing: str, files: tuple[str, ...]) -> str:
     — high-volume traces reappear on the next rotation, but low-volume
     logs/metrics don't until the collector restarts. `missing` is the human
     label (e.g. "logs", "traces or logs"); `files` are the jsonl base names to
-    cite in the remediation hint.
+    cite in the remediation hint. "Present" means has-data (FR-19), so a
+    seeded-empty relation never counts as present.
     """
-    present = _present_signals(have)
+    present = _present_signals(conn)
     if not present:
         return _NO_TELEMETRY_MSG
     names = " / ".join(f"{f}.jsonl" for f in files)
@@ -419,10 +547,12 @@ def _no_signal_msg(have: set[str], missing: str, files: tuple[str, ...]) -> str:
 
 
 def _require(conn: duckdb.DuckDBPyConnection, *relations: str) -> None:
-    have = _existing_relations(conn)
-    missing = [r for r in relations if r not in have]
+    # "Required" means the relation must carry DATA, not merely exist: every
+    # relation now resolves (empty) whenever any telemetry is present (FR-1), so a
+    # row-count check is what keeps slow/trace/logs/metric naming the gap (FR-19).
+    missing = [r for r in relations if not _has_rows(conn, r)]
     if missing:
-        raise NoTelemetryError(_no_signal_msg(have, missing[0], (missing[0],)))
+        raise NoTelemetryError(_no_signal_msg(conn, missing[0], (missing[0],)))
 
 
 def _fmt_ts(dt: datetime) -> str:
@@ -901,12 +1031,56 @@ def _evict_signal(telemetry_dir: Path, signal: str, hot_floor: datetime) -> None
 # --- relation building (hot / cold) ------------------------------------------
 
 
-def _assemble_hot(conn: duckdb.DuckDBPyConnection, telemetry_dir: Path) -> set[str]:
+def _seed_absent_relations(
+    conn: duckdb.DuckDBPyConnection,
+    telemetry_dir: Path,
+    tmp_dir: str,
+    present: set[str],
+    prefix: str,
+) -> None:
+    """Seed every absent base relation empty so ALL documented relations resolve.
+
+    Create each base signal not already in `present` (traces, logs, and the four
+    metric types) as an empty typed table — seeded from a cross-tolerant schema
+    probe — and add it to `present`. The probe is the dir's own first raw batch
+    when it has one, else the embedded sample, so absent relations resolve empty
+    in EVERY case, including a valid-but-empty or absent `--dir` (FR-1: never a
+    "table does not exist" error). `prefix` is the relation-name prefix: "_all_"
+    for the hot/cold builders that window via _finalize_relations, "" for connect
+    (which materialises final relations directly). Seeding identically on the hot
+    and cold paths keeps an absent relation's empty result byte-identical cached
+    vs --no-cache (FR-11). The friendly empty-telemetry (FR-18) and gap-naming
+    (FR-19) paths are preserved by the callers' row-count presence checks
+    (_has_rows), not by withholding the relation: an all-empty corpus still raises
+    the friendly message."""
+    absent = [s for s in CACHE_SIGNALS if s not in present]
+    if not absent:
+        return
+    probe = _schema_probe_chunk(telemetry_dir, tmp_dir)
+    if probe is None:
+        probe = _embedded_probe_chunk(tmp_dir)  # truly empty / absent dir
+    if probe is None:
+        return
+    for signal in absent:
+        conn.execute(
+            f"CREATE TABLE {prefix}{signal} AS SELECT * REPLACE ({_TS_FIX}) "
+            f"FROM {SIGNAL_READERS[signal]}('{probe}') WHERE false"
+        )
+        present.add(signal)
+
+
+def _assemble_hot(
+    conn: duckdb.DuckDBPyConnection, telemetry_dir: Path, tmp_dir: str
+) -> set[str]:
     """Build _all_<signal> = sealed parquet ∪ pending parquet.
 
     Sealed (complete past minutes) and pending (recent unsealed) are disjoint by
     construction, so a plain UNION ALL never double-counts. Returns the signals
-    for which any cached rows exist."""
+    that have CACHED rows (no seeding here): the caller uses an empty return as the
+    signal to fall back to a stateless cold scan, so seeding the absent relations
+    empty must happen only on the non-empty branch (build_hot), never before that
+    fallback decision — otherwise a lock-loser with an empty cache but live raw
+    files would expose empty relations instead of reading the raw delta."""
     present: set[str] = set()
     for signal in CACHE_SIGNALS:
         arms: list[str] = []
@@ -955,6 +1129,13 @@ def _finalize_relations(
                 f"WHERE timestamp >= TIMESTAMP '{_fmt_ts(lo)}' "
                 f"AND timestamp <= TIMESTAMP '{_fmt_ts(hi)}'"
             )
+    # FR-1 expose-empty: whenever ANY telemetry is present, `present` carries all
+    # six base signals — present streams are materialised (cold) or read from
+    # parquet (hot), and every absent signal is seeded empty
+    # (_seed_absent_relations) — so all seven documented relations resolve (a query
+    # gets 0 rows in-window, never a catalog error) and the hot and cold paths
+    # expose the identical set, keeping cached == --no-cache (FR-11). Empty
+    # in-window relations are kept, not dropped.
     create_unified_metrics_view(conn)
 
 
@@ -977,10 +1158,15 @@ def build_hot(
             _ingest_and_seal(conn, telemetry_dir, cursor, tmp_dir)
         finally:
             _release_lock(cdir, fd)
-    present = _assemble_hot(conn, telemetry_dir)
+    present = _assemble_hot(conn, telemetry_dir, tmp_dir)
     if not present:
+        # Empty cache: a stateless cold scan reads the raw delta (and itself seeds
+        # absent relations), so the query still answers (SPEC FR-12).
         build_cold(conn, telemetry_dir, window, tmp_dir)
         return
+    # Cache has data: seed the signals that sealed none empty so all documented
+    # relations resolve on the hot path exactly as on the cold path (FR-1/FR-11).
+    _seed_absent_relations(conn, telemetry_dir, tmp_dir, present, "_all_")
     _finalize_relations(conn, present, window)
 
 
@@ -1002,6 +1188,7 @@ def build_cold(
                 conn, f"_all_{signal}", SIGNAL_READERS[signal], chunks, _TS_FIX
             )
             present.add(signal)
+    _seed_absent_relations(conn, telemetry_dir, tmp_dir, present, "_all_")
     _finalize_relations(conn, present, window)
 
 
@@ -1016,12 +1203,17 @@ def connect(telemetry_dir: Path) -> duckdb.DuckDBPyConnection:
     conn.execute("INSTALL otlp FROM community")
     conn.execute("LOAD otlp")
     with tempfile.TemporaryDirectory(prefix="otelq-") as tmp_dir:
+        present: set[str] = set()
         for stream in CURSOR_STREAMS:
             chunks = _chunk_signal(stream, telemetry_dir, tmp_dir)
             if not chunks:
                 continue
             for signal in STREAM_SIGNALS[stream]:
                 _materialize(conn, signal, SIGNAL_READERS[signal], chunks, _TS_FIX)
+                present.add(signal)
+        # Expose-empty (FR-1): seed every absent signal empty so all documented
+        # relations resolve, even over an empty/absent dir (embedded probe).
+        _seed_absent_relations(conn, telemetry_dir, tmp_dir, present, "")
         create_unified_metrics_view(conn)
     return conn
 
@@ -1101,6 +1293,13 @@ def build_connection(telemetry_dir: Path, plan: Plan) -> duckdb.DuckDBPyConnecti
 
 def run_command(args: argparse.Namespace) -> CommandResult:
     """Plan, build the connection, dispatch, and apply trace/metric cold-fallback."""
+    # A --dir that exists but is not a directory (e.g. a regular file) would
+    # crash deep in the cache layer: _acquire_lock does mkdir('<file>/.otelq-cache')
+    # and raises NotADirectoryError. Reject it up front with a friendly message
+    # (exit non-zero, no traceback), mirroring doctor's is_dir() guard. A missing
+    # dir is left alone — it routes to the normal friendly no-telemetry path.
+    if args.dir.exists() and not args.dir.is_dir():
+        raise SystemExit(f"otelq: --dir '{args.dir}' is not a directory")
     plan = plan_range(args)
     command = COMMANDS[args.command]
     conn = build_connection(args.dir, plan)
@@ -1153,15 +1352,22 @@ _LOG_LEVELS: tuple[tuple[str, int, int], ...] = (
     ("ERROR", 17, 20),
     ("FATAL", 21, 24),
 )
-_TRACE_SLOW_NS = 1_000_000_000  # 1s in nanoseconds; the >1s / =<1s span split
+_TRACE_SLOW_MS = 1000  # 1s in milliseconds; the >1s / =<1s span split. The
+# duckdb-otlp extension reports `duration` in integer milliseconds (sub-ms spans
+# truncate to 0), NOT nanoseconds — so the threshold and duration_ms below are ms.
 # Per-subset aggregates every summary row carries (count, span, distinct services).
 _SUMMARY_AGG = "count(*), min(timestamp), max(timestamp), count(DISTINCT service_name)"
 _SUMMARY_ZERO = (0, None, None, 0)  # a bucket/level present but with no records
+# The four metric types `summary` breaks metrics into (the suffixes of the
+# metrics_<type> relations). All four rows appear when metrics are present, zeros
+# included — a fixed skeleton like the log levels (FR-3). The OTel Summary type
+# is not among them: the duckdb-otlp reader for it is an unsupported stub.
+_METRIC_TYPES: tuple[str, ...] = ("gauge", "sum", "histogram", "exp_histogram")
 
 
 def _summary_traces(conn: duckdb.DuckDBPyConnection) -> list[Row]:
     """Two duration buckets; both rows present even when one is empty (FR-3)."""
-    bucket = f"CASE WHEN duration > {_TRACE_SLOW_NS} THEN '>1s' ELSE '=<1s' END"
+    bucket = f"CASE WHEN duration > {_TRACE_SLOW_MS} THEN '>1s' ELSE '=<1s' END"
     got = {
         r[0]: r[1:]
         for r in conn.execute(
@@ -1194,24 +1400,37 @@ def _summary_logs(conn: duckdb.DuckDBPyConnection) -> list[Row]:
     return rows
 
 
-def _summary_metrics(conn: duckdb.DuckDBPyConnection) -> Row:
-    """A single row; metrics carry no meaningful sub-categorization (FR-3)."""
-    return ("metrics", "", *_one_row(conn.execute(f"SELECT {_SUMMARY_AGG} FROM metrics")))
+def _summary_metrics(conn: duckdb.DuckDBPyConnection) -> list[Row]:
+    """One row per metric type (all four present, zeros included), each scoped to
+    that type over the unified `metrics` view (FR-3). `details` is the type."""
+    got = {
+        r[0]: r[1:]
+        for r in conn.execute(
+            f"SELECT metric_type AS t, {_SUMMARY_AGG} FROM metrics GROUP BY t"
+        ).fetchall()
+    }
+    return [
+        ("metrics", mtype, *got.get(mtype, _SUMMARY_ZERO)) for mtype in _METRIC_TYPES
+    ]
 
 
 def cmd_summary(
     conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
 ) -> CommandResult:
-    have = _existing_relations(conn)
+    # Include a signal only when it has captured DATA (rows), not merely a
+    # seeded-empty relation — so an empty traces relation emits no zero-count trace
+    # buckets (FR-3: an absent signal contributes no rows; AC-25). The within-
+    # signal skeletons (both trace buckets, all six log levels, all four metric
+    # types) still appear for a present signal.
     columns = ["signal", "details", "count", "earliest", "latest", "services"]
     rows: list[Row] = []
-    if "traces" in have:
+    if _has_rows(conn, "traces"):
         rows += _summary_traces(conn)
-    if "logs" in have:
+    if _has_rows(conn, "logs"):
         rows += _summary_logs(conn)
-    if "metrics" in have:
-        rows.append(_summary_metrics(conn))
-    if not rows:  # no signal present at all -> friendly empty-telemetry path (FR-18)
+    if _has_rows(conn, "metrics"):
+        rows += _summary_metrics(conn)
+    if not rows:  # no signal has data -> friendly empty-telemetry path (FR-18)
         raise NoTelemetryError(_NO_TELEMETRY_MSG)
     return columns, rows
 
@@ -1223,6 +1442,12 @@ def cmd_sql(
 
     try:
         result = conn.execute(args.query)
+        # An empty / whitespace / comment-only query has no statement to run, so
+        # DuckDB's execute() returns None and result.description below would raise
+        # AttributeError (not a duckdb.Error). Route it to the same friendly
+        # SQL-error path as any other bad SQL instead of a raw traceback (EC-4).
+        if result is None:
+            raise SystemExit("otelq: SQL error: empty query")
         columns = [d[0] for d in result.description] if result.description else []
         rows = result.fetchall()
     except duckdb.Error as exc:
@@ -1233,26 +1458,29 @@ def cmd_sql(
 def cmd_errors(
     conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
 ) -> CommandResult:
-    have = _existing_relations(conn)
-    if "traces" not in have and "logs" not in have:
-        # errors are derived from error spans and ERROR/FATAL logs; metrics
-        # alone can't answer it, so name the gap rather than blaming the collector.
+    # errors are derived from error spans and ERROR/FATAL logs; with neither
+    # signal carrying data (metrics-only, or nothing), name the gap rather than
+    # blaming the collector. "Has data", not mere existence: both relations now
+    # resolve (empty) whenever any telemetry is present (FR-1).
+    if not _has_rows(conn, "traces") and not _has_rows(conn, "logs"):
         raise NoTelemetryError(
-            _no_signal_msg(have, "traces or logs", ("traces", "logs"))
+            _no_signal_msg(conn, "traces or logs", ("traces", "logs"))
         )
     # The time window is applied by the relation builder (SPEC INV-7), so the
     # command queries the already-scoped relations.
     columns = ["kind", "timestamp", "service_name", "label", "detail"]
     rows: list[Row] = []
-    if "traces" in have:
+    if _has_rows(conn, "traces"):
         rows += conn.execute(
             "SELECT 'span', timestamp, service_name, span_name, status_message "
             "FROM traces WHERE status_code = 2"
         ).fetchall()
-    if "logs" in have:
+    if _has_rows(conn, "logs"):
+        # FR-4: match case-insensitively. severity_text carries inconsistent
+        # casing in practice (e.g. "Error"), so fold before comparing (cf. FR-2).
         rows += conn.execute(
             "SELECT 'log', timestamp, service_name, severity_text, body "
-            "FROM logs WHERE severity_text IN ('ERROR', 'FATAL')"
+            "FROM logs WHERE upper(severity_text) IN ('ERROR', 'FATAL')"
         ).fetchall()
     rows.sort(key=lambda r: r[1], reverse=True)
     return columns, rows
@@ -1264,9 +1492,15 @@ def cmd_slow(
     _require(conn, "traces")
     columns = ["timestamp", "service_name", "span_name", "duration_ms", "trace_id"]
     rows = conn.execute(
+        # FR-5 orders by duration desc; the trailing keys (all output columns, so
+        # they exist on every traces relation) are a deterministic tie-breaker so
+        # equal-duration spans — and which ones the LIMIT keeps — match on the hot
+        # (parquet) and cold (raw) paths — byte-identical cached vs --no-cache.
         "SELECT timestamp, service_name, span_name, "
-        "round(duration / 1e6, 2) AS duration_ms, trace_id "
-        "FROM traces ORDER BY duration DESC LIMIT ?",
+        "duration AS duration_ms, trace_id "
+        "FROM traces "
+        "ORDER BY duration DESC, timestamp DESC, trace_id, service_name, span_name "
+        "LIMIT ?",
         [args.top],
     ).fetchall()
     return columns, rows
@@ -1278,7 +1512,7 @@ def cmd_trace(
     _require(conn, "traces")
     spans = conn.execute(
         "SELECT span_id, parent_span_id, span_name, service_name, "
-        "round(duration / 1e6, 2), status_code, timestamp "
+        "duration, status_code, timestamp "
         "FROM traces WHERE trace_id = ? ORDER BY timestamp",
         [args.trace_id],
     ).fetchall()
@@ -1300,7 +1534,10 @@ def cmd_trace(
     rows: list[Row] = []
 
     def walk(parent_key: str | None, depth: int) -> None:
-        for span in sorted(children.get(parent_key, []), key=lambda s: s[6]):
+        # Order siblings by timestamp (FR-6), then span_id (unique) as a
+        # deterministic tie-breaker so the tree renders in the same order on the
+        # hot (parquet) and cold (raw) paths — byte-identical cached vs --no-cache.
+        for span in sorted(children.get(parent_key, []), key=lambda s: (s[6], s[0])):
             rows.append(
                 (depth, "  " * depth + span[2], span[3], span[4], span[5], span[0])
             )
@@ -1320,16 +1557,26 @@ def cmd_logs(
         where.append("service_name = ?")
         params.append(args.service)
     if args.level:
-        where.append("severity_text = ?")
+        # FR-7: case-insensitive match. severity_text carries inconsistent
+        # casing in practice (e.g. "Info"), so fold both sides, not just input.
+        where.append("upper(severity_text) = ?")
         params.append(args.level.upper())
     if args.grep:
-        where.append("body ILIKE ?")
-        params.append(f"%{args.grep}%")
+        # FR-7: --grep is a literal, case-insensitive SUBSTRING match. ILIKE
+        # treated `_` and `%` in the term as wildcards (so "user_id" matched
+        # "userXid"); contains() matches the raw text literally, with lower() on
+        # both sides keeping it case-insensitive.
+        where.append("contains(lower(body), lower(?))")
+        params.append(args.grep)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     columns = ["timestamp", "service_name", "severity_text", "body", "trace_id"]
     rows = conn.execute(
+        # FR-7 orders newest-first; the trailing keys are a deterministic
+        # tie-breaker so rows sharing a timestamp render in the same order on the
+        # hot (parquet) and cold (raw) paths — byte-identical cached vs --no-cache.
         f"SELECT timestamp, service_name, severity_text, body, trace_id "
-        f"FROM logs{clause} ORDER BY timestamp DESC",
+        f"FROM logs{clause} "
+        f"ORDER BY timestamp DESC, service_name, severity_text, body, trace_id",
         params,
     ).fetchall()
     return columns, rows
@@ -1348,8 +1595,13 @@ def cmd_metric(
         "metric_unit",
     ]
     rows = conn.execute(
+        # FR-8 orders ascending by timestamp; the trailing keys are a
+        # deterministic tie-breaker (metric_name is filtered to a constant) so
+        # equal-timestamp points render in the same order on the hot (parquet)
+        # and cold (raw) paths — byte-identical cached vs --no-cache.
         "SELECT timestamp, service_name, metric_name, metric_type, value, "
-        "metric_unit FROM metrics WHERE metric_name = ? ORDER BY timestamp",
+        "metric_unit FROM metrics WHERE metric_name = ? "
+        "ORDER BY timestamp, service_name, value, metric_type, metric_unit",
         [args.name],
     ).fetchall()
     return columns, rows
@@ -1509,6 +1761,22 @@ COMMANDS: dict[str, Command] = {
 }
 
 
+def _non_negative_int(value: str) -> int:
+    """argparse `type` for `slow --top`: a non-negative int.
+
+    A negative value reaches DuckDB as `LIMIT -1`, which raises an uncaught
+    BinderException (a raw traceback); reject it at parse time (exit 2) instead.
+    A non-int keeps argparse's standard "invalid int value" error, and `--top 0`
+    stays valid (it returns zero rows)."""
+    try:
+        ivalue = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: '{value}'")
+    if ivalue < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {ivalue}")
+    return ivalue
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="otelq",
@@ -1517,19 +1785,31 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=textwrap.dedent(
             """\
             argument order:
-              --dir / --format / --all / --no-cache are GLOBAL flags and must come
-              BEFORE the subcommand:  otelq --format json errors   (not: otelq errors
-              --format json). Subcommand flags (--since, --top, --service, ...) go
-              after. Prefer --format json so output is parsed, not scraped.
+              --dir / --format / --all / --no-cache / --since are GLOBAL flags and
+              must come BEFORE the subcommand:  otelq --since 10m --format json errors
+              (not: otelq errors --since 10m). Per-command flags (--top, --service,
+              --level, --grep) go AFTER the subcommand. Prefer --format json so output
+              is parsed, not scraped.
+
+            time window (filters by each record's own event-time):
+              (default)         a recent window (the cache's hot window)
+              --since Nm|Nh|Nd  only the trailing window, e.g. 10m, 2h, 1d
+              --all             the full captured history (no window)
+              `trace` ignores the window — a trace id is looked up across all history.
 
             sql views (for `otelq sql "<query>"`):
-              traces   timestamp, duration (ns), trace_id, span_id, parent_span_id,
+              traces   timestamp, duration (ms), trace_id, span_id, parent_span_id,
                        service_name, span_name, span_kind,
                        status_code (0=unset,1=ok,2=error), status_message
               logs     timestamp, trace_id, service_name, severity_text, body
               metrics  timestamp, service_name, metric_name, metric_type, value,
-                       metric_unit
-              also: metrics_gauge, metrics_sum
+                       metric_unit  (metric_type: gauge|sum|histogram|exp_histogram;
+                       value = the value of gauge/sum, the sum of histogram/exp)
+              per-type metric relations (metrics unions whichever are present):
+                metrics_gauge, metrics_sum               value
+                metrics_histogram, metrics_exp_histogram  count, sum, min, max
+                       (+ bucket_counts/explicit_bounds, or scale/zero_count/…)
+              (the OTel Summary metric type is unsupported by the reader extension)
 
             Run `otelq troubleshoot` for the capture → query loop and common fixes.
             """
@@ -1556,32 +1836,38 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="bypass the parquet cache entirely (pure cold scan)",
     )
+    # --since is a GLOBAL flag: it shapes the query's time window (the twin of
+    # --all), so like the other query-shaping flags it precedes the subcommand
+    # and appears in the top-level usage line. See SPEC-otelq-cli FR-11/FR-15.
+    parser.add_argument(
+        "--since",
+        help="restrict to a trailing time window: Nm/Nh/Nd (e.g. 10m, 2h, 1d)",
+    )
 
-    def add_since(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--since", help="time window, e.g. 10m, 2h, 1d")
-
-    sub = parser.add_subparsers(dest="command", required=True)
-    add_since(sub.add_parser("summary", help="counts and time span per signal"))
+    # Not required: a bare `otelq` (command is None) prints full help in main().
+    sub = parser.add_subparsers(dest="command", required=False)
+    sub.add_parser("summary", help="counts and time span per signal")
     p_sql = sub.add_parser("sql", help="run an ad-hoc SQL query")
     p_sql.add_argument(
         "query",
-        help="SQL over views: traces, logs, metrics, metrics_gauge, metrics_sum",
+        help=(
+            "SQL over views: traces, logs, metrics, metrics_gauge, metrics_sum, "
+            "metrics_histogram, metrics_exp_histogram"
+        ),
     )
-    add_since(p_sql)
-    add_since(sub.add_parser("errors", help="error spans and ERROR/FATAL logs"))
+    sub.add_parser("errors", help="error spans and ERROR/FATAL logs")
     p_slow = sub.add_parser("slow", help="slowest spans")
-    p_slow.add_argument("--top", type=int, default=20, help="rows to show")
-    add_since(p_slow)
+    p_slow.add_argument(
+        "--top", type=_non_negative_int, default=20, help="rows to show"
+    )
     p_trace = sub.add_parser("trace", help="all spans of one trace as a tree")
     p_trace.add_argument("trace_id", help="trace id to expand")
     p_logs = sub.add_parser("logs", help="filtered log records")
     p_logs.add_argument("--service", help="filter by service name")
     p_logs.add_argument("--level", help="filter by severity, e.g. ERROR")
     p_logs.add_argument("--grep", help="case-insensitive substring of the body")
-    add_since(p_logs)
     p_metric = sub.add_parser("metric", help="time series for one metric")
     p_metric.add_argument("name", help="metric name")
-    add_since(p_metric)
     sub.add_parser(
         "collector-config",
         help="print the file-export fragment to add to an existing Collector",
@@ -1593,6 +1879,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "troubleshoot",
         help="print the capture → query loop and common fixes",
+    )
+    p_help = sub.add_parser("help", help="show help for otelq or a command")
+    p_help.add_argument(
+        "topic", nargs="?", help="command to show help for (omit for general help)"
     )
     return parser
 
@@ -1617,8 +1907,30 @@ def _dispatch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _help_for(parser: argparse.ArgumentParser, topic: str | None) -> int:
+    """`help` command: print general help when no topic, else the named
+    command's own help — delegated to `<topic> -h` so argparse both renders it
+    and validates the name (unknown topic -> its usual invalid-choice error)."""
+    if topic is None:
+        parser.print_help()
+        return 0
+    try:
+        parser.parse_args([topic, "-h"])
+    except SystemExit as exc:  # argparse exits after printing help/usage
+        return exc.code if isinstance(exc.code, int) else 0
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    # Bare `otelq` and `otelq help [topic]` are usability affordances handled
+    # before dispatch (FR-22); every other command flows through _dispatch.
+    if args.command is None:
+        parser.print_help()
+        return 0
+    if args.command == "help":
+        return _help_for(parser, args.topic)
     try:
         return _dispatch(args)
     except BrokenPipeError:

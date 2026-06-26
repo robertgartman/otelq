@@ -27,9 +27,18 @@ cd otelq
 
 ```sh
 just otel-demo            # Collector + generators, then waits for the flush
-just otelq summary        # counts and time span per signal
-just otelq metric gen     # the synthetic gauge from the demo
 just otel-down            # stop and clean up
+
+printf '%s\n' "=== Demo queries ===" \
+  "just otelq summary" \
+  "just otelq errors" \
+  "just otelq slow --top 10" \
+  "just otelq trace <trace_id>" \
+  "just otelq logs --level ERROR --grep 'timeout'" \
+  "just otelq metric <name>" \
+  "just otelq sql 'select * from traces limit 5'" \
+  "== Running Summary =="
+just otelq summary        # summary based metrics stored under telemetry folder
 ```
 
 **Or with plain Docker Compose** — no command runner needed:
@@ -40,10 +49,19 @@ docker compose -f compose.yaml -f compose.demo.yaml --profile otel up -d
 docker compose -f compose.yaml -f compose.demo.yaml --profile demo up
 sleep 7                                    # let the Collector flush its 5s batch
 
-uv run otelq.py summary                    # uv runs the single-file CLI — no install
-uv run otelq.py metric gen
-
 docker compose -f compose.yaml -f compose.demo.yaml --profile otel --profile demo down
+
+printf '%s\n' "=== Demo queries ===" \
+  "uv run otelq.py otelq summary" \
+  "uv run otelq.py otelq errors" \
+  "uv run otelq.py otelq slow --top 10" \
+  "uv run otelq.py otelq trace <trace_id>" \
+  "uv run otelq.py otelq logs --level ERROR --grep 'timeout'" \
+  "uv run otelq.py otelq metric <name>" \
+  "uv run otelq.py otelq sql 'select * from traces limit 5'" \
+  "== Running Summary =="
+
+uv run otelq.py summary                    # uv runs the single-file CLI — no install
 ```
 
 Both paths need [Docker](https://www.docker.com/) and [uv](https://docs.astral.sh/uv/); the `just` path additionally needs [`just`](https://github.com/casey/just). The demo generators live **only in this repo** as a testing aid — they are **never** part of integrating otelq into your own project.
@@ -94,7 +112,7 @@ otelq --dir /Users/me/dev/my-service/telemetry doctor    # verify your wiring sa
 
 `collector-config` is generated from otelq's pinned constants, so it never drifts from the contract; `doctor` checks a telemetry directory against it. The `file` exporter requires the `*-contrib` Collector image. The **target-project-setup** skill automates all of this and asks for the target project's path; see below. When exercising your own app is inconvenient, the skill can also confirm the wiring end-to-end with a throwaway [`telemetrygen`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen) probe — committed, run against your Collector over its own network, then reverted — flagging first if the teed pipeline also feeds a real backend.
 
-> **No Collector yet?** otelq bundles one purely so you can try the tool without instrumenting anything — see [Give it a try](#give-it-a-try). That bundled stack (and the Compose files and optional `just` recipes that manage it) is a **demo and local-dev aid, not a deployment model**: in real use the Collector lives in your project, and otelq just reads what it writes.
+> **No Collector yet?** otelq bundles one purely so you can try the tool without instrumenting anything — see [Give it a dry run](#give-it-a-dry-run). That bundled stack (and the Compose files and optional `just` recipes that manage it) is a **demo and local-dev aid, not a deployment model**: in real use the Collector lives in your project, and otelq just reads what it writes.
 
 ### Your project's production environment
 
@@ -109,71 +127,74 @@ So if you keep the Collector in production, make the configuration this project 
 
 Concretely, that means parameterizing the pieces otelq added — gating the `file` exporters and the `telemetry/` bind mount behind a profile or environment variable, and selecting the production exporter set when deploying — so a single Compose definition flips cleanly between *"store telemetry locally for otelq"* and *"ship telemetry to a remote, production-compliant collector."*
 
-## Quickstart
-
-```sh
-# 1. Start the bundled dev Collector (OTLP gRPC :4317 / HTTP :4318)
-docker compose --profile otel up -d
-
-# 2. Point the app you are debugging at the Collector and run it
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
-#    ...then run your app so it emits telemetry...
-
-# 3. Query what was captured — uv runs the single-file CLI, no install
-uv run otelq.py summary
-uv run otelq.py --format json errors
-uv run otelq.py slow --top 10
-uv run otelq.py trace <trace_id>
-```
-
-Stop the Collector with `docker compose --profile otel down`. To see otelq work without instrumenting an app, use the demo in [Give it a try](#give-it-a-try) above.
-
-> **Optional `just` shortcuts.** If you have [`just`](https://github.com/casey/just) installed, the repo's [`justfile`](justfile) wraps all of the above — `just otel-up`, `just otelq summary`, `just otel-down`, and `just otel-clean` (a *safe* telemetry reset that stops the Collector before truncating its open files, then clears the cache). They are a convenience, not a requirement.
-
 ## Install / run options
 
-**(a) Zero-install, ad-hoc** — `otelq.py` is a [PEP 723](https://peps.python.org/pep-0723/) single-file script. `uv` provisions Python and DuckDB on the fly:
+**(a) Zero-install, ad-hoc** — `otelq.py` is a [PEP 723](https://peps.python.org/pep-0723/) single-file script. The skill based AI workflow assumes you fetch it with `uvx` directly from GitHub, but you can also run it straight from the repo or a local clone:
 
 ```sh
 uv run otelq.py summary
 ```
 
-**(b) Installed CLI** (after the first PyPI release):
 
-```sh
-uvx otelq summary          # ephemeral, no install
-pipx install otelq         # persistent install
-```
-
-**(c) Clone the repo** for the bundled dev Collector (the Compose stack, plus an optional `justfile` of shortcuts):
-
-```sh
-git clone https://github.com/robertgartman/otelq
-cd otelq
-docker compose --profile otel up -d
-```
 
 ## Commands
 
-| Command   | What it does                                              |
-|-----------|-----------------------------------------------------------|
-| `summary` | Counts and time span per signal                           |
-| `errors`  | Error spans and ERROR/FATAL logs                          |
-| `slow`    | Slowest spans (`--top N`)                                 |
-| `trace`   | All spans of one trace, as a tree (`trace <trace_id>`)    |
-| `logs`    | Filtered log records (`--service`, `--level`, `--grep`)   |
-| `metric`  | Time series for one metric (`metric <name>`)              |
-| `sql`     | Ad-hoc SQL over the `traces`/`logs`/`metrics` views       |
-| `collector-config` | Print the file-export fragment to add to an existing Collector |
-| `doctor`  | Check that a telemetry dir satisfies the contract (`--dir`) |
-| `troubleshoot` | Print the capture → query loop and common fixes |
+This is a dump from running `uv run otelq.py --help` within the project root:
 
-**Argument-order rule:** `--format` (`table` \| `json` \| `csv`) is a global flag and goes **before** the subcommand. The same applies to `--all` and `--no-cache`. The `--since` window (e.g. `10m`, `2h`, `1d`) goes after the subcommand.
+```text
 
-```sh
-uv run otelq.py --format json errors        # correct
-uv run otelq.py errors --format json         # WRONG: --format is global
-uv run otelq.py logs --level ERROR --since 30m
+usage: otelq [-h] [--dir DIR] [--format {table,json,csv}] [--all] [--no-cache] [--since SINCE] {summary,sql,errors,slow,trace,logs,metric,collector-config,doctor,troubleshoot,help} ...
+
+Query OTLP telemetry captured by the dev OTel Collector.
+
+positional arguments:
+  {summary,sql,errors,slow,trace,logs,metric,collector-config,doctor,troubleshoot,help}
+    summary             counts and time span per signal
+    sql                 run an ad-hoc SQL query
+    errors              error spans and ERROR/FATAL logs
+    slow                slowest spans
+    trace               all spans of one trace as a tree
+    logs                filtered log records
+    metric              time series for one metric
+    collector-config    print the file-export fragment to add to an existing Collector
+    doctor              check that --dir satisfies the telemetry contract
+    troubleshoot        print the capture → query loop and common fixes
+    help                show help for otelq or a command
+
+options:
+  -h, --help            show this help message and exit
+  --dir DIR             telemetry folder (default: /Users/robert/misc-dev/otelq/telemetry)
+  --format {table,json,csv}
+  --all                 widen the query to the full raw history (cold scan)
+  --no-cache            bypass the parquet cache entirely (pure cold scan)
+  --since SINCE         restrict to a trailing time window: Nm/Nh/Nd (e.g. 10m, 2h, 1d)
+
+argument order:
+  --dir / --format / --all / --no-cache / --since are GLOBAL flags and
+  must come BEFORE the subcommand:  otelq --since 10m --format json errors
+  (not: otelq errors --since 10m). Per-command flags (--top, --service,
+  --level, --grep) go AFTER the subcommand. Prefer --format json so output
+  is parsed, not scraped.
+
+time window (filters by each record's own event-time):
+  (default)         a recent window (the cache's hot window)
+  --since Nm|Nh|Nd  only the trailing window, e.g. 10m, 2h, 1d
+  --all             the full captured history (no window)
+  `trace` ignores the window — a trace id is looked up across all history.
+
+sql views (for `otelq sql "<query>"`):
+  traces   timestamp, duration (ms), trace_id, span_id, parent_span_id,
+           service_name, span_name, span_kind,
+           status_code (0=unset,1=ok,2=error), status_message
+  logs     timestamp, trace_id, service_name, severity_text, body
+  metrics  timestamp, service_name, metric_name, metric_type, value,
+           metric_unit  (metric_type: gauge|sum|histogram|exp_histogram;
+           value = the value of gauge/sum, the sum of histogram/exp)
+  per-type metric relations (metrics unions whichever are present):
+    metrics_gauge, metrics_sum               value
+    metrics_histogram, metrics_exp_histogram  count, sum, min, max
+           (+ bucket_counts/explicit_bounds, or scale/zero_count/…)
+  (the OTel Summary metric type is unsupported by the reader extension)
 ```
 
 See [`context/spec/SPEC-otelq-cli`](context/spec/SPEC-otelq-cli.md) for the full, authoritative command behavior.

@@ -35,12 +35,13 @@ def synth_conn() -> duckdb.DuckDBPyConnection:
             span_attributes VARCHAR, events_json VARCHAR, links_json VARCHAR,
             dropped_attributes_count INTEGER, dropped_events_count INTEGER,
             dropped_links_count INTEGER, flags INTEGER);
+        -- duration is integer milliseconds (extension unit): 5 / 90 / 12 ms.
         INSERT INTO traces VALUES
-          ('2026-05-22 10:00:00',0,5000000,'trace-a','span-a1','','','checkout-api',
+          ('2026-05-22 10:00:00',0,5,'trace-a','span-a1','','','checkout-api',
            '','','GET /orders',2,1,'','','','','','','','',0,0,0,0),
-          ('2026-05-22 10:00:01',0,90000000,'trace-a','span-a2','span-a1','',
+          ('2026-05-22 10:00:01',0,90,'trace-a','span-a2','span-a1','',
            'checkout-api','','','SELECT orders',3,1,'','','','','','','','',0,0,0,0),
-          ('2026-05-22 10:00:02',0,12000000,'trace-b','span-b1','','','catalog-api',
+          ('2026-05-22 10:00:02',0,12,'trace-b','span-b1','','','catalog-api',
            '','','POST /products',2,2,'boom','','','','','','','',0,0,0,0);
         """
     )
@@ -88,6 +89,47 @@ def synth_conn() -> duckdb.DuckDBPyConnection:
         INSERT INTO metrics_sum VALUES
           ('2026-05-22 10:00:00',0,'http.server.requests','','{requests}',42,
            'checkout-api','','','','','','','',0,'',2,true);
+        """
+    )
+    # histogram/exp_histogram mirror the duckdb-otlp reader columns; the unified
+    # `metrics` view surfaces their `sum` as `value` (they have no scalar value).
+    conn.execute(
+        """
+        CREATE TABLE metrics_histogram (
+            timestamp TIMESTAMP_MS, start_timestamp BIGINT, metric_name VARCHAR,
+            metric_description VARCHAR, metric_unit VARCHAR, count BIGINT, sum DOUBLE,
+            min DOUBLE, max DOUBLE, bucket_counts VARCHAR, explicit_bounds VARCHAR,
+            service_name VARCHAR, service_namespace VARCHAR, service_instance_id VARCHAR,
+            resource_attributes VARCHAR, scope_name VARCHAR, scope_version VARCHAR,
+            scope_attributes VARCHAR, metric_attributes VARCHAR, flags INTEGER,
+            exemplars_json VARCHAR, aggregation_temporality INTEGER);
+        INSERT INTO metrics_histogram
+          (timestamp, metric_name, metric_unit, count, sum, min, max, service_name,
+           aggregation_temporality)
+        VALUES
+          ('2026-05-22 10:00:00','http.server.duration','ms',10,123.5,1.0,50.0,
+           'checkout-api',2);
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE metrics_exp_histogram (
+            timestamp TIMESTAMP_MS, start_timestamp BIGINT, metric_name VARCHAR,
+            metric_description VARCHAR, metric_unit VARCHAR, count BIGINT, sum DOUBLE,
+            min DOUBLE, max DOUBLE, scale INTEGER, zero_count BIGINT,
+            zero_threshold DOUBLE, positive_offset INTEGER,
+            positive_bucket_counts VARCHAR, negative_offset INTEGER,
+            negative_bucket_counts VARCHAR, service_name VARCHAR,
+            service_namespace VARCHAR, service_instance_id VARCHAR,
+            resource_attributes VARCHAR, scope_name VARCHAR, scope_version VARCHAR,
+            scope_attributes VARCHAR, metric_attributes VARCHAR, flags INTEGER,
+            exemplars_json VARCHAR, aggregation_temporality INTEGER);
+        INSERT INTO metrics_exp_histogram
+          (timestamp, metric_name, metric_unit, count, sum, min, max, scale,
+           zero_count, service_name, aggregation_temporality)
+        VALUES
+          ('2026-05-22 10:00:01','rpc.server.duration','ms',5,42.0,2.0,20.0,2,0,
+           'catalog-api',2);
         """
     )
     otelq.create_unified_metrics_view(conn)
@@ -154,8 +196,19 @@ def test_summary_breakdown_rows(synth_conn: duckdb.DuckDBPyConnection) -> None:
     # logs: one INFO (sevnum 9), one ERROR (sevnum 17)
     assert count[("logs", "INFO")] == 1
     assert count[("logs", "ERROR")] == 1
-    # metrics: single row, empty details, 2 gauge + 1 sum = 3
-    assert count[("metrics", "")] == 3
+    # metrics: one row per type, scoped to that type (2 gauge, 1 sum, 1 histogram,
+    # 1 exp_histogram)
+    assert count[("metrics", "gauge")] == 2
+    assert count[("metrics", "sum")] == 1
+    assert count[("metrics", "histogram")] == 1
+    assert count[("metrics", "exp_histogram")] == 1
+    # the four metric-type rows appear in canonical order
+    assert [r[1] for r in rows if r[0] == "metrics"] == [
+        "gauge",
+        "sum",
+        "histogram",
+        "exp_histogram",
+    ]
     # per-subset services: ERROR logs came only from catalog-api
     err = next(r for r in rows if r[:2] == ("logs", "ERROR"))
     assert err[5] == 1
@@ -203,11 +256,17 @@ def test_summary_unset_row_only_when_present() -> None:
 
 
 def test_summary_absent_signal_has_no_rows() -> None:
-    # AC-25 / FR-3: a wholly-absent signal contributes no zero-count skeleton.
-    conn = _summary_conn(with_metrics=True)  # only metrics present
+    # AC-25 / FR-3: only metrics present -> the four metric-type rows (one gauge
+    # row of real data, the other three at zero), and NO zero-count trace/log
+    # skeleton (a wholly-absent signal contributes no rows).
+    conn = _summary_conn(with_metrics=True)  # only metrics present (one gauge)
     _columns, rows = otelq.cmd_summary(conn, Namespace())
-    assert len(rows) == 1
-    assert rows[0][:3] == ("metrics", "", 1)
+    assert [r[0] for r in rows] == ["metrics"] * 4  # no traces/logs rows at all
+    count = {(r[0], r[1]): r[2] for r in rows}
+    assert count[("metrics", "gauge")] == 1
+    assert count[("metrics", "sum")] == 0
+    assert count[("metrics", "histogram")] == 0
+    assert count[("metrics", "exp_histogram")] == 0
 
 
 def test_summary_raises_when_empty() -> None:
@@ -222,6 +281,56 @@ def test_sql_passthrough(synth_conn: duckdb.DuckDBPyConnection) -> None:
     )
     assert columns == ["n"]
     assert rows == [(3,)]
+
+
+def test_all_relations_resolve_and_metric_types(
+    synth_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    # AC-1 / FR-1, FR-2: every exposed relation resolves via `sql`, the `metrics`
+    # view exposes the FR-2 columns, and it spans all four metric types.
+    for rel in (
+        "traces",
+        "logs",
+        "metrics",
+        "metrics_gauge",
+        "metrics_sum",
+        "metrics_histogram",
+        "metrics_exp_histogram",
+    ):
+        cols, _rows = otelq.cmd_sql(
+            synth_conn, Namespace(query=f"SELECT * FROM {rel} LIMIT 1")
+        )
+        assert cols, f"{rel} did not resolve"
+    cols, _ = otelq.cmd_sql(synth_conn, Namespace(query="SELECT * FROM metrics LIMIT 1"))
+    assert {
+        "timestamp",
+        "service_name",
+        "metric_name",
+        "metric_type",
+        "value",
+        "metric_unit",
+    } <= set(cols)
+    _c, rows = otelq.cmd_sql(
+        synth_conn, Namespace(query="SELECT DISTINCT metric_type FROM metrics")
+    )
+    assert {r[0] for r in rows} == {"gauge", "sum", "histogram", "exp_histogram"}
+
+
+def test_metrics_view_value_is_value_or_sum(
+    synth_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    # FR-2: metrics.value carries the scalar `value` for gauge/sum and the `sum`
+    # for histogram/exp_histogram (which have no scalar value).
+    _c, rows = otelq.cmd_sql(
+        synth_conn,
+        Namespace(
+            query="SELECT metric_type, value FROM metrics "
+            "WHERE metric_type IN ('histogram', 'exp_histogram') ORDER BY metric_type"
+        ),
+    )
+    got = dict(rows)
+    assert got["exp_histogram"] == 42.0  # the exp_histogram row's sum
+    assert got["histogram"] == 123.5  # the histogram row's sum
 
 
 def test_integration_reads_real_fixture() -> None:
@@ -240,6 +349,26 @@ def test_errors_finds_error_span_and_log(
     assert all(r[2] == "catalog-api" for r in rows)
 
 
+def test_errors_matches_mixed_case_severity_text() -> None:
+    # FR-4 regression: ERROR/FATAL logs must match case-insensitively. Real
+    # exporters store mixed-case text (e.g. "Error"/"Fatal"); a case-sensitive
+    # filter silently dropped them.
+    conn = duckdb.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE logs (timestamp TIMESTAMP_MS, trace_id VARCHAR, "
+        "service_name VARCHAR, severity_text VARCHAR, severity_number INTEGER, "
+        "body VARCHAR)"
+    )
+    conn.execute(
+        "INSERT INTO logs VALUES "
+        "('2026-05-22 10:00:00','t1','app','Error',17,'boom'),"
+        "('2026-05-22 10:00:01','t2','app','Fatal',21,'dead'),"
+        "('2026-05-22 10:00:02','t3','app','Info',9,'fine')"
+    )
+    _columns, rows = otelq.cmd_errors(conn, Namespace(since=None))
+    assert sorted(r[3] for r in rows) == ["Error", "Fatal"]
+
+
 def test_slow_orders_by_duration_desc(
     synth_conn: duckdb.DuckDBPyConnection,
 ) -> None:
@@ -247,6 +376,29 @@ def test_slow_orders_by_duration_desc(
     assert len(rows) == 2
     assert rows[0][2] == "SELECT orders"  # 90ms span first
     assert rows[0][3] >= rows[1][3]  # duration_ms descending
+
+
+def test_slow_and_summary_use_millisecond_duration() -> None:
+    # FR-3/FR-5 regression: the duckdb-otlp extension reports duration in ms.
+    # A 2000 ms span must land in the ">1s" bucket and show as 2000 ms in `slow`.
+    # The old code treated duration as ns: it never crossed the 1e9 threshold
+    # (so ">1s" was always empty) and divided by 1e6 (so `slow` showed 0.0 ms).
+    conn = duckdb.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE traces (timestamp TIMESTAMP_MS, duration BIGINT, "
+        "service_name VARCHAR, span_name VARCHAR, trace_id VARCHAR)"
+    )
+    conn.execute(
+        "INSERT INTO traces VALUES "
+        "('2026-05-22 10:00:00',2000,'app','slow-op','t1'),"  # 2s  -> >1s
+        "('2026-05-22 10:00:01',12,'app','fast-op','t2')"     # 12ms -> =<1s
+    )
+    summary = {(r[0], r[1]): r[2] for r in otelq.cmd_summary(conn, Namespace())[1]}
+    assert summary[("traces", ">1s")] == 1
+    assert summary[("traces", "=<1s")] == 1
+    cols, rows = otelq.cmd_slow(conn, Namespace(top=1))
+    assert rows[0][cols.index("span_name")] == "slow-op"
+    assert rows[0][cols.index("duration_ms")] == 2000
 
 
 def test_trace_returns_tree_for_one_trace(
@@ -276,6 +428,28 @@ def test_logs_filter_by_level(synth_conn: duckdb.DuckDBPyConnection) -> None:
     )
     assert len(rows) == 1
     assert rows[0][2] == "ERROR"
+
+
+def test_logs_filter_by_level_mixed_case_text() -> None:
+    # FR-7 regression: --level must match severity_text case-insensitively.
+    # Real exporters store mixed-case text (e.g. "Info"); `--level INFO` once
+    # missed these because only the input was folded, not the column.
+    conn = duckdb.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE logs (timestamp TIMESTAMP_MS, trace_id VARCHAR, "
+        "service_name VARCHAR, severity_text VARCHAR, severity_number INTEGER, "
+        "body VARCHAR)"
+    )
+    conn.execute(
+        "INSERT INTO logs VALUES "
+        "('2026-05-22 10:00:00','t1','app','Info',9,'a'),"
+        "('2026-05-22 10:00:01','t2','app','Info',9,'b')"
+    )
+    _columns, rows = otelq.cmd_logs(
+        conn, Namespace(service=None, level="INFO", grep=None)
+    )
+    assert len(rows) == 2
+    assert all(r[2] == "Info" for r in rows)
 
 
 def test_logs_filter_by_grep(synth_conn: duckdb.DuckDBPyConnection) -> None:
@@ -478,6 +652,96 @@ def make_sum(
     }
 
 
+def make_histogram(
+    ts: datetime,
+    name: str = "http.server.duration",
+    unit: str = "ms",
+    count: int = 10,
+    total: float = 123.5,
+    service: str = "app-test",
+) -> dict[str, Any]:
+    return {
+        "resourceMetrics": [
+            {
+                "resource": _resource(service),
+                "scopeMetrics": [
+                    {
+                        "metrics": [
+                            {
+                                "name": name,
+                                "unit": unit,
+                                "description": "",
+                                "histogram": {
+                                    "aggregationTemporality": 2,
+                                    "dataPoints": [
+                                        {
+                                            "startTimeUnixNano": _ns(ts),
+                                            "timeUnixNano": _ns(ts),
+                                            "count": str(count),
+                                            "sum": total,
+                                            "bucketCounts": ["0", "1", "2", "3", "4"],
+                                            "explicitBounds": [1.0, 5.0, 10.0, 25.0],
+                                        }
+                                    ],
+                                },
+                            }
+                        ]
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def make_exp_histogram(
+    ts: datetime,
+    name: str = "rpc.server.duration",
+    unit: str = "ms",
+    count: int = 5,
+    total: float = 42.0,
+    service: str = "app-test",
+) -> dict[str, Any]:
+    return {
+        "resourceMetrics": [
+            {
+                "resource": _resource(service),
+                "scopeMetrics": [
+                    {
+                        "metrics": [
+                            {
+                                "name": name,
+                                "unit": unit,
+                                "description": "",
+                                "exponentialHistogram": {
+                                    "aggregationTemporality": 2,
+                                    "dataPoints": [
+                                        {
+                                            "startTimeUnixNano": _ns(ts),
+                                            "timeUnixNano": _ns(ts),
+                                            "count": str(count),
+                                            "sum": total,
+                                            "scale": 2,
+                                            "zeroCount": "0",
+                                            "positive": {
+                                                "offset": 0,
+                                                "bucketCounts": ["1", "2", "2"],
+                                            },
+                                            "negative": {
+                                                "offset": 0,
+                                                "bucketCounts": [],
+                                            },
+                                        }
+                                    ],
+                                },
+                            }
+                        ]
+                    }
+                ],
+            }
+        ]
+    }
+
+
 def write_jsonl(
     path: Path, objs: Iterable[dict[str, Any]], append: bool = False
 ) -> None:
@@ -516,15 +780,203 @@ def test_fabricated_corpus_roundtrips(temp_telemetry: Path) -> None:
     write_jsonl(
         temp_telemetry / "logs.jsonl", [make_log(base, severity="ERROR", sevnum=17)]
     )
-    write_jsonl(temp_telemetry / "metrics.jsonl", [make_gauge(base), make_sum(base)])
+    write_jsonl(
+        temp_telemetry / "metrics.jsonl",
+        [make_gauge(base), make_sum(base), make_histogram(base), make_exp_histogram(base)],
+    )
     conn = otelq.connect(temp_telemetry)
     by: dict[str, int] = {}
     for r in otelq.cmd_summary(conn, Namespace())[1]:  # sum the per-signal breakdown
         by[r[0]] = by.get(r[0], 0) + r[2]
-    assert by == {"traces": 1, "logs": 1, "metrics": 2}
+    assert by == {"traces": 1, "logs": 1, "metrics": 4}  # one of each metric type
     row = conn.execute("SELECT min(timestamp) FROM traces").fetchone()
     assert row is not None
     assert row[0].year == 2026
+
+
+def test_metrics_absent_types_resolve_empty_via_cli(temp_telemetry: Path) -> None:
+    # FR-1: a gauge+sum-only corpus still resolves metrics_histogram /
+    # metrics_exp_histogram — to 0 rows, never a catalog error — and the result is
+    # byte-identical cached vs --no-cache (the keystone, expose-empty path).
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "metrics.jsonl", [make_gauge(base), make_sum(base)])
+    for rel in ("metrics_histogram", "metrics_exp_histogram"):
+        cached = _run(temp_telemetry, "sql", f"SELECT count(*) AS n FROM {rel}")
+        nocache = _run(temp_telemetry, "--no-cache", "sql", f"SELECT count(*) AS n FROM {rel}")
+        assert _json.loads(cached) == [{"n": 0}]  # resolves empty, not an error
+        assert cached == nocache, f"cached != --no-cache for {rel}"
+
+
+def test_metrics_four_types_value_is_sum_via_cli(temp_telemetry: Path) -> None:
+    # FR-2: with all four metric types present, the `metrics` view spans them and
+    # value = sum for histogram/exp_histogram; cached == --no-cache.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "metrics.jsonl",
+        [
+            make_gauge(base, value=4.0),
+            make_sum(base, value=42),
+            make_histogram(base, total=123.5),
+            make_exp_histogram(base, total=42.0),
+        ],
+    )
+    types = _run(temp_telemetry, "sql", "SELECT DISTINCT metric_type FROM metrics")
+    assert {r["metric_type"] for r in _json.loads(types)} == {
+        "gauge",
+        "sum",
+        "histogram",
+        "exp_histogram",
+    }
+    hist = "SELECT metric_type, value FROM metrics WHERE metric_type = 'histogram'"
+    cached = _run(temp_telemetry, "sql", hist)
+    assert _json.loads(cached) == [{"metric_type": "histogram", "value": 123.5}]
+    assert cached == _run(temp_telemetry, "--no-cache", "sql", hist)
+
+
+def test_absent_signals_resolve_empty_metrics_only(temp_telemetry: Path) -> None:
+    # FR-1 universal expose-empty: on a metrics-only corpus, traces/logs (and the
+    # metrics view) still RESOLVE — to 0 rows, never a catalog error — byte-
+    # identical cached vs --no-cache; summary shows only metric rows; slow/trace/
+    # errors name the gap (present: metrics) rather than blaming the collector.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "metrics.jsonl", [make_gauge(base), make_sum(base)])
+    for rel in ("traces", "logs"):
+        cached = _run(temp_telemetry, "sql", f"SELECT count(*) AS n FROM {rel}")
+        nocache = _run(temp_telemetry, "--no-cache", "sql", f"SELECT count(*) AS n FROM {rel}")
+        assert _json.loads(cached) == [{"n": 0}]  # resolves empty, not an error
+        assert cached == nocache, f"cached != --no-cache for {rel}"
+    rows = _json.loads(_run(temp_telemetry, "summary"))
+    assert {r["signal"] for r in rows} == {"metrics"}  # no trace/log skeleton
+    for argv in (["slow"], ["trace", "deadbeef"], ["errors"]):
+        out, err = _run_both(temp_telemetry, *argv)
+        assert out.strip() == ""  # the command yields no rows on stdout
+        assert "present: metrics" in err  # names the gap, not the generic text
+        assert otelq._NO_TELEMETRY_MSG not in err
+
+
+def test_empty_dir_resolves_empty_and_stays_friendly(temp_telemetry: Path) -> None:
+    # FR-1/FR-18: a truly EMPTY dir still resolves every relation (0 rows, never a
+    # catalog error — seeded from the embedded schema probe), byte-identical cached
+    # vs --no-cache; yet the built-in commands still emit the generic friendly
+    # message and exit 0, because presence is by row count (_has_rows), and no
+    # zero-count skeleton is emitted.
+    for rel in ("traces", "logs", "metrics", "metrics_histogram"):
+        cached = _run(temp_telemetry, "sql", f"SELECT count(*) AS n FROM {rel}")
+        nocache = _run(temp_telemetry, "--no-cache", "sql", f"SELECT count(*) AS n FROM {rel}")
+        assert _json.loads(cached) == [{"n": 0}], f"{rel} should resolve to 0 rows"
+        assert cached == nocache, f"cached != --no-cache for {rel}"
+    for argv in (["summary"], ["slow"], ["errors"], ["metric", "x"]):
+        out, err = _run_both(temp_telemetry, *argv)
+        assert out.strip() == ""  # no rows / no skeleton on stdout
+        assert otelq._NO_TELEMETRY_MSG in err  # generic friendly text, nothing present
+
+
+# =============================================================================
+# N4 regression tests — one focused test per original bug. Each pins the FIXED
+# behavior: reverting the corresponding fix would fail the test.
+# =============================================================================
+
+
+def test_bug1_metrics_gauge_and_sum_queryable_cache_equals_nocache(
+    temp_telemetry: Path,
+) -> None:
+    # BUG-1: on a gauge-only corpus, both metrics_gauge and metrics_sum must be
+    # queryable — gauge has rows, sum resolves to 0 (never a catalog error) — and
+    # byte-identical cached vs --no-cache.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "metrics.jsonl",
+        [make_gauge(base), make_gauge(base + timedelta(seconds=5))],
+    )
+    for rel, n in (("metrics_gauge", 2), ("metrics_sum", 0)):
+        cached = _run(temp_telemetry, "sql", f"SELECT count(*) AS n FROM {rel}")
+        nocache = _run(temp_telemetry, "--no-cache", "sql", f"SELECT count(*) AS n FROM {rel}")
+        assert _json.loads(cached) == [{"n": n}], f"{rel} expected {n}"
+        assert cached == nocache, f"cached != --no-cache for {rel}"
+
+
+def test_bug2_slow_top_negative_rejected_at_parse() -> None:
+    # BUG-2: `slow --top -1` must be rejected by argparse (exit 2, "must be >= 0"),
+    # NOT reach DuckDB as LIMIT -1 (an uncaught BinderException traceback).
+    import io as _io
+    from contextlib import redirect_stderr
+
+    parser = otelq.build_parser()
+    err = _io.StringIO()
+    with pytest.raises(SystemExit) as exc, redirect_stderr(err):
+        parser.parse_args(["slow", "--top", "-1"])
+    assert exc.value.code == 2
+    assert "must be >= 0" in err.getvalue()
+    assert parser.parse_args(["slow", "--top", "0"]).top == 0  # zero is valid
+    with pytest.raises(SystemExit):  # a non-int still errors
+        parser.parse_args(["slow", "--top", "abc"])
+
+
+def test_bug3_logs_grep_is_literal_substring(temp_telemetry: Path) -> None:
+    # BUG-3: --grep is a literal, case-insensitive SUBSTRING match, NOT an ILIKE
+    # pattern — `_` and `%` must match themselves, not act as wildcards.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            make_log(base + timedelta(seconds=0), body="user_id matched"),
+            make_log(base + timedelta(seconds=1), body="userXid mismatch"),
+            make_log(base + timedelta(seconds=2), body="100% done"),
+            make_log(base + timedelta(seconds=3), body="100zzdone"),
+        ],
+    )
+
+    def bodies(*flags: str) -> list[str]:
+        return [r["body"] for r in _json.loads(_run(temp_telemetry, "logs", *flags))]
+
+    # '_' is literal: matches "user_id matched" only, not "userXid mismatch"
+    assert bodies("--grep", "user_id") == ["user_id matched"]
+    # '%' is literal: matches "100% done" only, not "100zzdone"
+    assert bodies("--grep", "100%") == ["100% done"]
+    # case-insensitive
+    assert bodies("--grep", "USER_ID") == ["user_id matched"]
+
+
+def test_bug4_dir_pointing_at_file_is_friendly(tmp_path: Path) -> None:
+    # BUG-4: --dir pointing at a regular file exits non-zero with an "is not a
+    # directory" message and NO traceback (not a deep NotADirectoryError).
+    f = tmp_path / "notadir"
+    f.write_text("hi", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:  # clean SystemExit, not a traceback
+        otelq.main(["--dir", str(f), "summary"])
+    assert "is not a directory" in str(exc.value)
+    assert exc.value.code != 0
+
+
+def test_bug5_empty_sql_query_is_friendly(synth_conn: duckdb.DuckDBPyConnection) -> None:
+    # BUG-5: an empty/whitespace SQL string raises SystemExit "otelq: SQL error"
+    # (a friendly message), NOT an AttributeError from result=None.
+    for q in ("", "   ", "\n\t"):
+        with pytest.raises(SystemExit) as exc:
+            otelq.cmd_sql(synth_conn, Namespace(query=q))
+        assert "otelq: SQL error" in str(exc.value)
+    cols, rows = otelq.cmd_sql(synth_conn, Namespace(query="SELECT 1 AS one"))
+    assert cols == ["one"] and rows == [(1,)]  # a valid query still works
+
+
+def test_bug6_logs_order_deterministic_across_cache_paths(temp_telemetry: Path) -> None:
+    # BUG-6: logs sharing an identical timestamp must order deterministically
+    # (the trailing tie-breaker), so cached output == --no-cache byte-for-byte.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    same = base + timedelta(seconds=5)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            make_log(same, service="svc-c", body="ccc"),
+            make_log(same, service="svc-a", body="aaa"),
+            make_log(same, service="svc-b", body="bbb"),
+            make_log(base + timedelta(seconds=1), service="svc-a", body="earlier"),
+        ],
+    )
+    cached = _run(temp_telemetry, "logs")
+    nocache = _run(temp_telemetry, "--no-cache", "logs")
+    assert cached == nocache  # tie-breaker makes equal-timestamp order deterministic
+    assert len(_json.loads(cached)) == 4
 
 
 # --- AC-1 / FR-1, FR-5: sealing produces per-minute partitions ----------------
@@ -554,7 +1006,7 @@ def test_ac11_cached_equals_no_cache(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     spans: list[dict[str, Any]] = []
     logs: list[dict[str, Any]] = []
-    gauges: list[dict[str, Any]] = []
+    metrics: list[dict[str, Any]] = []  # all four metric types, interleaved
     for i in range(20):  # 20 minutes, all inside the 30-min hot window
         t = base + timedelta(minutes=i, seconds=5)
         err = i % 5 == 0
@@ -576,17 +1028,24 @@ def test_ac11_cached_equals_no_cache(temp_telemetry: Path) -> None:
                 body=f"msg{i}",
             )
         )
-        gauges.append(make_gauge(t, value=float(i)))
+        metrics.append(make_gauge(t, value=float(i)))
+        metrics.append(make_sum(t, value=i * 2))
+        metrics.append(make_histogram(t, total=float(i * 10)))
+        metrics.append(make_exp_histogram(t, total=float(i * 100)))
     write_jsonl(temp_telemetry / "traces.jsonl", spans)
     write_jsonl(temp_telemetry / "logs.jsonl", logs)
-    write_jsonl(temp_telemetry / "metrics.jsonl", gauges)
+    write_jsonl(temp_telemetry / "metrics.jsonl", metrics)
     for argv in (
         ["summary"],
         ["errors"],
         ["slow"],
         ["logs"],
         ["metric", "db.pool"],
+        ["metric", "http.server.duration"],  # a histogram metric (value = sum)
         ["trace", trace_hex("t3")],
+        ["sql", "SELECT metric_type, count(*) c FROM metrics GROUP BY 1 ORDER BY 1"],
+        ["sql", "SELECT count(*) FROM metrics_histogram"],
+        ["sql", "SELECT count(*) FROM metrics_exp_histogram"],
     ):
         cached = _run(temp_telemetry, *argv)
         nocache = _run(temp_telemetry, "--no-cache", *argv)
@@ -798,7 +1257,7 @@ def test_ac9_recent_default_vs_all(temp_telemetry: Path) -> None:
 def test_ac8_since_beyond_window_is_cold(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 10, 0, 0, tzinfo=timezone.utc)
     write_jsonl(temp_telemetry / "traces.jsonl", _minutes_per_minute(base, 90))
-    far = _signal_count(temp_telemetry, "traces", "summary", "--since", "120m")
+    far = _signal_count(temp_telemetry, "traces", "--since", "120m", "summary")
     assert far == 90
 
 
@@ -1104,7 +1563,10 @@ def test_identical_late_records_kept(temp_telemetry: Path) -> None:
 
 def test_require_names_missing_signal_when_others_present() -> None:
     conn = duckdb.connect(":memory:")
-    conn.execute("CREATE TABLE traces(timestamp TIMESTAMP)")  # traces present, no logs
+    # traces has DATA (a row), no logs at all. "Present" = has rows, not mere
+    # table existence (every relation can now be seeded empty), so insert a row.
+    conn.execute("CREATE TABLE traces(timestamp TIMESTAMP)")
+    conn.execute("INSERT INTO traces VALUES (TIMESTAMP '2026-05-22 10:00:00')")
     with pytest.raises(otelq.NoTelemetryError) as exc:
         otelq.cmd_logs(conn, Namespace(service=None, level=None, grep=None))
     msg = str(exc.value)
@@ -1122,7 +1584,10 @@ def test_require_keeps_generic_message_when_nothing_present() -> None:
 
 def test_errors_names_gap_when_only_metrics_present() -> None:
     conn = duckdb.connect(":memory:")
-    conn.execute("CREATE TABLE metrics(timestamp TIMESTAMP)")  # metrics only
+    # metrics has DATA (a row), no traces/logs. "Present" = has rows (FR-19), so
+    # insert a row rather than relying on an empty table as a presence proxy.
+    conn.execute("CREATE TABLE metrics(timestamp TIMESTAMP)")
+    conn.execute("INSERT INTO metrics VALUES (TIMESTAMP '2026-05-22 10:00:00')")
     with pytest.raises(otelq.NoTelemetryError) as exc:
         otelq.cmd_errors(conn, Namespace())
     msg = str(exc.value)
@@ -1264,8 +1729,73 @@ def test_help_epilog_documents_argument_order_and_sql_schema() -> None:
     help_text = otelq.build_parser().format_help()
     assert "GLOBAL flags" in help_text
     assert "BEFORE the subcommand" in help_text
-    for view in ("traces", "logs", "metrics", "metrics_gauge", "metrics_sum"):
+    for view in (
+        "traces",
+        "logs",
+        "metrics",
+        "metrics_gauge",
+        "metrics_sum",
+        "metrics_histogram",
+        "metrics_exp_histogram",
+    ):
         assert view in help_text
+
+
+def test_bare_otelq_prints_full_help() -> None:
+    # FR-22: a bare `otelq` (no command) prints the full help and exits 0,
+    # rather than the terse argparse "required: command" error.
+    import io as _io
+    from contextlib import redirect_stdout
+
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        assert otelq.main([]) == 0
+    out = buf.getvalue()
+    assert "usage: otelq" in out and "summary" in out and "GLOBAL flags" in out
+
+
+def test_help_command_prints_general_help() -> None:
+    # FR-22: `otelq help` == the global help.
+    import io as _io
+    from contextlib import redirect_stdout
+
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        assert otelq.main(["help"]) == 0
+    assert "usage: otelq" in buf.getvalue() and "GLOBAL flags" in buf.getvalue()
+
+
+def test_help_command_topic_prints_subcommand_help() -> None:
+    # FR-22: `otelq help <command>` prints that command's own help.
+    import io as _io
+    from contextlib import redirect_stdout
+
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        assert otelq.main(["help", "slow"]) == 0
+    out = buf.getvalue()
+    assert "otelq slow" in out and "--top" in out
+
+
+def test_help_command_unknown_topic_errors() -> None:
+    # FR-22 / EC-13: `otelq help <unknown>` reports argparse's invalid-choice
+    # error (exit 2), not a silent success.
+    import io as _io
+    from contextlib import redirect_stderr
+
+    buf = _io.StringIO()
+    with redirect_stderr(buf):
+        assert otelq.main(["help", "not-a-command"]) == 2
+    assert "invalid choice" in buf.getvalue()
+
+
+def test_default_dir_is_cwd_relative() -> None:
+    # FR-12 / ADR-001: the default telemetry dir is <cwd>/telemetry, resolved from
+    # the current working directory — NOT the script's install location. A
+    # script-relative default put it under site-packages for `uvx ... otelq`.
+    assert otelq.DEFAULT_DIR == Path.cwd() / "telemetry"
+    parsed = otelq.build_parser().parse_args(["summary"])
+    assert parsed.dir == Path.cwd() / "telemetry"
 
 
 # --- broken pipe: `otelq ... | head` must exit cleanly, not dump a traceback ---

@@ -11,18 +11,20 @@ otel-up:
 
 # Quick test with synthetic data — no app needed. Starts the Collector (with NO
 # published host ports, via compose.demo.yaml, so it never collides with another
-# collector on 4317), then runs telemetrygen generators that push ~15s of traces,
-# metrics, and logs through it over the Docker network, populating telemetry/ so
-# otelq (and the otelq skill) can be tried on a fresh clone.
+# collector on 4317), then runs telemetrygen generators that push ~15s of a
+# nuanced mix — fast + slow (>1s) traces, metrics, and logs at all six severity
+# levels (TRACE/DEBUG/INFO/WARN/ERROR/FATAL) — through it over the Docker network,
+# populating telemetry/ so otelq (and the otelq skill) can be tried on a fresh
+# clone with every view non-empty.
 otel-demo:
     mkdir -p telemetry
     docker compose -f compose.yaml -f compose.demo.yaml --profile otel up -d
-    @echo "Generating ~15s of synthetic traces + metrics + logs via telemetrygen (one-shot)..."
+    @echo "Generating ~15s of synthetic telemetry via telemetrygen (fast+slow traces, metrics, all six log levels; one-shot)..."
     docker compose -f compose.yaml -f compose.demo.yaml --profile demo up
     -docker compose -f compose.yaml -f compose.demo.yaml --profile demo rm -fs >/dev/null 2>&1
     @echo "Waiting for the Collector to flush its final batch (5s batch timeout)..."
     sleep 7
-    @echo "Done. Query it:  just otelq summary  |  just otelq slow  |  just otelq metric gen"
+    @echo "Done. Query it:  just otelq summary  |  just otelq slow  |  just otelq errors  |  just otelq metric gen"
 
 # Stop the dev OTel Collector — both the standalone project and the demo project.
 otel-down:

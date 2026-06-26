@@ -80,9 +80,11 @@ The two communicate only through the bytes on disk at the bind-mount path.
 Because the files live on the host (not inside the container's writable layer),
 they **survive `docker compose down`** and remain readable by any host process at
 a predictable location. The CLI is therefore responsible only for *locating* that
-directory — it exposes a `--dir` flag with a sane default (the repo-relative
-telemetry directory resolved from the tool's own location), so the common case
-needs no argument and an unusual layout is still reachable.
+directory — it exposes a `--dir` flag with a sane default (`<cwd>/telemetry`, the
+telemetry directory under the current working directory), so the common case
+needs no argument and an unusual layout is still reachable. (A cwd-relative
+default also keeps an installed copy — `uvx`/`pipx` — usable: a script-relative
+default would point into the install location, e.g. site-packages.)
 
 ## Alternatives Considered
 
@@ -113,8 +115,9 @@ needs no argument and an unusual layout is still reachable.
   the Collector-side of the seam (Dockerization and the bind mount) is decided in
   [ADR-004](ADR-004-collector-in-docker-bind-mount.md).
 - **The CLI must locate the directory robustly.** A `--dir` flag with a
-  sensible repo-relative default is required so the tool works with zero
-  configuration in the normal case and remains usable for non-standard layouts.
+  sensible cwd-relative default (`<cwd>/telemetry`) is required so the tool works
+  with zero configuration in the normal case and remains usable for non-standard
+  layouts.
   The behavioral details of the CLI are specified in
   [SPEC-otelq-cli](../spec/SPEC-otelq-cli.md).
 - **Re-reading on demand is the read model.** Because the CLI re-attaches to the
