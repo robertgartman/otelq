@@ -14,12 +14,12 @@ behaved as intended.
 Get a quick view of the telemetry captured by the Collector. **start** here if you do not exactly know what you want to query.
 
 ```
-uvx --from git+https://github.com/robertgartman/otelq otelq --dir telemetry --format json summary
+uvx otelq --dir telemetry --format json summary
 ```
 
 ## Running otelq
 ```
-uvx --from git+https://github.com/robertgartman/otelq otelq --dir telemetry ...
+uvx otelq --dir telemetry ...
 ```
 
 - **`--dir telemetry` is required.** It points otelq at the Collector's output
@@ -27,17 +27,17 @@ uvx --from git+https://github.com/robertgartman/otelq otelq --dir telemetry ...
   dir set up when otelq was wired in). Because `uvx` runs otelq from an isolated
   build, the default would not resolve to your project, so always pass `--dir`.
   Adjust the path if your Collector writes elsewhere.
-- To pin a version, append a ref: `…/otelq@v0.1.0 otelq …`.
+- To pin a version: `uvx otelq@0.1.0 --dir telemetry …`.
 
 ## Discovering commands
 To see the available commands and options, run:
 ```
-uvx --from git+https://github.com/robertgartman/otelq otelq --help
+uvx otelq --help
 ```
 
 ## Troubleshoot
 
 ```
-uvx --from git+https://github.com/robertgartman/otelq otelq --troubleshoot
+uvx otelq --troubleshoot
 ```
 
