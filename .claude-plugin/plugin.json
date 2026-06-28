@@ -1,7 +1,7 @@
 {
   "name": "otelq",
   "description": "Capture and query local OpenTelemetry traces/logs/metrics with the otelq CLI.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "Robert Gartman"
   },
