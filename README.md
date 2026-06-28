@@ -14,9 +14,11 @@ otelq is a tiny command-line tool that turns the OpenTelemetry signals your appl
 - **Zero heavy infrastructure.** A stock [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) writes signals to plain JSONL files; otelq reads them in-process with DuckDB. Nothing to deploy, nothing to run between queries. A one-shot bundled demo gets you querying real signals in seconds.
 - **Fully local, fully isolated.** Telemetry never leaves your machine — it lives in a directory you own and read directly. Nothing is shipped to a backend, a vendor, or the cloud.
 
-## Give it a dry run
+## Take it for a test run
 
-See it work in under a minute — no app to instrument. Clone the repo and run the demo: it starts the Collector and pushes ~15s of synthetic traces, metrics, and logs through it with [telemetrygen](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen), the official OpenTelemetry load generator.
+See it work in under a minute — no app to instrument. Clone the otelq repo and run the demo: it starts the Collector (in Docker) and pushes a few seconds of synthetic traces, metrics, and logs through it with [telemetrygen](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen), the official OpenTelemetry load generator.
+
+When done, you have telemetry data that otelq can parse and query. The demo instructions below runs an initial summary query.
 
 ```sh
 git clone https://github.com/robertgartman/otelq
@@ -95,15 +97,15 @@ Your application(s) send OpenTelemetry over OTLP to a Collector running in Docke
 
 The bind-mounted directory is the entire contract: the Collector writes `traces.jsonl`, `logs.jsonl`, and `metrics.jsonl`; otelq reads those same files. There is no network coupling between the Collector and the CLI — the shared directory is the API.
 
-### Integrating with your Collector
+### Using otelq in your project, with your OTEL Collector
 
 otelq is a pure *consumer* of the telemetry directory — it never owns or runs a Collector. In any real setup the Collector belongs to **your** project: it is the one your application already sends OTLP to. You connect otelq by **teeing that Collector's output to a directory otelq can read** — add otelq's `file` exporters to the Collector so it also writes `traces.jsonl` / `logs.jsonl` / `metrics.jsonl`, then point otelq at that directory. otelq never starts, stops, or cleans that Collector; it only reads the files and owns its `.otelq-cache/` subtree.
 
-The direction matters: you work **from the otelq repo** and integrate otelq **into your target project** (identified by its absolute path, e.g. `/Users/me/dev/my-service`) — not the other way around. You invoke *your* coding agent onto a skill (target-project-setup) in *this* repo.
+The _direction_ of integration matters: you work **from the otelq repo** and integrate otelq **into your target project** (identified by its absolute path, e.g. `/Users/me/dev/my-service`) — not the other way around. You invoke *your* coding agent onto a `target-project-setup` skill in *this* repo.
 
 ```sh
-# otelq runs straight from GitHub via uvx — no clone, no install:
-alias otelq="uvx --from git+https://github.com/robertgartman/otelq otelq"
+# otelq runs straight from PyPI via uvx — no clone, no install:
+alias otelq="uvx otelq"
 
 otelq collector-config                      # prints the exporters + pipeline wiring to add
 # ...paste the fragment into your project's Collector config, bind-mount its ./telemetry, restart...
@@ -112,7 +114,7 @@ otelq --dir /Users/me/dev/my-service/telemetry doctor    # verify your wiring sa
 
 `collector-config` is generated from otelq's pinned constants, so it never drifts from the contract; `doctor` checks a telemetry directory against it. The `file` exporter requires the `*-contrib` Collector image. The **target-project-setup** skill automates all of this and asks for the target project's path; see below. When exercising your own app is inconvenient, the skill can also confirm the wiring end-to-end with a throwaway [`telemetrygen`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen) probe — committed, run against your Collector over its own network, then reverted — flagging first if the teed pipeline also feeds a real backend.
 
-> **No Collector yet?** otelq bundles one purely so you can try the tool without instrumenting anything — see [Give it a dry run](#give-it-a-dry-run). That bundled stack (and the Compose files and optional `just` recipes that manage it) is a **demo and local-dev aid, not a deployment model**: in real use the Collector lives in your project, and otelq just reads what it writes.
+> **No Collector yet?** otelq bundles one purely so you can try the tool without instrumenting anything — see [Take it for a test run](#take-it-for-a-test-run). That bundled stack (and the Compose files and optional `just` recipes that manage it) is a **demo and local-dev aid, not a deployment model**: in real use the Collector lives in your project, and otelq just reads what it writes.
 
 ### Your project's production environment
 
@@ -129,7 +131,13 @@ Concretely, that means parameterizing the pieces otelq added — gating the `fil
 
 ## Install / run options
 
-**(a) Zero-install, ad-hoc** — `otelq.py` is a [PEP 723](https://peps.python.org/pep-0723/) single-file script. The skill based AI workflow assumes you fetch it with `uvx` directly from GitHub, but you can also run it straight from the repo or a local clone:
+**(a) Zero-install via PyPI (recommended)** — run otelq straight from [PyPI](https://pypi.org/project/otelq/) with `uvx`; no clone, no install. This is what the skill-based AI workflow uses:
+
+```sh
+uvx otelq summary             # pin a version with: uvx otelq@0.1.0 summary
+```
+
+**(b) From the repo or a local clone** — `otelq.py` is a [PEP 723](https://peps.python.org/pep-0723/) single-file script, so `uv` can run it directly:
 
 ```sh
 uv run otelq.py summary
@@ -143,7 +151,8 @@ This is a dump from running `uv run otelq.py --help` within the project root:
 
 ```text
 
-usage: otelq [-h] [--dir DIR] [--format {table,json,csv}] [--all] [--no-cache] [--since SINCE] {summary,sql,errors,slow,trace,logs,metric,collector-config,doctor,troubleshoot,help} ...
+usage: otelq [-h] [--dir DIR] [--format {table,json,csv}] [--all] [--no-cache] [--since SINCE]
+             {summary,sql,errors,slow,trace,logs,metric,collector-config,doctor,troubleshoot,help} ...
 
 Query OTLP telemetry captured by the dev OTel Collector.
 
@@ -195,24 +204,24 @@ sql views (for `otelq sql "<query>"`):
     metrics_histogram, metrics_exp_histogram  count, sum, min, max
            (+ bucket_counts/explicit_bounds, or scale/zero_count/…)
   (the OTel Summary metric type is unsupported by the reader extension)
+
+Run `otelq troubleshoot` for the capture → query loop and common fixes.
 ```
 
-See [`context/spec/SPEC-otelq-cli`](context/spec/SPEC-otelq-cli.md) for the full, authoritative command behavior.
+Run  the full, authoritative command behavior.
 
 ## DuckDB pin note
 
-The sole runtime dependency is pinned exactly: `duckdb==1.5.3`. This is deliberate. otelq reads OTLP JSONL via the community [`duckdb-otlp`](https://github.com/smithclay/duckdb-otlp) extension, which is built per DuckDB version — a floating DuckDB would silently fail to load the extension. CI runs an extension-probe step that loads the extension against the pinned version so the pin and the published extension stay in lockstep. See [`context/adr/ADR-003`](context/adr/ADR-003-duckdb-otlp-extension-pin-governance.md) for the decision and trade-offs.
+The DuckDB runtime dependency is pinned exactly. This is deliberate. otelq reads OTLP JSONL via the community [`duckdb-otlp`](https://github.com/smithclay/duckdb-otlp) extension, which is built per DuckDB version — a floating DuckDB would silently fail to load the extension. CI runs an extension-probe step that loads the extension against the pinned version so the pin and the published extension stay in lockstep. See [`context/adr/ADR-003`](context/adr/ADR-003-duckdb-otlp-extension-pin-governance.md) for the decision and trade-offs.
 
 ## Agentic engineering
 
-This repo is built to be driven by AI coding agents:
+This repo is built to be developed with AI engineering:
 
 - **[`AGENTS.md`](AGENTS.md)** — start here. The entry point for agents working in this repo.
 - **[`context/CONTEXT.md`](context/CONTEXT.md)** — the documentation system (PRD / SPEC / ADR / CONTRACT routing rules).
 - **[`.agents/skills/otelq`](.agents/skills/otelq/SKILL.md)** — the otelq skill: capture OTEL signals from the dev Collector and query them with otelq. A `.claude` shim (`.claude/skills/otelq`) mirrors it for Claude Code.
 - **[`.agents/skills/target-project-setup`](.agents/skills/target-project-setup/SKILL.md)** — the target-project-setup skill: run from this repo to wire otelq's file-export pipeline into *another* project's existing Collector (the integrated setup above). It asks for the target project's absolute path and verifies the result with `otelq doctor`.
-
-The `.claude-plugin` manifest (`.claude-plugin/plugin.json`, `marketplace.json`) is an early distribution path for shipping otelq and its skill as an installable plugin.
 
 ## Contributing
 
@@ -221,8 +230,7 @@ just lint          # ruff
 just otelq-test    # pytest suite
 ```
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full setup, the project-specific
-rules (strict typing, the load-bearing `duckdb` pin, the `justfile` gateway), the
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full setup, the
 maintainer branch/PR/merge workflow for this public repo, and the PR checklist.
 Participation is governed by the
 [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md); report vulnerabilities per

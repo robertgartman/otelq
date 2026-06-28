@@ -53,16 +53,16 @@ truncates the JSONL files).
 ## Running otelq
 
 Throughout this skill, **`otelq …`** is shorthand for running the CLI straight
-from GitHub with `uvx` — no clone, no global install:
+from PyPI with `uvx` — no clone, no global install:
 
 ```
-uvx --from git+https://github.com/robertgartman/otelq otelq …
+uvx otelq …
 ```
 
-The first run builds otelq and fetches the DuckDB `otlp` community extension
+The first run downloads otelq and fetches the DuckDB `otlp` community extension
 (network once, then cached). For the `doctor` / `summary` checks below, pass
 `--dir $TARGET/telemetry` so otelq reads the target project's output folder. To
-pin a version, append a ref: `…/otelq@v0.1.0 otelq …`.
+pin a version: `uvx otelq@0.1.0 …`.
 
 ## Step 0 — Ask for `$TARGET`, secure its working tree, then preflight
 
