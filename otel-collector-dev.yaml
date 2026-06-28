@@ -1,5 +1,6 @@
-# Dev OpenTelemetry Collector — writes OTLP traces/logs/metrics as JSONL to /telemetry
-# for the otelq CLI. See context/adr/ADR-004 and context/contract/CONTRACT-telemetry-directory.
+# Dev OpenTelemetry Collector
+# Writes OTLP traces/logs/metrics as JSONL
+# to /telemetry for the otelq CLI.
 
 receivers:
   otlp:
