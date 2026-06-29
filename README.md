@@ -70,27 +70,51 @@ Both paths need [Docker](https://www.docker.com/) and [uv](https://docs.astral.s
 
 ## Architecture
 
-At runtime, every component lives on your machine:
+At runtime, every component lives and runs on your machine:
 
 ```mermaid
+---
+title: "otelq runtime architecture"
+config:
+  themeVariables:
+    clusterBkg: transparent
+---
 flowchart TB
+
+  subgraph github["otelq GitHub repo"]
+    otelq-code["otelq Python code"]
+  end
+
   subgraph host["Local host — nothing leaves your machine"]
-    apps["Applications generating OpenTelemetry<br/>(your services, tests, scripts)"]
-    collector["OpenTelemetry Collector<br/>· Docker container ·"]
-    skill["otelq skill"]
-    otelq["otelq · host CLI"]
+
+    apps["Your applications and tools generating OpenTelemetry<br/>(tools, services, tests, scripts)"]
+
+    agent["AI coding agent"]
+
+    otelq-uvx["otelq · running with uvx"]
+
+    subgraph docker["Docker container"]
+      collector["OpenTelemetry Collector"]
+    end
 
     subgraph project["Your project"]
-      signals["telemetry/<br/>traces.jsonl · logs.jsonl · metrics.jsonl"]
-      cache["telemetry/.otelq-cache/<br/>parquet query cache"]
+      signals["folder: ./telemetry<br/><br/>traces.jsonl · logs.jsonl · metrics.jsonl"]
+      cache["folder: ./telemetry/.otelq-cache<br/><br/>parquet query cache"]
+      skill["otelq skill"]
     end
   end
 
   apps -->|"OTLP · gRPC :4317 / HTTP :4318"| collector
   collector -->|"writes JSONL · bind mount"| signals
-  skill -->|invokes| otelq
-  otelq -->|reads| signals
-  otelq -->|"reads / writes"| cache
+  agent -->|invokes| otelq-uvx
+  agent -->|reads| skill
+  otelq-uvx -->|reads| signals
+  otelq-uvx -->|"reads / writes"| cache
+  otelq-uvx -->|fetch| otelq-code
+
+  classDef default fill:#d5fcb0
+  classDef whiteBg fill:#f0f0f0,stroke:#999999
+  class docker,project whiteBg
 ```
 
 Your application(s) send OpenTelemetry over OTLP to a Collector running in Docker. The Collector writes each signal as plain JSONL into a `telemetry/` directory bind-mounted from your project. otelq runs on the host — invoked directly or by the `otelq` skill — and reads those `.jsonl` files in-process with DuckDB, keeping an incremental parquet cache under `telemetry/.otelq-cache/` for fast repeat queries.
@@ -147,7 +171,7 @@ uv run otelq.py summary
 
 ## Commands
 
-This is a dump from running `uv run otelq.py --help` within the project root:
+This is a dump from running `uvx otelq.py --help` within the project root:
 
 ```text
 
@@ -172,7 +196,7 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  --dir DIR             telemetry folder (default: /Users/robert/misc-dev/otelq/telemetry)
+  --dir DIR             telemetry folder (default: /Users/robertgartman/dev/otelq/telemetry)
   --format {table,json,csv}
   --all                 widen the query to the full raw history (cold scan)
   --no-cache            bypass the parquet cache entirely (pure cold scan)
