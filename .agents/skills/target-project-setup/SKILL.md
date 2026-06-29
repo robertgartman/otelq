@@ -326,39 +326,80 @@ up but the agent has no instructions for it, so the `otelq` command is effective
 dead weight in that project. Install a **verbatim copy** of this repo's canonical
 query skill, `.agents/skills/otelq/SKILL.md`, into `$TARGET`.
 
-This is the one step that **reads** a file inside the otelq repo (the canonical
-skill) and **writes** it into `$TARGET` — it still never *edits* anything in the
-otelq repo, and otelq stays the master for the skill's content.
+This is the one step that **reads** files inside the otelq repo (the canonical
+skill and its Claude Code shim) and **writes** them into `$TARGET` — it still never
+*edits* anything in the otelq repo, and otelq stays the master for the skill's
+content.
 
-1. **Ask the user where to install it — this is driven by their AI coding agent,**
-   because different agents discover skills in different places, and from the otelq
-   repo we cannot know which agent `$TARGET` uses. Offer:
-   - **`.agents/skills/otelq/SKILL.md`** — the cross-agent `.agents/skills` standard.
-     The most portable choice; **recommend this** unless the user knows their agent
-     needs something else.
-   - **`.claude/skills/otelq/SKILL.md`** — Claude Code's project-scoped skills dir.
-   - **An agent-specific path the user names** — e.g. another tool's skills
-     directory. Take the location from the user rather than guessing.
+This skill is **agnostic about which AI coding agent `$TARGET` uses**, and that is
+exactly why placing the file on disk is *not* the finish line: each agent discovers
+skills in a different place, so a skill that is present but in a directory the
+agent never scans is invisible — wired-up-but-dead, the same failure mode as a
+wired Collector with no skill at all. So drive this step from the agent, and treat
+**"the agent can actually load it"** as the acceptance criterion (verified below),
+not "the file exists."
 
-   Whatever they pick, keep the trailing `otelq/SKILL.md` shape (a directory named
-   `otelq` containing `SKILL.md`), and install **project-scoped inside `$TARGET`**
-   (not into a global/user skills dir) so the skill travels with the repo.
+1. **Ask the user which AI coding agent `$TARGET` uses** (Claude Code, Cursor,
+   Windsurf, Copilot, Codex, another, or several) — *then derive the skills
+   architecture from that answer*, rather than only asking for a path. From the
+   otelq repo we cannot know the target's agent, and the right install layout
+   depends entirely on it.
 
-2. **Copy it verbatim** from the otelq repo into the chosen location under `$TARGET`.
-   Do not rewrite, trim, or "adapt" the content — otelq is the master for this skill,
-   exactly as it is for the `collector-config` fragment, so a copy that drifts is a
-   bug. If the destination file already exists and is byte-for-byte identical, leave
-   it untouched; if it exists but differs, replace it with the canonical copy:
+2. **Pick the skills architecture for that agent.** otelq is the master for the
+   skill *content*; how it is surfaced is per-agent:
+   - **The canonical body always lives at `.agents/skills/otelq/SKILL.md`** — the
+     cross-agent `.agents/skills` standard, project-scoped inside `$TARGET` so it
+     travels with the repo. Install it there regardless of agent; it is the single
+     source of truth a shim can point at.
+   - **If the chosen agent reads `.agents/skills` natively**, that one file is
+     enough — no shim.
+   - **If the chosen agent has its own skills dir** (e.g. **Claude Code →
+     `.claude/skills/otelq/SKILL.md`**), it will **not** see `.agents/skills`, so
+     also install a **thin pointer shim** in the agent's own dir whose body just
+     says *"read the canonical instructions at `.agents/skills/otelq/SKILL.md` and
+     follow them exactly."* This is the pattern the otelq repo uses on itself: see
+     `.claude/skills/otelq/SKILL.md` — copy it verbatim as the shim. It keeps a
+     single canonical body while making the skill discoverable. Match whatever shim
+     convention `$TARGET` already uses for its other skills if it has one.
+   - **For multiple agents**, install one canonical body plus one shim per agent
+     that needs its own dir.
+   - **An agent you do not recognise** → ask the user for that agent's
+     project-scoped skills directory and the shape it expects, rather than guessing.
+
+   Whatever the layout, keep the trailing `otelq/SKILL.md` shape (a directory named
+   `otelq` containing `SKILL.md`) and install **project-scoped inside `$TARGET`**
+   (never a global/user skills dir).
+
+3. **Copy verbatim** from the otelq repo into the chosen location(s) under `$TARGET`.
+   Do not rewrite, trim, or "adapt" the content — otelq is the master for both the
+   canonical skill and the shim, exactly as it is for the `collector-config`
+   fragment, so a copy that drifts is a bug. If a destination file already exists and
+   is byte-for-byte identical, leave it untouched; if it exists but differs, replace
+   it with the canonical copy:
 
    ```sh
-   DEST="$TARGET/.agents/skills/otelq"          # or the location the user chose
+   # canonical body (always)
+   DEST="$TARGET/.agents/skills/otelq"
    mkdir -p "$DEST"
    cp .agents/skills/otelq/SKILL.md "$DEST/SKILL.md"
+
+   # plus a per-agent shim when the agent has its own dir, e.g. Claude Code:
+   SHIM="$TARGET/.claude/skills/otelq"
+   mkdir -p "$SHIM"
+   cp .claude/skills/otelq/SKILL.md "$SHIM/SKILL.md"
    ```
 
-3. **Confirm it landed** — `git -C "$TARGET" status` should show the new skill file,
-   so it is committed alongside the integration (the commit in the verify step picks
-   it up). Tell the user the otelq command is now usable by `$TARGET`'s agent.
+4. **Acceptance check — confirm the agent can discover it, not just that the file
+   landed.** `git -C "$TARGET" status` should show the new skill/shim file(s) (so
+   they commit alongside the integration). Then verify discoverability *for the
+   named agent*: the skill sits in a directory **that agent actually scans**
+   (canonical body in `.agents/skills` only suffices for agents that read it; Claude
+   Code needs the `.claude/skills` shim). Note that a freshly added skill usually
+   requires the agent to **reload/restart its session** before it appears, and that
+   `$TARGET`'s git status should be clean afterwards (idempotent: a byte-identical
+   skill already present is a no-op, not a re-copy). Only once the skill resolves in
+   the user's actual agent is this step done — then tell the user the `otelq` command
+   is usable by `$TARGET`'s agent.
 
 ## When something is off
 
@@ -373,3 +414,8 @@ otelq repo, and otelq stays the master for the skill's content.
 - The probe's `telemetrygen` can't reach the Collector — confirm both are in the
   **same Compose project** (so service-name DNS resolves) and that you used the
   Collector's **service** name, not its `container_name`.
+- The skill file is present but **the agent never offers/loads otelq** — it is in a
+  directory that agent does not scan. Most common with Claude Code, which reads
+  `.claude/skills` and **not** `.agents/skills`: add the thin `.claude/skills/otelq`
+  shim pointing at the canonical body (see the install step), then reload the agent
+  session so it re-scans skills.
