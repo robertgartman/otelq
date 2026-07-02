@@ -70,7 +70,7 @@ if TYPE_CHECKING:
 # the packaged version in pyproject.toml (a test asserts they match), so an
 # agent driving otelq — and the DuckDB/extension pin governance of ADR-003 — can
 # report exactly which build it is talking to.
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 # Public surface of this single-file module. The CLI entry is `main`; the rest
 # is the API the test suite pins. The trailing group is deliberately exported
