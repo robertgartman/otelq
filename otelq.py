@@ -50,8 +50,10 @@ import sys
 import tempfile
 import textwrap
 import time
-from collections.abc import Callable, Iterable, Iterator
-from datetime import datetime, timedelta
+import weakref
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
@@ -64,6 +66,12 @@ from typing import TYPE_CHECKING, Any, TypedDict, cast
 if TYPE_CHECKING:
     import duckdb
 
+# otelq's own version, reported by `otelq --version` (F-3). Kept in lockstep with
+# the packaged version in pyproject.toml (a test asserts they match), so an
+# agent driving otelq — and the DuckDB/extension pin governance of ADR-003 — can
+# report exactly which build it is talking to.
+__version__ = "0.2.1"
+
 # Public surface of this single-file module. The CLI entry is `main`; the rest
 # is the API the test suite pins. The trailing group is deliberately exported
 # despite the leading underscore: it is internal to normal callers but part of
@@ -71,6 +79,7 @@ if TYPE_CHECKING:
 # so listing it here makes that test-visible contract explicit.
 __all__ = [
     "main",
+    "__version__",
     "build_parser",
     "build_connection",
     "connect",
@@ -103,6 +112,10 @@ __all__ = [
     "_LOCK_STALE_SECS",
     "_LOCK_HARD_STALE_SECS",
     "_NO_TELEMETRY_MSG",
+    "_parse_since",
+    "_seal_external_access",
+    "_future_ceiling",
+    "_fmt_ts",
 ]
 
 # Default to ./telemetry under the *current working directory* so the zero-config
@@ -134,6 +147,22 @@ OTLP_TOP_LEVEL_KEY = {
     "logs": "resourceLogs",
     "metrics": "resourceMetrics",
 }
+
+def _rows_upper_bound(line: str) -> int:
+    """A cheap, sound UPPER bound on the read_otlp_* rows a JSONL line yields,
+    computed WITHOUT parsing it (P-2).
+
+    Every span, log record, and metric data point — i.e. every output row —
+    carries at least one `*[Tt]imeUnixNano` key (spans and sum/histogram points
+    carry two), and `"imeUnixNano"` is the shared substring of all of them
+    (timeUnixNano, startTimeUnixNano, endTimeUnixNano, observedTimeUnixNano). So
+    this count is never below the true row count; it can only overcount, which
+    keeps chunk sizing conservative (smaller, never oversized) and is safe as the
+    gate that decides whether a line even needs a real json.loads. A stray
+    occurrence inside a string value only inflates the bound, at worst forcing an
+    exact re-count via _decode_line — never a crash or a dropped row."""
+    return line.count("imeUnixNano")
+
 
 # read_otlp_* corrupts memory above 2048 output rows; _SAFE_CHUNK leaves a
 # margin so a chunk can never reach the boundary. _CRASH_LIMIT is the boundary
@@ -187,6 +216,14 @@ LOCK_FILENAME = ".lock"
 CURSOR_SCHEMA_VERSION = 1
 RETENTION_MINUTES = 30  # hot window
 MARGIN_MINUTES = 2  # watermark lateness allowance before a minute may seal
+# How far ahead of wall-clock an event-time may sit before otelq treats it as an
+# implausible outlier (clock-skewed producer, ns/µs unit mistake). The event-time
+# window anchor and the cache watermark are clamped to `wall_clock + this` so a
+# single bogus far-future record can neither push the hot window past all real
+# data (a silent "no telemetry") nor ratchet the retention floor forward and
+# evict the whole sealed cache (B-1). Generous enough to tolerate ordinary
+# divergent-clock skew (EC-12), which is seconds-to-minutes, not a day.
+MAX_FUTURE_SKEW = timedelta(days=1)
 FINGERPRINT_BYTES = 256
 _LOCK_STALE_SECS = 120
 # A lock "held" by a live pid for longer than this is almost certainly a reused
@@ -196,8 +233,8 @@ _LOCK_HARD_STALE_SECS = 3600
 _TMP_SUFFIX = ".tmp"
 
 _NO_TELEMETRY_MSG = (
-    "no telemetry captured — is the collector running (just otel-up) "
-    "and OTEL_ENABLED=true?"
+    "no telemetry captured — is the collector that writes this directory running, "
+    "and are your apps exporting OTLP to it? (run `otelq troubleshoot`)"
 )
 
 
@@ -298,10 +335,24 @@ def _buffer_to_chunks(
         buf, buf_rows = [], 0
 
     for line in lines:
-        decoded = _decode_line(signal, line)
-        if decoded is None:
+        stripped = line.strip()
+        if not stripped:
             continue
-        _, rows = decoded
+        ub = _rows_upper_bound(line)
+        if stripped.endswith("}") and ub <= _CRASH_LIMIT:
+            # Fast path (P-2): a complete object (ends with '}') whose upper bound
+            # is under the crash limit needs no parse — the bound is a safe row
+            # count for chunk sizing. This skips json.loads for the overwhelming
+            # majority of lines on the cold path over a large corpus.
+            rows = ub
+        else:
+            # A partially-written trailing line (won't end in '}') or a batch whose
+            # bound reaches the crash limit: confirm with a real parse, which skips
+            # blank/partial lines and oversize batches with a warning (FR-15).
+            decoded = _decode_line(signal, line)
+            if decoded is None:
+                continue
+            _, rows = decoded
         if buf and buf_rows + rows > _SAFE_CHUNK:
             flush()
         buf.append(line if line.endswith("\n") else line + "\n")
@@ -455,7 +506,7 @@ def _materialize(
     longer needed once this returns.
     """
     for index, chunk in enumerate(chunks):
-        select = f"SELECT * REPLACE ({ts_fix}) FROM {reader}('{chunk}')"
+        select = f"SELECT * REPLACE ({ts_fix}) FROM {reader}({_sql_str(chunk)})"
         if index == 0:
             conn.execute(f"CREATE TABLE {name} AS {select}")
         else:
@@ -498,6 +549,16 @@ def _existing_relations(conn: duckdb.DuckDBPyConnection) -> set[str]:
     return {r[0] for r in rows}
 
 
+# Per-connection memo of `relation -> has-rows`. otelq's query relations are built
+# once and never mutated by a read command, so presence is stable for a
+# connection's life; caching it collapses the several count(*) round-trips a
+# single command makes (cmd_summary + _require + _has_rows) into one probe per
+# relation (P-4). Keyed weakly so a closed connection's entry is collectable.
+_presence_memo: "weakref.WeakKeyDictionary[duckdb.DuckDBPyConnection, dict[str, bool]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
 def _has_rows(conn: duckdb.DuckDBPyConnection, relation: str) -> bool:
     """True iff `relation` exists AND holds at least one row.
 
@@ -505,10 +566,18 @@ def _has_rows(conn: duckdb.DuckDBPyConnection, relation: str) -> bool:
     crucially, treats a seeded-empty relation (FR-1 expose-empty) exactly like an
     absent one. "Present" therefore means *has captured data*, not mere table
     existence: the presence checks below stay correct now that every documented
-    relation resolves (empty) whenever any telemetry is present."""
+    relation resolves (empty) whenever any telemetry is present. The result is
+    memoised per connection (P-4)."""
+    memo = _presence_memo.setdefault(conn, {})
+    cached = memo.get(relation)
+    if cached is not None:
+        return cached
     if relation not in _existing_relations(conn):
+        memo[relation] = False
         return False
-    return bool(_scalar(conn.execute(f"SELECT count(*) FROM {relation}")))
+    result = bool(_scalar(conn.execute(f"SELECT count(*) FROM {relation}")))
+    memo[relation] = result
+    return result
 
 
 def _present_signals(conn: duckdb.DuckDBPyConnection) -> list[str]:
@@ -542,7 +611,7 @@ def _no_signal_msg(
         f"The collector is up, so either the apps aren't emitting {missing}, or "
         f"{names} was deleted while the collector was running — high-volume "
         f"traces reappear on rotation but low-volume logs/metrics don't until "
-        f"the collector is restarted (see `just otel-clean`)."
+        f"the collector is restarted (run `otelq troubleshoot`)."
     )
 
 
@@ -558,6 +627,21 @@ def _require(conn: duckdb.DuckDBPyConnection, *relations: str) -> None:
 def _fmt_ts(dt: datetime) -> str:
     """Format a datetime as a DuckDB TIMESTAMP literal / cursor string."""
     return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
+def _utc_now() -> datetime:
+    """Wall-clock UTC as a naive datetime, matching the naive-UTC event-times the
+    OTLP reader produces (so the two are directly comparable)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _future_ceiling() -> datetime:
+    """The largest event-time otelq will anchor to: wall-clock + MAX_FUTURE_SKEW.
+
+    Event-times above this are implausible outliers; clamping the window anchor
+    and the cache watermark to this ceiling keeps one bogus far-future record from
+    blacking out every query or wiping the sealed cache (B-1)."""
+    return _utc_now() + MAX_FUTURE_SKEW
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -581,8 +665,19 @@ def parse_minute_key(stem: str) -> datetime | None:
         return None
 
 
+def _sql_str(value: str) -> str:
+    """Quote a string as a DuckDB single-quoted SQL literal, escaping embedded
+    quotes (`'` -> `''`).
+
+    Every filesystem path otelq splices into SQL passes through here so a
+    telemetry dir containing a single quote — common on macOS ("Robert's Mac",
+    `it's-a-demo/`) — neither breaks the query with an opaque syntax error nor
+    permits SQL injection via `--dir` (B-5)."""
+    return "'" + value.replace("'", "''") + "'"
+
+
 def _sql_file_list(paths: list[str]) -> str:
-    return "[" + ", ".join("'" + p + "'" for p in paths) + "]"
+    return "[" + ", ".join(_sql_str(p) for p in paths) + "]"
 
 
 # --- cache paths -------------------------------------------------------------
@@ -672,11 +767,18 @@ def _wipe_cache(telemetry_dir: Path) -> None:
 
 
 def _reap_tmp(telemetry_dir: Path) -> None:
-    """Remove stale *.tmp files left by a crashed write (older than the lock TTL,
-    so a concurrent writer's in-flight temp file is never reaped)."""
+    """Remove stale *.tmp files left by a crashed write.
+
+    Skipped entirely while a live pid holds the writer lock: a legitimate holder
+    may run a long catch-up seal whose single `COPY` exceeds _LOCK_STALE_SECS
+    between mtime updates, and reaping its in-flight temp file mid-write would
+    corrupt the seal (B-8). With no live holder, *.tmp older than the lock TTL is
+    a crash leftover and is removed."""
     cdir = cache_dir(telemetry_dir)
     if not cdir.exists():
         return
+    if _lock_held_by_live_pid(cdir):
+        return  # a live writer owns the cache; never touch its in-flight temp files
     now = time.time()
     for p in cdir.rglob("*" + _TMP_SUFFIX):
         try:
@@ -710,6 +812,20 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False  # Windows raises OSError for a dead pid
     return True
+
+
+def _lock_held_by_live_pid(cdir: Path) -> bool:
+    """True iff the writer lock exists and names a currently-live pid.
+
+    Used to hold off destructive housekeeping (tmp reaping) while a legitimate
+    writer is mid-run, and to refuse unlinking a lock that a reaper handed to
+    another process."""
+    lock = cdir / LOCK_FILENAME
+    try:
+        pid = int((lock.read_text(encoding="utf-8") or "0").strip() or "0")
+    except (OSError, ValueError):
+        return False
+    return _pid_alive(pid)
 
 
 def _reap_if_stale(lock: Path) -> bool:
@@ -748,12 +864,23 @@ def _acquire_lock(cdir: Path) -> int | None:
 
 
 def _release_lock(cdir: Path, fd: int) -> None:
+    """Release the writer lock, but unlink the sentinel only when it still names
+    our pid. If a reaper decided we blew past the hard ceiling and re-acquired for
+    another process, unlinking by name would delete THAT holder's lock and let two
+    writers run at once (INV-5); verify ownership first (B-9)."""
     try:
         os.close(fd)
     except OSError:
         pass
+    lock = cdir / LOCK_FILENAME
     try:
-        (cdir / LOCK_FILENAME).unlink()
+        holder = int((lock.read_text(encoding="utf-8") or "0").strip() or "0")
+    except (OSError, ValueError):
+        return  # gone or unreadable — nothing of ours to remove
+    if holder != os.getpid():
+        return  # reaped and handed to another process; leave their lock intact
+    try:
+        lock.unlink()
     except OSError:
         pass
 
@@ -767,8 +894,12 @@ def _file_identity(path: Path) -> str:
     Rotation renames the active file to a backup but preserves the inode and the
     immutable prefix bytes, so the key carries over and the stored offset
     resumes (SPEC FR-3). The fingerprint guards inode reuse and filesystems
-    where st_ino is 0/non-unique (EC-6); size is deliberately not part of the
-    key (it grows, which would churn the key every run)."""
+    where st_ino is 0/non-unique (EC-6). Size is deliberately not part of the
+    key (it grows every append, which would churn the key every run); the
+    residual truncate-and-rewrite hole the size once guarded is closed by the
+    shrink check in _iter_stream_delta (st_size < stored offset ⇒ reset), so
+    identity stays stable while a rewritten file is never resumed at a stale
+    offset (B-6)."""
     st = os.stat(path)
     with open(path, "rb") as fh:
         head = fh.read(FINGERPRINT_BYTES)
@@ -795,17 +926,31 @@ def _iter_stream_delta(
     Binary reads keep byte offsets exact on every platform (text-mode tell() is
     opaque under newline translation). A trailing line without a newline is a
     partial write: it is not yielded and its bytes are not consumed, so it is
-    re-read once complete."""
+    re-read once complete.
+
+    A file that shrank below its stored offset was truncated and rewritten under
+    a coincidentally-identical identity; it resumes from 0 (B-6). A file listed by
+    the glob but unreadable this run has its prior offset carried forward rather
+    than dropped, so it is not re-read from 0 (and its unsealed rows duplicated)
+    next run (B-4)."""
+    any_open_failure = False
     for src in sorted(glob.glob(str(telemetry_dir / SIGNAL_GLOBS[stream]))):
         path = Path(src)
         try:
             key = _file_identity(path)
             fh = open(path, "rb")
         except OSError:
+            any_open_failure = True
             continue
         prior = files_state.get(key)
         offset = prior["bytes_consumed"] if prior is not None else 0
         with fh:
+            try:
+                size = os.fstat(fh.fileno()).st_size
+            except OSError:
+                size = offset
+            if size < offset:
+                offset = 0  # truncated + rewritten under a stale identity -> restart
             fh.seek(offset)
             buf = b""
             while True:
@@ -822,6 +967,15 @@ def _iter_stream_delta(
                     if ln.strip():
                         yield ln.decode("utf-8", "replace")
         new_state_out[key] = {"bytes_consumed": offset}
+    if any_open_failure:
+        # We cannot map an unreadable glob path back to its identity key, so
+        # conservatively carry forward every prior offset we did not just refresh.
+        # The only cost is briefly retaining a key for a genuinely rotated-away
+        # file when some *other* file also failed to open — bounded, and pruned on
+        # the next clean run — whereas dropping a live file's offset would
+        # re-parse it from 0 and break FR-11/INV-4 (B-4).
+        for key, state in files_state.items():
+            new_state_out.setdefault(key, state)
 
 
 # --- ingest, seal, evict -----------------------------------------------------
@@ -845,11 +999,13 @@ def _build_staging(
             arms: list[str] = []
             pending = pending_path(telemetry_dir, signal)
             if pending.exists():
-                arms.append(f"SELECT * FROM read_parquet('{pending.as_posix()}')")
+                arms.append(
+                    f"SELECT * FROM read_parquet({_sql_str(pending.as_posix())})"
+                )
             for chunk in chunks:
                 arms.append(
                     f"SELECT * REPLACE ({_TS_FIX}) FROM "
-                    f"{SIGNAL_READERS[signal]}('{chunk}')"
+                    f"{SIGNAL_READERS[signal]}({_sql_str(chunk)})"
                 )
             if arms:
                 conn.execute(
@@ -904,24 +1060,34 @@ def _ingest_and_seal(
             cursor["streams"][stream]["max_event_ts_seen"] = _fmt_ts(max(candidates))
 
     for signal in CACHE_SIGNALS:
-        if signal not in staged:
-            continue
         wm = _parse_ts(cursor["streams"][stream_of(signal)].get("max_event_ts_seen"))
         if wm is None:
             continue
-        hot_floor = wm - timedelta(minutes=RETENTION_MINUTES)
+        # Clamp the retention anchor to a plausible ceiling: a single far-future
+        # record must not ratchet hot_floor forward and evict the whole sealed
+        # cache (B-1). The persisted watermark keeps the true max (INV-7); only
+        # the floors derived here are clamped.
+        anchor = min(wm, _future_ceiling())
+        hot_floor = anchor - timedelta(minutes=RETENTION_MINUTES)
         # Retention is per-minute but the query window is sub-minute: the minute
         # straddling hot_floor still holds records >= hot_floor that an in-window
         # query needs. Retain one extra minute below the window so the exact
         # sub-minute window filter in _finalize_relations trims it correctly,
         # keeping the hot read equal to a full raw re-scan (FR-11).
         retain_floor = hot_floor - timedelta(minutes=1)
-        # A minute m=[m, m+60s) is sealable once wm has passed its end by MARGIN.
-        seal_high = wm - timedelta(seconds=60 + MARGIN_MINUTES * 60)
-        newly_sealed = _seal_signal(
-            conn, telemetry_dir, signal, retain_floor, seal_high
-        )
-        _rewrite_pending(conn, telemetry_dir, signal, retain_floor, newly_sealed)
+        # Sealing and pending-rewrite need this run's _stage_<signal> table, so
+        # they only run for staged signals. Eviction is decoupled: it runs for
+        # every signal whose stream has a watermark, so a signal that stops being
+        # staged (e.g. a sibling metric type on a stream still advancing via
+        # another type) still has its out-of-window partitions removed rather than
+        # lingering in the `metrics` view (FR-6; B-10).
+        if signal in staged:
+            # A minute m=[m, m+60s) is sealable once wm has passed its end by MARGIN.
+            seal_high = anchor - timedelta(seconds=60 + MARGIN_MINUTES * 60)
+            newly_sealed = _seal_signal(
+                conn, telemetry_dir, signal, retain_floor, seal_high
+            )
+            _rewrite_pending(conn, telemetry_dir, signal, retain_floor, newly_sealed)
         _evict_signal(telemetry_dir, signal, retain_floor)
 
     cursor["version"] = CURSOR_SCHEMA_VERSION
@@ -954,7 +1120,7 @@ def _seal_signal(
         conn.execute(
             f"COPY (SELECT * FROM _stage_{signal} "
             f"WHERE date_trunc('minute', timestamp) = TIMESTAMP '{_fmt_ts(m)}') "
-            f"TO '{tmp.as_posix()}' (FORMAT PARQUET)"
+            f"TO {_sql_str(tmp.as_posix())} (FORMAT PARQUET)"
         )
         os.replace(tmp, target)
         sealed.add(m)
@@ -1006,7 +1172,7 @@ def _rewrite_pending(
     count = _scalar(conn.execute(f"SELECT count(*) FROM ({final})"))
     if count:
         tmp = pending.with_suffix(pending.suffix + _TMP_SUFFIX)
-        conn.execute(f"COPY ({final}) TO '{tmp.as_posix()}' (FORMAT PARQUET)")
+        conn.execute(f"COPY ({final}) TO {_sql_str(tmp.as_posix())} (FORMAT PARQUET)")
         os.replace(tmp, pending)
     else:
         try:
@@ -1064,7 +1230,7 @@ def _seed_absent_relations(
     for signal in absent:
         conn.execute(
             f"CREATE TABLE {prefix}{signal} AS SELECT * REPLACE ({_TS_FIX}) "
-            f"FROM {SIGNAL_READERS[signal]}('{probe}') WHERE false"
+            f"FROM {SIGNAL_READERS[signal]}({_sql_str(probe)}) WHERE false"
         )
         present.add(signal)
 
@@ -1092,10 +1258,20 @@ def _assemble_hot(
             )
         pending = pending_path(telemetry_dir, signal)
         if pending.exists():
-            arms.append(f"SELECT * FROM read_parquet('{pending.as_posix()}')")
+            arms.append(f"SELECT * FROM read_parquet({_sql_str(pending.as_posix())})")
         if arms:
+            # A VIEW, not a table: the final windowed relations are materialised
+            # once from this in _finalize_relations, so a table here would copy the
+            # whole hot window twice (parquet -> _all_ -> final). As a view DuckDB
+            # does a single lazy parquet scan with the window predicate pushed down
+            # (P-1). max(timestamp) in _finalize uses parquet zone-map stats, not a
+            # full scan. The final relations stay materialised tables, so the reads
+            # (and any "a partition vanished mid-query" error) still happen inside
+            # build_connection's guarded region, preserving the cold fallback
+            # (FR-12); a fully-lazy final relation would move that error to query
+            # time, past the guard.
             conn.execute(
-                f"CREATE TABLE _all_{signal} AS " + " UNION ALL BY NAME ".join(arms)
+                f"CREATE VIEW _all_{signal} AS " + " UNION ALL BY NAME ".join(arms)
             )
             present.add(signal)
     return present
@@ -1119,7 +1295,13 @@ def _finalize_relations(
     if window is None or now_evt is None:
         lo = hi = None
     else:
-        lo, hi = now_evt - window, now_evt
+        # Clamp the window's upper anchor to a plausible ceiling so one far-future
+        # record can't push the whole window past every real record and return the
+        # friendly "no telemetry" while telemetry plainly exists (B-1). Applied on
+        # BOTH hot and cold paths so cached == --no-cache (FR-11); a no-op unless
+        # an event-time sits more than MAX_FUTURE_SKEW ahead of wall-clock.
+        hi = min(now_evt, _future_ceiling())
+        lo = hi - window
     for s in present:
         if lo is None or hi is None:
             conn.execute(f"CREATE TABLE {s} AS SELECT * FROM _all_{s}")
@@ -1231,13 +1413,15 @@ class Plan:
 
 
 def _parse_since(since: str | None) -> timedelta | None:
-    """Translate a window like '10m' / '2h' / '1d' into a timedelta."""
+    """Translate a window like '30s' / '10m' / '2h' / '1d' into a timedelta."""
     if not since:
         return None
-    units = {"m": "minutes", "h": "hours", "d": "days"}
+    units = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
     unit = units.get(since[-1].lower())
     if unit is None or not since[:-1].isdigit():
-        raise SystemExit(f"otelq: invalid --since '{since}' (use e.g. 10m, 2h, 1d)")
+        raise SystemExit(
+            f"otelq: invalid --since '{since}' (use e.g. 30s, 10m, 2h, 1d)"
+        )
     return timedelta(**{unit: int(since[:-1])})
 
 
@@ -1260,11 +1444,36 @@ def plan_range(args: argparse.Namespace) -> Plan:
         route = "COLD"
     elif since is not None and since > hot:
         route = "COLD"
-    elif cmd in ("trace", "metric"):
+    elif cmd == "trace":
+        # Only `trace` widens on a hot miss: a trace id is looked up across all
+        # history (FR-10), ignoring the window. `metric` deliberately does NOT —
+        # widening on an empty hot result would return points OUTSIDE the --since
+        # or default window (FR-15/FR-9); `metric` widens only when explicitly
+        # requested via --all/--since, which already routes COLD above (B-2).
         route = "HOT_THEN_COLD"
     else:
         route = "HOT"
     return Plan(route, window, use_cache)
+
+
+def _human_window(window: timedelta | None) -> str:
+    """Render a plan window as the compact form the user typed (30s/10m/2h/1d)."""
+    if window is None:
+        return "all history"
+    seconds = int(window.total_seconds())
+    for size, suffix in ((86400, "d"), (3600, "h"), (60, "m")):
+        if seconds % size == 0:
+            return f"last {seconds // size}{suffix}"
+    return f"last {seconds}s"
+
+
+def _plan_summary(plan: Plan) -> str:
+    """One-line window/route/cache description for --verbose (stderr, F-5)."""
+    cache = "on" if plan.use_cache else "off"
+    return (
+        f"otelq: window={_human_window(plan.window)} (by event-time), "
+        f"route={plan.route.lower()}, cache={cache}"
+    )
 
 
 def build_connection(telemetry_dir: Path, plan: Plan) -> duckdb.DuckDBPyConnection:
@@ -1291,6 +1500,21 @@ def build_connection(telemetry_dir: Path, plan: Plan) -> duckdb.DuckDBPyConnecti
     return conn
 
 
+def _seal_external_access(conn: duckdb.DuckDBPyConnection, command: str) -> None:
+    """Revoke DuckDB's filesystem/network access before a built-in query runs.
+
+    By this point the query relations are fully materialised (or, on the hot
+    path, are parquet-backed views the built-in commands never touch — they read
+    the materialised final tables), so the built-ins need no further file access.
+    Dropping it is defense-in-depth against a crafted view/relation reaching other
+    files (D-2). `sql` is exempt on purpose: it is an ad-hoc analysis escape hatch
+    that runs with your user's file access — the help documents this — so it must
+    keep read/write access to `read_csv`, `COPY`, etc."""
+    if command == "sql":
+        return
+    conn.execute("SET enable_external_access=false")
+
+
 def run_command(args: argparse.Namespace) -> CommandResult:
     """Plan, build the connection, dispatch, and apply trace/metric cold-fallback."""
     # A --dir that exists but is not a directory (e.g. a regular file) would
@@ -1301,25 +1525,48 @@ def run_command(args: argparse.Namespace) -> CommandResult:
     if args.dir.exists() and not args.dir.is_dir():
         raise SystemExit(f"otelq: --dir '{args.dir}' is not a directory")
     plan = plan_range(args)
+    verbose = bool(getattr(args, "verbose", False))
+    if verbose:
+        print(_plan_summary(plan), file=sys.stderr)
     command = COMMANDS[args.command]
-    conn = build_connection(args.dir, plan)
     fallback = plan.use_cache and plan.route == "HOT_THEN_COLD"
-    try:
-        columns, rows = command(conn, args)
-    except NoTelemetryError:
-        if not fallback:
-            raise
-        conn = build_connection(args.dir, Plan("COLD", None, True))
+    with closing(build_connection(args.dir, plan)) as conn:
+        _seal_external_access(conn, args.command)
+        try:
+            columns, rows = command(conn, args)
+        except NoTelemetryError:
+            if not fallback:
+                raise
+        else:
+            if not (fallback and not rows):
+                return columns, rows
+    # Fell through: the hot window held no answer and this command may widen to a
+    # full-history cold scan (only `trace` today). closing() has already released
+    # the hot connection before we open the cold one (D-3).
+    if verbose:
+        print(
+            "otelq: hot window empty — widened to a full-history cold scan",
+            file=sys.stderr,
+        )
+    with closing(build_connection(args.dir, Plan("COLD", None, True))) as conn:
+        _seal_external_access(conn, args.command)
         return command(conn, args)
-    if fallback and not rows:
-        conn = build_connection(args.dir, Plan("COLD", None, True))
-        return command(conn, args)
-    return columns, rows
 
 
 def format_output(columns: list[str], rows: list[tuple[Any, ...]], fmt: str) -> str:
     if fmt == "json":
-        return json.dumps([dict(zip(columns, r)) for r in rows], default=str, indent=2)
+        # Compact separators (no spaces): pretty-printing roughly doubles the
+        # token count for the tool's primary consumer — AI agents — against the
+        # PRD's token-efficiency goal (P-5). Use `table` for humans, `jsonl` for
+        # streaming one object per line.
+        return json.dumps(
+            [dict(zip(columns, r)) for r in rows], default=str, separators=(",", ":")
+        )
+    if fmt == "jsonl":
+        return "\n".join(
+            json.dumps(dict(zip(columns, r)), default=str, separators=(",", ":"))
+            for r in rows
+        )
     if fmt == "csv":
         buf = io.StringIO()
         writer = csv.writer(buf)
@@ -1363,6 +1610,38 @@ _SUMMARY_ZERO = (0, None, None, 0)  # a bucket/level present but with no records
 # included — a fixed skeleton like the log levels (FR-3). The OTel Summary type
 # is not among them: the duckdb-otlp reader for it is an unsupported stub.
 _METRIC_TYPES: tuple[str, ...] = ("gauge", "sum", "histogram", "exp_histogram")
+
+# Default row cap for the list-style commands (errors/logs/metric). `slow` keeps
+# its own smaller default. A cap keeps an accidental `logs` over a large capture
+# from flooding an agent's context; --top overrides it and a stderr notice fires
+# when the cap actually truncated the result (F-1).
+_DEFAULT_TOP = 50
+
+
+def _limited(
+    conn: duckdb.DuckDBPyConnection,
+    query: str,
+    params: Sequence[Any],
+    top: int,
+) -> list[Row]:
+    """Run `query` (which must already carry its ORDER BY) capped at `top` rows.
+
+    Fetches one extra row so truncation is detected without a second count query;
+    when the cap bites, the extra row is dropped and a one-line notice is written
+    to stderr (never stdout, so --format json/csv stays machine-parseable). `top`
+    of 0 returns no rows, matching `slow --top 0`."""
+    if top == 0:
+        return []
+    rows: list[Row] = conn.execute(
+        f"{query} LIMIT ?", [*params, top + 1]
+    ).fetchall()
+    if len(rows) > top:
+        print(
+            f"otelq: output truncated to {top} rows; pass --top N for more",
+            file=sys.stderr,
+        )
+        rows = rows[:top]
+    return rows
 
 
 def _summary_traces(conn: duckdb.DuckDBPyConnection) -> list[Row]:
@@ -1469,20 +1748,32 @@ def cmd_errors(
     # The time window is applied by the relation builder (SPEC INV-7), so the
     # command queries the already-scoped relations.
     columns = ["kind", "timestamp", "service_name", "label", "detail"]
-    rows: list[Row] = []
+    arms: list[str] = []
     if _has_rows(conn, "traces"):
-        rows += conn.execute(
-            "SELECT 'span', timestamp, service_name, span_name, status_message "
+        arms.append(
+            "SELECT 'span' AS kind, timestamp, service_name, "
+            "span_name AS label, status_message AS detail "
             "FROM traces WHERE status_code = 2"
-        ).fetchall()
+        )
     if _has_rows(conn, "logs"):
         # FR-4: match case-insensitively. severity_text carries inconsistent
         # casing in practice (e.g. "Error"), so fold before comparing (cf. FR-2).
-        rows += conn.execute(
-            "SELECT 'log', timestamp, service_name, severity_text, body "
+        arms.append(
+            "SELECT 'log' AS kind, timestamp, service_name, "
+            "severity_text AS label, body AS detail "
             "FROM logs WHERE upper(severity_text) IN ('ERROR', 'FATAL')"
-        ).fetchall()
-    rows.sort(key=lambda r: r[1], reverse=True)
+        )
+    if not arms:
+        return columns, []
+    # FR-4 orders newest-first; the trailing keys are a deterministic tie-breaker
+    # so equal-timestamp rows render in the same order on the hot (parquet) and
+    # cold (raw) paths — byte-identical cached vs --no-cache (B-7). ORDER BY in
+    # SQL (not a Python sort) also tolerates null label/detail without raising.
+    query = (
+        " UNION ALL ".join(arms)
+        + " ORDER BY timestamp DESC, kind, service_name, label, detail"
+    )
+    rows = _limited(conn, query, [], getattr(args, "top", _DEFAULT_TOP))
     return columns, rows
 
 
@@ -1491,7 +1782,8 @@ def cmd_slow(
 ) -> CommandResult:
     _require(conn, "traces")
     columns = ["timestamp", "service_name", "span_name", "duration_ms", "trace_id"]
-    rows = conn.execute(
+    rows = _limited(
+        conn,
         # FR-5 orders by duration desc; the trailing keys (all output columns, so
         # they exist on every traces relation) are a deterministic tie-breaker so
         # equal-duration spans — and which ones the LIMIT keeps — match on the hot
@@ -1499,22 +1791,56 @@ def cmd_slow(
         "SELECT timestamp, service_name, span_name, "
         "duration AS duration_ms, trace_id "
         "FROM traces "
-        "ORDER BY duration DESC, timestamp DESC, trace_id, service_name, span_name "
-        "LIMIT ?",
-        [args.top],
-    ).fetchall()
+        "ORDER BY duration DESC, timestamp DESC, trace_id, service_name, span_name",
+        [],
+        args.top,
+    )
     return columns, rows
+
+
+def _resolve_trace_id(conn: duckdb.DuckDBPyConnection, wanted: str) -> str:
+    """Resolve `wanted` to a full trace id, accepting a unique prefix (F-4).
+
+    An exact match always wins (and is the common path, so it costs one indexed
+    lookup). Otherwise a `git`-style unique-prefix match lets an agent paste a
+    shortened id; two or more matches raise a friendly SystemExit naming the
+    ambiguity rather than silently picking one. A prefix that matches nothing is
+    returned unchanged so the caller emits the normal 'no spans found' message."""
+    exact = conn.execute(
+        "SELECT 1 FROM traces WHERE trace_id = ? LIMIT 1", [wanted]
+    ).fetchall()
+    if exact:
+        return wanted
+    # starts_with keeps the term a literal prefix (no LIKE wildcard handling);
+    # LIMIT 2 is enough to tell unique from ambiguous without scanning the rest.
+    matches = [
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT trace_id FROM traces WHERE starts_with(trace_id, ?) "
+            "ORDER BY trace_id LIMIT 2",
+            [wanted],
+        ).fetchall()
+    ]
+    if len(matches) > 1:
+        raise SystemExit(
+            f"otelq: trace id prefix '{wanted}' is ambiguous "
+            f"(matches {matches[0]}, {matches[1]}, …); use more characters"
+        )
+    if len(matches) == 1:
+        return matches[0]
+    return wanted
 
 
 def cmd_trace(
     conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
 ) -> CommandResult:
     _require(conn, "traces")
+    trace_id = _resolve_trace_id(conn, args.trace_id)
     spans = conn.execute(
         "SELECT span_id, parent_span_id, span_name, service_name, "
         "duration, status_code, timestamp "
         "FROM traces WHERE trace_id = ? ORDER BY timestamp",
-        [args.trace_id],
+        [trace_id],
     ).fetchall()
     if not spans:
         raise NoTelemetryError(f"no spans found for trace_id '{args.trace_id}'")
@@ -1570,7 +1896,8 @@ def cmd_logs(
         params.append(args.grep)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     columns = ["timestamp", "service_name", "severity_text", "body", "trace_id"]
-    rows = conn.execute(
+    rows = _limited(
+        conn,
         # FR-7 orders newest-first; the trailing keys are a deterministic
         # tie-breaker so rows sharing a timestamp render in the same order on the
         # hot (parquet) and cold (raw) paths — byte-identical cached vs --no-cache.
@@ -1578,7 +1905,8 @@ def cmd_logs(
         f"FROM logs{clause} "
         f"ORDER BY timestamp DESC, service_name, severity_text, body, trace_id",
         params,
-    ).fetchall()
+        getattr(args, "top", _DEFAULT_TOP),
+    )
     return columns, rows
 
 
@@ -1594,7 +1922,8 @@ def cmd_metric(
         "value",
         "metric_unit",
     ]
-    rows = conn.execute(
+    rows = _limited(
+        conn,
         # FR-8 orders ascending by timestamp; the trailing keys are a
         # deterministic tie-breaker (metric_name is filtered to a constant) so
         # equal-timestamp points render in the same order on the hot (parquet)
@@ -1603,7 +1932,8 @@ def cmd_metric(
         "metric_unit FROM metrics WHERE metric_name = ? "
         "ORDER BY timestamp, service_name, value, metric_type, metric_unit",
         [args.name],
-    ).fetchall()
+        getattr(args, "top", _DEFAULT_TOP),
+    )
     return columns, rows
 
 
@@ -1716,6 +2046,102 @@ def _validate_active_file(path: Path, signal: str) -> tuple[str, str]:
     return "OK", f"valid OTLP/JSON ('{key}' present)"
 
 
+def _doctor_cache_health(telemetry_dir: Path, cache: Path) -> list[Row]:
+    """Non-fatal cache diagnostics for the failure modes that actually bite (D-4):
+    a read-only dir (cache silently disabled), a stale writer lock, an
+    incompatible cursor, and a far-future watermark (B-1) that hides real
+    telemetry. All are OK/INFO/WARN — never FAIL — because queries still answer
+    via the cold path regardless."""
+    rows: list[Row] = []
+    probe = cache if cache.is_dir() else telemetry_dir
+    if os.access(probe, os.W_OK):
+        rows.append(("cache writable", "OK", f"{probe} is writable"))
+    else:
+        rows.append(
+            (
+                "cache writable",
+                "WARN",
+                f"{probe} is not writable — the parquet cache is disabled and "
+                f"every query runs a full cold scan",
+            )
+        )
+
+    lock = cache / LOCK_FILENAME
+    if lock.exists():
+        try:
+            age = time.time() - lock.stat().st_mtime
+        except OSError:
+            age = 0.0
+        if age > _LOCK_STALE_SECS:
+            rows.append(
+                (
+                    "cache lock",
+                    "WARN",
+                    f"a writer lock has been held ~{int(age)}s (stale; it is "
+                    f"reaped automatically on the next query)",
+                )
+            )
+        else:
+            rows.append(("cache lock", "INFO", "held (a query is ingesting now)"))
+
+    cursor_file = cache / CURSOR_FILENAME
+    payload: dict[str, Any] | None = None
+    if cursor_file.exists():
+        try:
+            loaded: object = json.loads(cursor_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            rows.append(
+                (
+                    "cache cursor",
+                    "WARN",
+                    "cursor.json is unreadable — the cache rebuilds on the next query",
+                )
+            )
+        else:
+            if isinstance(loaded, dict):
+                payload = cast(dict[str, Any], loaded)
+            ver = payload.get("version") if payload is not None else None
+            if ver == CURSOR_SCHEMA_VERSION:
+                rows.append(("cache cursor", "OK", f"schema v{ver}"))
+            else:
+                rows.append(
+                    (
+                        "cache cursor",
+                        "WARN",
+                        f"schema v{ver} != current v{CURSOR_SCHEMA_VERSION} — the "
+                        f"cache rebuilds on the next query",
+                    )
+                )
+
+    watermarks: list[datetime] = []
+    if payload is not None:
+        streams = payload.get("streams")
+        if isinstance(streams, dict):
+            for state in cast(dict[str, Any], streams).values():
+                if isinstance(state, dict):
+                    ts = _parse_ts(cast(dict[str, Any], state).get("max_event_ts_seen"))
+                    if ts is not None:
+                        watermarks.append(ts)
+    if watermarks:
+        newest = max(watermarks)
+        if newest > _future_ceiling():
+            rows.append(
+                (
+                    "clock skew",
+                    "WARN",
+                    f"newest event-time {_fmt_ts(newest)} is more than "
+                    f"{MAX_FUTURE_SKEW} ahead of wall-clock — a skewed producer or "
+                    f"bad instrumentation can hide real telemetry; the query window "
+                    f"is clamped to compensate (see `otelq troubleshoot`)",
+                )
+            )
+        else:
+            rows.append(
+                ("clock skew", "OK", "newest event-time is within range of wall-clock")
+            )
+    return rows
+
+
 def doctor_report(telemetry_dir: Path) -> tuple[list[Row], bool]:
     """Check a telemetry dir against the contract. Returns (rows, ok)."""
     rows: list[Row] = []
@@ -1747,6 +2173,7 @@ def doctor_report(telemetry_dir: Path) -> tuple[list[Row], bool]:
     rows.append(
         (".otelq-cache", "INFO", "present" if cache.is_dir() else "absent (built on first query)")
     )
+    rows.extend(_doctor_cache_health(telemetry_dir, cache))
     return rows, ok
 
 
@@ -1785,23 +2212,30 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=textwrap.dedent(
             """\
             argument order:
-              --dir / --format / --all / --no-cache / --since are GLOBAL flags and
-              must come BEFORE the subcommand:  otelq --since 10m --format json errors
+              --dir / --format / --all / --no-cache / --since / --verbose are
+              GLOBAL flags and must come BEFORE the subcommand:
+                otelq --since 10m --format json errors
               (not: otelq errors --since 10m). Per-command flags (--top, --service,
-              --level, --grep) go AFTER the subcommand. Prefer --format json so output
-              is parsed, not scraped.
+              --level, --grep) go AFTER the subcommand. Prefer --format json (or
+              jsonl, one compact object per line) so output is parsed, not scraped.
 
             time window (filters by each record's own event-time):
-              (default)         a recent window (the cache's hot window)
-              --since Nm|Nh|Nd  only the trailing window, e.g. 10m, 2h, 1d
-              --all             the full captured history (no window)
-              `trace` ignores the window — a trace id is looked up across all history.
+              (default)            a recent window (the cache's hot window)
+              --since Ns|Nm|Nh|Nd  only the trailing window, e.g. 30s, 10m, 2h, 1d
+              --all                the full captured history (no window)
+              `trace` ignores the window — a trace id is looked up across all
+              history, and a unique id prefix is accepted.
+
+            row limits:
+              errors / slow / logs / metric cap output with --top N and print a
+              one-line notice to stderr when the result was truncated.
 
             sql views (for `otelq sql "<query>"`):
               traces   timestamp, duration (ms), trace_id, span_id, parent_span_id,
                        service_name, span_name, span_kind,
                        status_code (0=unset,1=ok,2=error), status_message
-              logs     timestamp, trace_id, service_name, severity_text, body
+              logs     timestamp, trace_id, service_name, severity_text,
+                       severity_number, body
               metrics  timestamp, service_name, metric_name, metric_type, value,
                        metric_unit  (metric_type: gauge|sum|histogram|exp_histogram;
                        value = the value of gauge/sum, the sum of histogram/exp)
@@ -1810,10 +2244,20 @@ def build_parser() -> argparse.ArgumentParser:
                 metrics_histogram, metrics_exp_histogram  count, sum, min, max
                        (+ bucket_counts/explicit_bounds, or scale/zero_count/…)
               (the OTel Summary metric type is unsupported by the reader extension)
+              the built-in commands read only the telemetry under --dir. `sql`
+              is an escape hatch that runs with YOUR user's file access (it can
+              read/write local files via read_csv/COPY), so treat untrusted
+              queries with the same care as a shell command.
 
             Run `otelq troubleshoot` for the capture → query loop and common fixes.
             """
         ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"otelq {__version__}",
+        help="print otelq's version and exit",
     )
     parser.add_argument(
         "--dir",
@@ -1823,8 +2267,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--format",
-        choices=["table", "json", "csv"],
+        choices=["table", "json", "jsonl", "csv"],
         default="table",
+        help="output format (default: table; json/jsonl are compact for agents)",
     )
     parser.add_argument(
         "--all",
@@ -1836,12 +2281,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="bypass the parquet cache entirely (pure cold scan)",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="print the resolved time window and route to stderr",
+    )
     # --since is a GLOBAL flag: it shapes the query's time window (the twin of
     # --all), so like the other query-shaping flags it precedes the subcommand
     # and appears in the top-level usage line. See SPEC-otelq-cli FR-11/FR-15.
     parser.add_argument(
         "--since",
-        help="restrict to a trailing time window: Nm/Nh/Nd (e.g. 10m, 2h, 1d)",
+        help="restrict to a trailing time window: Ns/Nm/Nh/Nd (e.g. 30s, 10m, 2h, 1d)",
     )
 
     # Not required: a bare `otelq` (command is None) prints full help in main().
@@ -1855,19 +2305,28 @@ def build_parser() -> argparse.ArgumentParser:
             "metrics_histogram, metrics_exp_histogram"
         ),
     )
-    sub.add_parser("errors", help="error spans and ERROR/FATAL logs")
+    p_errors = sub.add_parser("errors", help="error spans and ERROR/FATAL logs")
+    p_errors.add_argument(
+        "--top", type=_non_negative_int, default=_DEFAULT_TOP, help="rows to show"
+    )
     p_slow = sub.add_parser("slow", help="slowest spans")
     p_slow.add_argument(
         "--top", type=_non_negative_int, default=20, help="rows to show"
     )
     p_trace = sub.add_parser("trace", help="all spans of one trace as a tree")
-    p_trace.add_argument("trace_id", help="trace id to expand")
+    p_trace.add_argument("trace_id", help="trace id (a unique prefix is accepted)")
     p_logs = sub.add_parser("logs", help="filtered log records")
     p_logs.add_argument("--service", help="filter by service name")
     p_logs.add_argument("--level", help="filter by severity, e.g. ERROR")
     p_logs.add_argument("--grep", help="case-insensitive substring of the body")
+    p_logs.add_argument(
+        "--top", type=_non_negative_int, default=_DEFAULT_TOP, help="rows to show"
+    )
     p_metric = sub.add_parser("metric", help="time series for one metric")
     p_metric.add_argument("name", help="metric name")
+    p_metric.add_argument(
+        "--top", type=_non_negative_int, default=_DEFAULT_TOP, help="rows to show"
+    )
     sub.add_parser(
         "collector-config",
         help="print the file-export fragment to add to an existing Collector",

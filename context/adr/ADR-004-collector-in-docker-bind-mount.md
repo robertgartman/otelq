@@ -12,11 +12,12 @@ must_not_contain:
   - implementation_walkthroughs
   - reversible_decisions
 created: 2026-06-23
-last_updated: 2026-06-23
+last_updated: 2026-07-02
 related_documents:
   - ADR-001-host-cli-reads-bind-mounted-files
   - ADR-005-incremental-parquet-cache
   - ADR-006-read-otlp-extension-quirks
+  - ADR-008-unified-cache-first-read-and-retention
   - SPEC-otelq-incremental-cache
   - CONTRACT-telemetry-directory
 supersedes: null
@@ -88,7 +89,8 @@ The following constraints are **load-bearing** and must not be changed casually:
   active file at 50 MB keeps every individual `.jsonl` (active file and rotated
   backups alike) comfortably under that read ceiling, and keeps a full
   per-query re-scan of the corpus viable. The incremental cache
-  ([ADR-005](ADR-005-incremental-parquet-cache.md)) further relies on rotation
+  ([ADR-005](../archive/ADR-005-incremental-parquet-cache.md), superseded by
+  [ADR-008](ADR-008-unified-cache-first-read-and-retention.md)) further relies on rotation
   being size-triggered and offset-stable.
 - **`memory_limiter` must be the first processor in every pipeline.** The
   Collector's own guidance requires the memory limiter to run ahead of any

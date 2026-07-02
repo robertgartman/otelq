@@ -54,13 +54,13 @@ sleep 7                                    # let the Collector flush its 5s batc
 docker compose -f compose.yaml -f compose.demo.yaml --profile otel --profile demo down
 
 printf '%s\n' "=== Demo queries ===" \
-  "uv run otelq.py otelq summary" \
-  "uv run otelq.py otelq errors" \
-  "uv run otelq.py otelq slow --top 10" \
-  "uv run otelq.py otelq trace <trace_id>" \
-  "uv run otelq.py otelq logs --level ERROR --grep 'timeout'" \
-  "uv run otelq.py otelq metric <name>" \
-  "uv run otelq.py otelq sql 'select * from traces limit 5'" \
+  "uv run otelq.py summary" \
+  "uv run otelq.py errors" \
+  "uv run otelq.py slow --top 10" \
+  "uv run otelq.py trace <trace_id>" \
+  "uv run otelq.py --format json logs --level ERROR --grep 'timeout'" \
+  "uv run otelq.py metric <name>" \
+  "uv run otelq.py sql 'select * from traces limit 5'" \
   "== Running Summary =="
 
 uv run otelq.py summary                    # uv runs the single-file CLI — no install
@@ -171,12 +171,14 @@ uv run otelq.py summary
 
 ## Commands
 
-This is a dump from running `uvx otelq.py --help` within the project root:
+This is a dump from running `uv run otelq.py --help` within the project root:
 
 ```text
 
-usage: otelq [-h] [--dir DIR] [--format {table,json,csv}] [--all] [--no-cache] [--since SINCE]
-             {summary,sql,errors,slow,trace,logs,metric,collector-config,doctor,troubleshoot,help} ...
+usage: otelq [-h] [--version] [--dir DIR] [--format {table,json,jsonl,csv}] [--all] [--no-cache]
+             [--verbose] [--since SINCE]
+             {summary,sql,errors,slow,trace,logs,metric,collector-config,doctor,troubleshoot,help}
+             ...
 
 Query OTLP telemetry captured by the dev OTel Collector.
 
@@ -196,30 +198,40 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  --dir DIR             telemetry folder (default: /Users/robertgartman/dev/otelq/telemetry)
-  --format {table,json,csv}
+  --version             print otelq's version and exit
+  --dir DIR             telemetry folder (default: <cwd>/telemetry)
+  --format {table,json,jsonl,csv}
+                        output format (default: table; json/jsonl are compact for agents)
   --all                 widen the query to the full raw history (cold scan)
   --no-cache            bypass the parquet cache entirely (pure cold scan)
-  --since SINCE         restrict to a trailing time window: Nm/Nh/Nd (e.g. 10m, 2h, 1d)
+  --verbose             print the resolved time window and route to stderr
+  --since SINCE         restrict to a trailing time window: Ns/Nm/Nh/Nd (e.g. 30s, 10m, 2h, 1d)
 
 argument order:
-  --dir / --format / --all / --no-cache / --since are GLOBAL flags and
-  must come BEFORE the subcommand:  otelq --since 10m --format json errors
+  --dir / --format / --all / --no-cache / --since / --verbose are
+  GLOBAL flags and must come BEFORE the subcommand:
+    otelq --since 10m --format json errors
   (not: otelq errors --since 10m). Per-command flags (--top, --service,
-  --level, --grep) go AFTER the subcommand. Prefer --format json so output
-  is parsed, not scraped.
+  --level, --grep) go AFTER the subcommand. Prefer --format json (or
+  jsonl, one compact object per line) so output is parsed, not scraped.
 
 time window (filters by each record's own event-time):
-  (default)         a recent window (the cache's hot window)
-  --since Nm|Nh|Nd  only the trailing window, e.g. 10m, 2h, 1d
-  --all             the full captured history (no window)
-  `trace` ignores the window — a trace id is looked up across all history.
+  (default)            a recent window (the cache's hot window)
+  --since Ns|Nm|Nh|Nd  only the trailing window, e.g. 30s, 10m, 2h, 1d
+  --all                the full captured history (no window)
+  `trace` ignores the window — a trace id is looked up across all
+  history, and a unique id prefix is accepted.
+
+row limits:
+  errors / slow / logs / metric cap output with --top N and print a
+  one-line notice to stderr when the result was truncated.
 
 sql views (for `otelq sql "<query>"`):
   traces   timestamp, duration (ms), trace_id, span_id, parent_span_id,
            service_name, span_name, span_kind,
            status_code (0=unset,1=ok,2=error), status_message
-  logs     timestamp, trace_id, service_name, severity_text, body
+  logs     timestamp, trace_id, service_name, severity_text,
+           severity_number, body
   metrics  timestamp, service_name, metric_name, metric_type, value,
            metric_unit  (metric_type: gauge|sum|histogram|exp_histogram;
            value = the value of gauge/sum, the sum of histogram/exp)
@@ -228,11 +240,16 @@ sql views (for `otelq sql "<query>"`):
     metrics_histogram, metrics_exp_histogram  count, sum, min, max
            (+ bucket_counts/explicit_bounds, or scale/zero_count/…)
   (the OTel Summary metric type is unsupported by the reader extension)
+  the built-in commands read only the telemetry under --dir. `sql`
+  is an escape hatch that runs with YOUR user's file access (it can
+  read/write local files via read_csv/COPY), so treat untrusted
+  queries with the same care as a shell command.
 
 Run `otelq troubleshoot` for the capture → query loop and common fixes.
 ```
 
-Run  the full, authoritative command behavior.
+Run `otelq help <command>` (or `otelq <command> -h`) for the full, authoritative
+behavior of any command.
 
 ## DuckDB pin note
 

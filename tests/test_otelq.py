@@ -1812,3 +1812,241 @@ def test_main_handles_broken_pipe() -> None:
     with redirect_stdout(_BrokenStream()):
         rc = otelq.main(["collector-config"])  # prints, so it hits the broken write
     assert rc == 0  # swallowed, no traceback escaped
+
+
+# --- review findings: F-1..F-5, P-5, D-2, D-4, B-1 --------------------------
+
+
+def _run_err(dirpath: Path, *argv: str) -> tuple[str, str]:
+    """Run the CLI in-process; return (stdout, stderr)."""
+    import io as _io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    out, err = _io.StringIO(), _io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        otelq.main(["--dir", str(dirpath), "--format", "json", *argv])
+    return out.getvalue(), err.getvalue()
+
+
+def test_f3_version_matches_pyproject() -> None:
+    # F-3: `otelq --version` reports __version__, kept in lockstep with the
+    # packaged version in pyproject.toml so an agent can name the exact build.
+    import tomllib
+
+    pyproject = Path(otelq.__file__).resolve().parent / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    assert data["project"]["version"] == otelq.__version__
+
+
+def test_f3_version_flag_prints_and_exits_zero() -> None:
+    import io as _io
+    from contextlib import redirect_stdout
+
+    buf = _io.StringIO()
+    with redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        otelq.main(["--version"])
+    assert exc.value.code == 0
+    assert f"otelq {otelq.__version__}" in buf.getvalue()
+
+
+def test_f1_top_caps_rows_and_warns_on_stderr(temp_telemetry: Path) -> None:
+    # F-1: --top caps a command's rows and, only when it actually truncated,
+    # prints a one-line notice to STDERR (never stdout, so json stays parseable).
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [make_log(base + timedelta(seconds=i), body=f"m{i}") for i in range(6)],
+    )
+    out, err = _run_err(temp_telemetry, "logs", "--top", "2")
+    assert len(_json.loads(out)) == 2
+    assert "truncated to 2 rows" in err
+    # Under the cap: full result, no notice on stderr.
+    out2, err2 = _run_err(temp_telemetry, "logs", "--top", "50")
+    assert len(_json.loads(out2)) == 6
+    assert "truncated" not in err2
+
+
+def test_f2_since_accepts_seconds_unit() -> None:
+    # F-2: --since gains a seconds unit (Ns) alongside m/h/d.
+    assert otelq._parse_since("45s") == timedelta(seconds=45)
+    assert otelq._parse_since("2m") == timedelta(minutes=2)
+    with pytest.raises(SystemExit):
+        otelq._parse_since("10x")
+
+
+def test_f2_since_seconds_windows_end_to_end(temp_telemetry: Path) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            make_log(base, body="oldest"),
+            make_log(base + timedelta(seconds=10), body="mid"),
+            make_log(base + timedelta(seconds=40), body="newest"),
+        ],
+    )
+    # Anchor is the max event-time (base+40s); a 30s window keeps mid+newest.
+    bodies = [r["body"] for r in _json.loads(_run(temp_telemetry, "--since", "30s", "logs"))]
+    assert "oldest" not in bodies
+    assert set(bodies) == {"mid", "newest"}
+    assert _run(temp_telemetry, "--since", "30s", "logs") == _run(
+        temp_telemetry, "--no-cache", "--since", "30s", "logs"
+    )
+
+
+def _raw_span(ts: datetime, tid: str, sid: str, name: str = "GET /x") -> dict[str, Any]:
+    """A span with an explicit (already-hex) trace id, for prefix-match tests."""
+    end = ts + timedelta(milliseconds=5)
+    span: dict[str, Any] = {
+        "traceId": tid,
+        "spanId": sid,
+        "parentSpanId": "",
+        "name": name,
+        "kind": 2,
+        "startTimeUnixNano": _ns(ts),
+        "endTimeUnixNano": _ns(end),
+        "attributes": [],
+        "flags": 0,
+        "status": {},
+    }
+    return {
+        "resourceSpans": [
+            {
+                "resource": _resource("app-test"),
+                "scopeSpans": [{"scope": {"name": "test"}, "spans": [span]}],
+            }
+        ]
+    }
+
+
+def test_f4_trace_prefix_resolves_and_flags_ambiguity(temp_telemetry: Path) -> None:
+    # F-4: `trace` accepts a unique id prefix; two matches raise a friendly error.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    tid_a1 = "aaaa" + "0" * 27 + "1"  # shares the "aaaa..." prefix with tid_a2
+    tid_a2 = "aaaa" + "0" * 27 + "2"
+    tid_b = "bbbb" + "0" * 28
+    write_jsonl(
+        temp_telemetry / "traces.jsonl",
+        [
+            _raw_span(base, tid_a1, "1" + "0" * 15, name="span-a1"),
+            _raw_span(base + timedelta(seconds=1), tid_a2, "2" + "0" * 15, name="span-a2"),
+            _raw_span(base + timedelta(seconds=2), tid_b, "3" + "0" * 15, name="span-b"),
+        ],
+    )
+    # A unique prefix resolves to the one trace (its single span).
+    rows = _json.loads(_run(temp_telemetry, "--all", "trace", "bbbb"))
+    assert [r["span_name"].strip() for r in rows] == ["span-b"]
+    # An exact id still works.
+    exact = _json.loads(_run(temp_telemetry, "--all", "trace", tid_a1))
+    assert [r["span_name"].strip() for r in exact] == ["span-a1"]
+    # An ambiguous prefix is a friendly SystemExit, not a silent pick.
+    with pytest.raises(SystemExit) as exc:
+        otelq.main(["--dir", str(temp_telemetry), "--all", "trace", "aaaa"])
+    assert "ambiguous" in str(exc.value)
+
+
+def test_p5_format_json_compact_and_jsonl() -> None:
+    # P-5: json is compact (no spaces) and a jsonl format streams one object/line.
+    cols = ["a", "b"]
+    rows = [(1, 2), (3, 4)]
+    assert otelq.format_output(cols, rows, "json") == '[{"a":1,"b":2},{"a":3,"b":4}]'
+    assert otelq.format_output(cols, rows, "jsonl") == '{"a":1,"b":2}\n{"a":3,"b":4}'
+
+
+def test_p5_format_jsonl_via_cli(temp_telemetry: Path) -> None:
+    import io as _io
+    from contextlib import redirect_stdout
+
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base), make_log(base + timedelta(seconds=1))])
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        otelq.main(["--dir", str(temp_telemetry), "--format", "jsonl", "logs"])
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    assert len(lines) == 2
+    for ln in lines:
+        assert isinstance(_json.loads(ln), dict)  # each line is a standalone object
+
+
+def test_d2_sql_boundary_locks_builtins_not_sql(tmp_path: Path) -> None:
+    # D-2: built-in commands run with filesystem access revoked; `sql` keeps it as
+    # a documented escape hatch.
+    csv_file = tmp_path / "data.csv"
+    csv_file.write_text("n\n1\n2\n", encoding="utf-8")
+    read = f"SELECT count(*) AS c FROM read_csv('{csv_file}')"
+
+    locked = duckdb.connect(":memory:")
+    otelq._seal_external_access(locked, "summary")
+    with pytest.raises(duckdb.Error):
+        locked.execute(read)
+
+    allowed = duckdb.connect(":memory:")
+    otelq._seal_external_access(allowed, "sql")
+    row = allowed.execute(read).fetchone()
+    assert row is not None and row[0] == 2
+
+
+def test_d4_doctor_reports_cache_health(temp_telemetry: Path) -> None:
+    # D-4: doctor surfaces cache writability without ever failing a valid dir.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base)])
+    rows, ok = otelq.doctor_report(temp_telemetry)
+    assert ok
+    assert any(r[0] == "cache writable" and r[1] == "OK" for r in rows)
+
+
+def test_d4_and_b1_doctor_flags_clock_skew(temp_telemetry: Path) -> None:
+    # D-4 + B-1: a far-future watermark in the cursor is flagged (WARN), never a
+    # FAIL — queries still answer via the clamped window.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base)])
+    cache = temp_telemetry / CACHE
+    cache.mkdir()
+    far = otelq._fmt_ts(otelq._future_ceiling() + timedelta(days=5))
+    payload: dict[str, Any] = {
+        "version": otelq.CURSOR_SCHEMA_VERSION,
+        "streams": {
+            s: {"files": {}, "max_event_ts_seen": far} for s in otelq.CURSOR_STREAMS
+        },
+    }
+    (cache / otelq.CURSOR_FILENAME).write_text(_json.dumps(payload), encoding="utf-8")
+    rows, ok = otelq.doctor_report(temp_telemetry)
+    assert ok  # skew is a WARN, not a FAIL
+    assert any(r[0] == "clock skew" and r[1] == "WARN" for r in rows)
+
+
+def test_b1_window_anchor_clamped_to_ceiling(temp_telemetry: Path) -> None:
+    # B-1: a single far-future record must not push the query window past all real
+    # data. The window's upper anchor is clamped to wall-clock + tolerance, so a
+    # record near the ceiling stays visible while the poison record is excluded;
+    # --all (windowless) still sees both. Identical hot vs cold (FR-11).
+    # aware UTC so make_log's naive-vs-aware timestamp conversion matches the
+    # naive-UTC ceiling the clamp computes at query time.
+    ceiling = datetime.now(timezone.utc) + otelq.MAX_FUTURE_SKEW
+    in_window = ceiling - timedelta(minutes=5)  # within the default hot window
+    poison = ceiling + timedelta(days=10)  # implausible outlier
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [make_log(in_window, body="real"), make_log(poison, body="poison")],
+    )
+
+    def count(*argv: str) -> int:
+        return _json.loads(_run(temp_telemetry, *argv, "sql", "SELECT count(*) AS n FROM logs"))[0]["n"]
+
+    assert count() == 1  # default window: poison clamped out, real record kept
+    assert count("--all") == 2  # windowless: both present
+    windowed = _run(temp_telemetry, "sql", "SELECT count(*) AS n FROM logs")
+    assert windowed == _run(temp_telemetry, "--no-cache", "sql", "SELECT count(*) AS n FROM logs")
+
+
+def test_b5_single_quote_in_dir_path_is_sql_safe(tmp_path: Path) -> None:
+    # B-5 / SPEC-cli FR-28, EC-21, AC-36: a --dir whose path contains a single
+    # quote must not break the SQL that splices raw-file paths. The query must
+    # still return rows and stay identical cached vs --no-cache (FR-11).
+    d = tmp_path / "o'brien" / "telemetry"
+    d.mkdir(parents=True)
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(d / "logs.jsonl", [make_log(base, body="hi"), make_log(base, body="yo")])
+    cached = _run(d, "--all", "sql", "SELECT count(*) AS n FROM logs")
+    nocache = _run(d, "--all", "--no-cache", "sql", "SELECT count(*) AS n FROM logs")
+    assert _json.loads(cached) == [{"n": 2}]  # no SQL breakage on the quoted path
+    assert cached == nocache

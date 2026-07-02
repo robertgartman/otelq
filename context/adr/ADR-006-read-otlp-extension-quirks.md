@@ -12,11 +12,12 @@ must_not_contain:
   - implementation_walkthroughs
   - reversible_decisions
 created: 2026-06-23
-last_updated: 2026-06-23
+last_updated: 2026-07-02
 related_documents:
   - ADR-003-duckdb-otlp-extension-pin-governance
   - ADR-004-collector-in-docker-bind-mount
   - ADR-005-incremental-parquet-cache
+  - ADR-008-unified-cache-first-read-and-retention
   - SPEC-otelq-incremental-cache
 supersedes: null
 superseded_by: null
@@ -115,6 +116,7 @@ drift between paths.
   in [ADR-004](ADR-004-collector-in-docker-bind-mount.md) keeps batches within
   range.
 - Because both fixes live in the shared read path, the incremental cache
-  ([ADR-005](ADR-005-incremental-parquet-cache.md)) inherits correct, fixed-
+  ([ADR-005](../archive/ADR-005-incremental-parquet-cache.md), superseded by
+  [ADR-008](ADR-008-unified-cache-first-read-and-retention.md)) inherits correct, fixed-
   timestamp rows for free, and its equivalence invariant (cached vs `--no-cache`)
   holds without the cache having to know anything about the extension's quirks.

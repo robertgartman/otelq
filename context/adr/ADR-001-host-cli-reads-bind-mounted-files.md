@@ -12,12 +12,13 @@ must_not_contain:
   - implementation_walkthroughs
   - reversible_decisions
 created: 2026-06-23
-last_updated: 2026-06-23
+last_updated: 2026-07-02
 related_documents:
   - ADR-002-pep723-uv-single-file-distribution
   - ADR-003-duckdb-otlp-extension-pin-governance
   - ADR-004-collector-in-docker-bind-mount
   - ADR-005-incremental-parquet-cache
+  - ADR-008-unified-cache-first-read-and-retention
   - CONTRACT-telemetry-directory
   - SPEC-otelq-cli
 supersedes: null
@@ -125,7 +126,8 @@ default would point into the install location, e.g. site-packages.)
   (Collector) and the file consumer (CLI) never contend for a handle, and either
   may be started, stopped, or replaced independently. The cost of repeatedly
   re-scanning the corpus is what later motivates the incremental cache in
-  [ADR-005](ADR-005-incremental-parquet-cache.md) — an accelerator layered *on*
+  [ADR-005](../archive/ADR-005-incremental-parquet-cache.md) (superseded by
+  [ADR-008](ADR-008-unified-cache-first-read-and-retention.md)) — an accelerator layered *on*
   this seam, not a change *to* it.
 - **The query tool stays a distributable artifact, not a deployment.** Because
   nothing in this path is a service, the tool can be shipped as a single file or

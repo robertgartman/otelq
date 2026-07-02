@@ -12,7 +12,7 @@ must_not_contain:
   - architectural_rationale
   - external_data_schemas
 created: 2026-06-23
-last_updated: 2026-06-25
+last_updated: 2026-07-02
 related_documents:
   - PRD-otelq
   - SPEC-otelq-incremental-cache
@@ -55,15 +55,17 @@ Product intent lives in [PRD-otelq](../prd/PRD-otelq.md).
 **Covered:** the named query relations/views and their column sets as exposed to
 `sql` and the built-in commands; the behavior, inputs, and output columns of the
 seven subcommands (`summary`, `errors`, `slow`, `trace`, `logs`, `metric`,
-`sql`); the global flags (`--format`, `--dir`, `--all`, `--no-cache`, `--since`)
-and the rule that global flags precede the subcommand; the three output formats
-and their format-independence; timestamp correction in the presented output; and
-otelq's exit-code and stderr behavior when telemetry is absent, partial, or
-malformed.
+`sql`); the global flags (`--format`, `--dir`, `--all`, `--no-cache`, `--since`,
+`--verbose`, `--version`) and the rule that global flags precede the subcommand;
+the per-command output row bound (`--top`); the four output formats and their
+format-independence; the `sql` filesystem-access boundary and the external-access
+lockdown for built-in commands; timestamp correction (and far-future clamping) in
+the presented output; and otelq's exit-code and stderr behavior when telemetry is
+absent, partial, or malformed.
 
 **Not covered:** the raw telemetry directory and OTLP JSONL schema (an external
 input — see [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md));
-the parquet cache mechanics, sealing, eviction, and hot/cold routing (see
+the parquet cache mechanics, sealing, eviction, and cache-first read routing (see
 [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md)); the
 `duckdb-otlp` extension itself and the rationale for working around it (see
 [ADR-006](../adr/ADR-006-read-otlp-extension-quirks.md)); and the OTel Collector
@@ -78,9 +80,9 @@ configuration that produces the raw files.
 - **Subcommand / command** — one of the seven verbs otelq accepts
   (`summary`, `errors`, `slow`, `trace`, `logs`, `metric`, `sql`).
 - **Global flag** — a flag accepted before the subcommand (`--format`, `--dir`,
-  `--all`, `--no-cache`, `--since`); contrast subcommand-specific flags
-  (`--top`, `--service`, `--level`, `--grep`, the `trace_id`/`name`/`query`
-  positionals), which follow the subcommand.
+  `--all`, `--no-cache`, `--since`, `--verbose`, `--version`); contrast
+  subcommand-specific flags (`--top`, `--service`, `--level`, `--grep`, the
+  `trace_id`/`name`/`query` positionals), which follow the subcommand.
 - **Default telemetry dir** — the `telemetry/` directory under the current
   working directory (`<cwd>/telemetry`, per
   [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md)),
@@ -203,7 +205,11 @@ configuration that produces the raw files.
   argument and return every span of that trace arranged as a parent/child tree
   (each span ordered under its parent by `timestamp`, with a depth indicator). A
   span whose `parent_span_id` is absent or not present among the trace's own
-  spans **must** be treated as a root.
+  spans **must** be treated as a root. The `trace_id` argument **must** accept a
+  unique **prefix** of a trace id in addition to a full id: an exact match wins;
+  otherwise a prefix that matches exactly one trace id resolves to it, and a
+  prefix matching two or more **must** be rejected as a real error (FR-17) naming
+  the ambiguity. A prefix matching none takes the normal empty-result path (EC-3).
 - **FR-7 — `logs`.** `logs` **must** return log records ordered newest-first by
   `timestamp`, filtered by the optional subcommand flags `--service`
   (exact `service_name`), `--level` (exact `severity_text`, case-insensitive
@@ -220,9 +226,13 @@ configuration that produces the raw files.
 ### Global flags and argument order
 
 - **FR-10 — `--format`.** A `--format` global flag **must** accept exactly
-  `table`, `json`, or `csv`, defaulting to `table`, and **must** select the
-  rendering of the result. `table` is for human reading; `json` is for
-  programmatic consumption.
+  `table`, `json`, `jsonl`, or `csv`, defaulting to `table`, and **must** select
+  the rendering of the result. `table` is for human reading; `json` is a single
+  compact JSON array for programmatic consumption (compact separators, no
+  insignificant whitespace, to minimize tokens for the AI-agent consumer per
+  [PRD-otelq](../prd/PRD-otelq.md)); `jsonl` emits one compact JSON object per
+  line for streaming/line-oriented consumers; `csv` is the spreadsheet/interchange
+  format.
 - **FR-11 — Global flags precede the subcommand.** `--format`, `--dir`,
   `--all`, `--no-cache`, and `--since` are global flags and **must** be accepted
   *before* the subcommand. Supplying a global flag *after* the subcommand
@@ -235,14 +245,14 @@ configuration that produces the raw files.
 - **FR-13 — `--all`.** An `--all` global flag **must** widen the query to the
   full raw history. (The routing this triggers is specified in
   [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md) FR-9.)
-- **FR-14 — `--no-cache`.** A `--no-cache` global flag **must** force a pure cold
-  scan of the raw files that neither reads nor writes any cache. (Cache
+- **FR-14 — `--no-cache`.** A `--no-cache` global flag **must** force a pure
+  raw-only scan of the raw files that neither reads nor writes any cache. (Cache
   interaction is specified in
   [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md) FR-17.)
-- **FR-15 — `--since`.** A `--since <Nm|Nh|Nd>` global flag **must** restrict the
-  query to a trailing window of `N` minutes (`m`), hours (`h`), or days (`d`). A
-  malformed `--since` value **must** be rejected as a real error (FR-17) with a
-  message naming the accepted forms.
+- **FR-15 — `--since`.** A `--since <Ns|Nm|Nh|Nd>` global flag **must** restrict
+  the query to a trailing window of `N` seconds (`s`), minutes (`m`), hours (`h`),
+  or days (`d`). A malformed `--since` value **must** be rejected as a real error
+  (FR-17) with a message naming the accepted forms.
 
 ### Presentation and robustness
 
@@ -251,7 +261,15 @@ configuration that produces the raw files.
   event. otelq **must** correct the nanosecond-in-millisecond-column value
   surfaced by the reader extension (see
   [ADR-006](../adr/ADR-006-read-otlp-extension-quirks.md)); a raw 2026 event
-  **must not** render as a far-future year.
+  **must not** render as a far-future year. A single implausible far-future
+  event-time (a clock-skewed producer or a unit mistake) **must not** blank out
+  otherwise-valid queries: the trailing-window anchor is clamped to a plausible
+  ceiling (`wall-clock + tolerance`) identically on the cache and `--no-cache`
+  paths, so a bogus record beyond the ceiling is excluded from a windowed result
+  rather than pushing the window past all real data. The clamp is defined once, as
+  the window/watermark anchor, in
+  [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md) (INV-7, EC-12);
+  `doctor` surfaces the condition as a non-fatal warning (FR-26).
 - **FR-17 — Exit codes.** otelq **must** exit `0` on success, including when a
   command produces zero result rows, prints a friendly "no telemetry" message
   (FR-18, FR-19), or prints help (a bare `otelq` or `otelq help`, FR-22). A
@@ -293,6 +311,59 @@ configuration that produces the raw files.
   **must** be rejected as a real error (FR-17) carrying argparse's invalid-choice
   message that names the valid commands. The `-h`/`--help` flags (top-level and
   per-subcommand) remain available and unchanged.
+
+### Output bounds, metadata, and safety
+
+- **FR-23 — Output row bound (`--top`).** `errors`, `logs`, and `metric` **must**
+  each accept a `--top N` subcommand flag that caps the number of returned rows,
+  defaulting to a sane bound (**50**) so a chatty window cannot flood an agent's
+  context (`slow` keeps its own default of **20**, FR-5). `N` **must** be a
+  non-negative integer; a negative value **must** be rejected as a real error
+  (FR-17). `--top 0` returns zero rows. When — and **only** when — the bound
+  actually truncates the result, otelq **must** print a one-line notice to
+  **stderr** (never stdout, so `json`/`jsonl`/`csv` stay machine-parseable). The
+  cap is applied after the command's own ordering, so the retained rows are the
+  first `N` of the fully-ordered result.
+- **FR-24 — `--version`.** A `--version` global flag **must** print otelq's own
+  version and exit `0`. The reported version **must** match the packaged
+  distribution version (so an agent can name the exact build it drives, relevant
+  to the DuckDB/extension pin governance of
+  [ADR-003](../adr/ADR-003-duckdb-otlp-extension-pin-governance.md)).
+- **FR-25 — `--verbose`.** A `--verbose` global flag **must**, without changing
+  the result rows or their rendering (INV-3), print a one-line description of the
+  resolved query plan — the event-time window it covered, and how much of it was
+  served from the cache versus gap-filled from raw — to **stderr**, so a result is
+  self-describing and window/route surprises are diagnosable. When a `trace`
+  lookup widens from an empty default window to the full history (FR-10 of
+  [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md)), `--verbose`
+  **must** also note that widening.
+- **FR-26 — `doctor` cache-health and clock-skew checks.** The `doctor` command
+  **must**, in addition to validating the telemetry directory against
+  [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md),
+  report non-fatal diagnostics for the cache failure modes that silently degrade
+  queries: cache-directory writability (a read-only dir disables the cache),
+  a stale writer lock, an incompatible cursor schema version, and a newest cached
+  event-time more than the clamp tolerance ahead of wall-clock (the FR-16 / cache
+  INV-7 condition). These checks **must** be reported as `OK`/`INFO`/`WARN`
+  only — never `FAIL` — because queries still answer from the raw files regardless,
+  and **must not** change `doctor`'s exit code, which stays governed by the
+  telemetry-contract validation.
+- **FR-27 — `sql` filesystem boundary and built-in lockdown.** The `sql` command
+  is an ad-hoc analysis escape hatch: it executes arbitrary SQL against the
+  exposed relations with the invoking user's filesystem access (it can read and
+  write local files via `read_csv`, `COPY`, etc.). otelq's help **must** document
+  this so a caller treats an untrusted query with the same care as a shell
+  command. Every **built-in** command (all commands other than `sql`) **must**
+  run with DuckDB's external filesystem/network access revoked once its query
+  relations are materialized, as defense-in-depth so a crafted relation cannot
+  reach other files. Revoking access **must not** change any built-in command's
+  result (its relations are already built by that point).
+- **FR-28 — SQL-safe telemetry paths.** otelq **must** operate correctly when the
+  telemetry directory (or any path it derives) contains characters that are
+  significant in SQL string literals — notably a single quote (common on macOS,
+  e.g. `Robert's Mac`). Such a path **must not** cause a SQL syntax error or
+  permit injection; every filesystem path spliced into SQL **must** be escaped or
+  bound. This holds identically on the cache and `--no-cache` paths.
 
 ## Edge Cases & Failure Modes
 
@@ -342,6 +413,35 @@ configuration that produces the raw files.
 - **EC-13 — Unknown help topic.** `otelq help not-a-command` **must** exit
   non-zero with argparse's invalid-choice error naming the valid commands; it
   **must not** silently fall back to general help and exit `0`. (FR-22, FR-17)
+- **EC-14 — `--top` truncation notice.** Given more matching rows than the bound,
+  `otelq logs --top 2` returns exactly two rows and prints a one-line truncation
+  notice to **stderr**; under the bound (e.g. `--top 50` over six rows) the full
+  result is returned and **no** notice is printed. The notice never appears on
+  stdout. (FR-23)
+- **EC-15 — `--since` seconds unit.** `--since 30s` restricts the query to the
+  trailing 30 seconds (anchored at the max in-window event-time), a tighter window
+  than the `1m` floor previously allowed. (FR-15)
+- **EC-16 — `--version`.** `otelq --version` prints `otelq <version>` and exits
+  `0`, where `<version>` equals the packaged distribution version. (FR-24)
+- **EC-17 — `--verbose` metadata.** `otelq --verbose summary` prints the same
+  result rows as without `--verbose`, plus a one-line window/route/cache
+  description to stderr; the stdout rows and their order are unchanged. (FR-25,
+  INV-3)
+- **EC-18 — `jsonl` format.** `--format jsonl` emits one compact JSON object per
+  line (each line independently parseable), while `--format json` emits a single
+  compact array; both carry the same logical rows in the same order as `table`.
+  (FR-10, INV-3)
+- **EC-19 — Trace-id prefix.** `trace <unique-prefix>` returns the matching
+  trace's tree; an exact id still works; a prefix matching two or more trace ids
+  exits non-zero with an ambiguity message; a prefix matching none takes the
+  empty-result path (EC-3). (FR-6, FR-17)
+- **EC-20 — Built-in lockdown vs `sql` escape hatch.** After a built-in command's
+  relations are built, DuckDB external file access is revoked, so a built-in
+  cannot be coerced into reading an unrelated file; `sql` retains file access so
+  `read_csv`/`COPY` continue to work as documented. (FR-27)
+- **EC-21 — Quote in `--dir`.** A telemetry directory whose path contains a single
+  quote (e.g. `.../Robert's Mac/telemetry`) is queried normally — no SQL syntax
+  error, identical result cached vs `--no-cache`. (FR-28)
 
 ## Acceptance Criteria
 
@@ -499,6 +599,57 @@ configuration that produces the raw files.
   `test_help_command_prints_general_help`,
   `test_help_command_topic_prints_subcommand_help`,
   `test_help_command_unknown_topic_errors`.*
+- **AC-27** (Verifies FR-23, EC-14): Given more matching log rows than the bound,
+  when `logs --top 2` runs, then exactly two rows are returned and a truncation
+  notice is written to stderr; when the bound is not exceeded (`--top 50`), the
+  full result is returned with no stderr notice.
+  *Verification hint: `test_f1_top_caps_rows_and_warns_on_stderr`; also
+  `test_bug2_slow_top_negative_rejected_at_parse` for the non-negative rule.*
+- **AC-28** (Verifies FR-24, EC-16): Given the CLI, when `otelq --version` runs,
+  then it prints `otelq <version>` and exits `0`, and `<version>` equals the
+  `pyproject.toml` project version.
+  *Verification hint: `test_f3_version_flag_prints_and_exits_zero`,
+  `test_f3_version_matches_pyproject`.*
+- **AC-29** (Verifies FR-25, EC-17, INV-3): Given any command, when `--verbose` is
+  supplied, then the stdout rows and order match the non-verbose run and a
+  window/route/cache line is written to stderr.
+  *Verification hint: run a command with and without `--verbose`; assert stdout is
+  identical and stderr carries the plan summary.*
+- **AC-30** (Verifies FR-26): Given a valid telemetry dir, when `doctor` runs,
+  then it reports cache-writability (and, when a far-future cursor watermark is
+  present, a clock-skew `WARN`) as non-fatal rows without changing the exit code.
+  *Verification hint: `test_d4_doctor_reports_cache_health`,
+  `test_d4_and_b1_doctor_flags_clock_skew`.*
+- **AC-31** (Verifies FR-27, EC-20): Given a built-in command, when it runs, then
+  DuckDB external file access is revoked after its relations are built (a
+  `read_csv` is denied); given `sql`, file access is retained (`read_csv`
+  succeeds).
+  *Verification hint: `test_d2_sql_boundary_locks_builtins_not_sql`.*
+- **AC-32** (Verifies FR-10, EC-18, INV-3): Given any result, when `--format json`
+  is selected it is a single compact JSON array, and `--format jsonl` emits one
+  compact JSON object per line; both carry the same rows in the same order as
+  `table`.
+  *Verification hint: `test_p5_format_json_compact_and_jsonl`,
+  `test_p5_format_jsonl_via_cli`.*
+- **AC-33** (Verifies FR-15, EC-15): Given `--since 30s`, when a command runs,
+  then the window is the trailing 30 seconds; `_parse_since` accepts the `s` unit
+  alongside `m/h/d` and rejects a malformed value.
+  *Verification hint: `test_f2_since_accepts_seconds_unit`,
+  `test_f2_since_seconds_windows_end_to_end`.*
+- **AC-34** (Verifies FR-6, EC-19): Given several traces, when `trace` is given a
+  unique id prefix it returns that trace; an exact id also works; an ambiguous
+  prefix exits non-zero with an ambiguity message.
+  *Verification hint: `test_f4_trace_prefix_resolves_and_flags_ambiguity`.*
+- **AC-35** (Verifies FR-16, EC-7): Given a corpus with one far-future record plus
+  in-window records, when a windowed command runs, then the far-future record is
+  excluded (the window anchor is clamped) while the in-window records are
+  returned, identically cached vs `--no-cache`; `--all` includes both.
+  *Verification hint: `test_b1_window_anchor_clamped_to_ceiling`.*
+- **AC-36** (Verifies FR-28, EC-21): Given a telemetry directory whose path
+  contains a single quote, when a command runs, then it returns the correct result
+  with no SQL error, identical cached vs `--no-cache`.
+  *Verification hint: cross-checked by the incremental-cache SPEC's path-escaping
+  criteria; assert a quoted `--dir` yields the same rows on both paths.*
 
 ### Examples
 
@@ -532,8 +683,9 @@ configuration that produces the raw files.
   the raw telemetry files it reads. Its output is a pure function of (the
   telemetry it reads, the command, and the flags).
 - **INV-2** — Output-format roles are fixed: `table` is the human-facing default;
-  `json` is the machine/automation format; `csv` is the spreadsheet/interchange
-  format. Choosing a format never changes which command runs.
+  `json` (a single compact array) and `jsonl` (one compact object per line) are
+  the machine/automation formats; `csv` is the spreadsheet/interchange format.
+  Choosing a format never changes which command runs.
 - **INV-3** — Format independence: the rows a command returns, and their order,
   do not depend on which `--format` is chosen; only the rendering differs.
 - **INV-4** — Friendly failure: absent telemetry yields a human-readable stderr

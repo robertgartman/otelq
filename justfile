@@ -42,9 +42,13 @@ otel-down:
 otel-clean:
     #!/usr/bin/env bash
     set -euo pipefail
-    collector=otel-collector
-    running=$(docker ps -q -f "name=^${collector}$" 2>/dev/null || true)
-    [ -n "$running" ] && docker stop "$collector" >/dev/null
+    # Stop EVERY collector that may hold telemetry/*.jsonl open: the standalone
+    # `just otel-up` container (otel-collector) AND the demo container
+    # (otelq-demo-collector, from compose.demo.yaml). Truncating a file a live
+    # collector still holds open leaves an orphaned fd / NUL hole (see below), so
+    # any running collector for this dir must be stopped first.
+    running=$(docker ps -q -f "name=^otel-collector$" -f "name=^otelq-demo-collector$" 2>/dev/null || true)
+    [ -n "$running" ] && docker stop $running >/dev/null
     # Active files: empty in place. Truncating while the Collector holds the fd
     # would leave a multi-KB NUL hole (its file exporter is not O_APPEND — it
     # writes at a tracked offset), which is why the stop above is required.
@@ -53,7 +57,7 @@ otel-clean:
     find telemetry -maxdepth 1 -type f -name '*.jsonl' \
         ! -name traces.jsonl ! -name logs.jsonl ! -name metrics.jsonl -delete
     rm -rf telemetry/.otelq-cache
-    [ -n "$running" ] && docker start "$collector" >/dev/null
+    [ -n "$running" ] && docker start $running >/dev/null
     echo "Reset telemetry/ (emptied active files in place; removed backups + .otelq-cache)"
 
 # Reset captured telemetry: empty the active files in place, drop rotated
@@ -61,7 +65,7 @@ otel-clean:
 # Collector is stopped first (held-open file exporters; orphaned-fd footgun).
 [windows]
 otel-clean:
-    @$c = "otel-collector"; $running = (docker ps -q -f "name=^$c$"); if ($running) { docker stop $c | Out-Null }; foreach ($sig in 'traces','logs','metrics') { Clear-Content -Path "telemetry/$sig.jsonl" -ErrorAction SilentlyContinue }; Get-ChildItem -Path telemetry -Filter *.jsonl -File | Where-Object { $_.Name -notin 'traces.jsonl','logs.jsonl','metrics.jsonl' } | Remove-Item -Force -ErrorAction SilentlyContinue; Remove-Item -Path "telemetry/.otelq-cache" -Recurse -Force -ErrorAction SilentlyContinue; if ($running) { docker start $c | Out-Null }; Write-Host "Reset telemetry/ (emptied active files in place; removed backups + .otelq-cache)"
+    @$running = (docker ps -q -f "name=^otel-collector$" -f "name=^otelq-demo-collector$"); if ($running) { docker stop $running | Out-Null }; foreach ($sig in 'traces','logs','metrics') { Clear-Content -Path "telemetry/$sig.jsonl" -ErrorAction SilentlyContinue }; Get-ChildItem -Path telemetry -Filter *.jsonl -File | Where-Object { $_.Name -notin 'traces.jsonl','logs.jsonl','metrics.jsonl' } | Remove-Item -Force -ErrorAction SilentlyContinue; Remove-Item -Path "telemetry/.otelq-cache" -Recurse -Force -ErrorAction SilentlyContinue; if ($running) { docker start $running | Out-Null }; Write-Host "Reset telemetry/ (emptied active files in place; removed backups + .otelq-cache)"
 
 # Query captured telemetry, e.g. `just otelq summary`
 otelq *ARGS:

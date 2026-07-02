@@ -2,7 +2,7 @@
 doc_type: adr
 authoritative: true
 stability: stable
-status: active
+status: superseded
 decision_scope: architecture
 audience:
   - ai
@@ -12,14 +12,14 @@ must_not_contain:
   - implementation_walkthroughs
   - reversible_decisions
 created: 2026-06-23
-last_updated: 2026-06-23
+last_updated: 2026-07-02
 related_documents:
   - SPEC-otelq-incremental-cache
   - ADR-004-collector-in-docker-bind-mount
   - ADR-006-read-otlp-extension-quirks
   - CONTRACT-telemetry-directory
 supersedes: null
-superseded_by: null
+superseded_by: ADR-008-unified-cache-first-read-and-retention
 ai_summary: "A per-minute parquet cache under telemetry/.otelq-cache/ accelerates recent/repeated queries while staying byte-identical to a full raw re-scan."
 semantic_tags:
   - otelq
@@ -33,13 +33,21 @@ semantic_tags:
 
 # ADR-005 — Incremental Parquet Cache
 
+> **Status: superseded** by
+> [ADR-008](../adr/ADR-008-unified-cache-first-read-and-retention.md), which
+> replaces the bounded-rolling-window and stateless-cold-path decisions (and the
+> bounded-footprint consequence) with a unified cache-first read and extended
+> event-time retention. The cursor, margin-based sealing, event-time watermark,
+> `O_EXCL` single-writer lock, and `--no-cache` oracle recorded here carry
+> forward unchanged under ADR-008. Retained for historical rationale only.
+
 ## Context
 
 `otelq` answers a query by parsing OTLP JSONL through the `duckdb-otlp` reader
-([ADR-006](ADR-006-read-otlp-extension-quirks.md)). The reader cannot tail,
+([ADR-006](../adr/ADR-006-read-otlp-extension-quirks.md)). The reader cannot tail,
 follow, or seek a file; every invocation re-parses whole files from byte zero.
 For the dev workflow — repeated, narrow, recent-window queries against a
-`telemetry/` corpus that only grows ([ADR-004](ADR-004-collector-in-docker-bind-mount.md))
+`telemetry/` corpus that only grows ([ADR-004](../adr/ADR-004-collector-in-docker-bind-mount.md))
 — re-parsing the entire corpus on every command is wasteful and gets slower as
 captured data accumulates.
 
@@ -101,7 +109,7 @@ The mechanics (rationale here; the binding contract is the SPEC) are:
   source of truth. This option is deferred, not foreclosed.
 - **Tailing or watching the raw files to ingest incrementally in real time.**
   Rejected: the `duckdb-otlp` reader cannot follow or seek a file
-  ([ADR-006](ADR-006-read-otlp-extension-quirks.md)), so there is no supported
+  ([ADR-006](../adr/ADR-006-read-otlp-extension-quirks.md)), so there is no supported
   way to consume an append stream live. The cursor's byte-offset approach is the
   available substitute and runs per invocation, not continuously.
 
@@ -116,7 +124,7 @@ The mechanics (rationale here; the binding contract is the SPEC) are:
   definition.
 - The cache lives **inside** `telemetry/` (`telemetry/.otelq-cache/`), so it is
   scoped to the `CONTRACT-telemetry-directory` capture seam
-  ([ADR-004](ADR-004-collector-in-docker-bind-mount.md)) and is cleared when that
+  ([ADR-004](../adr/ADR-004-collector-in-docker-bind-mount.md)) and is cleared when that
   directory is reset.
 - The full, testable behaviour — including rotation tolerance, idempotent
   sealing, crash recovery, and the unreliable-inode and stale-lock edge cases —
