@@ -83,8 +83,8 @@ configuration that produces the raw files.
   `--all`, `--no-cache`, `--since`, `--verbose`, `--version`); contrast
   subcommand-specific flags (`--top`, `--service`, `--level`, `--grep`, the
   `trace_id`/`name`/`query` positionals), which follow the subcommand.
-- **Default telemetry dir** — the `telemetry/` directory under the current
-  working directory (`<cwd>/telemetry`, per
+- **Default telemetry dir** — the `.telemetry/` directory under the current
+  working directory (`<cwd>/.telemetry`, per
   [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md)),
   used when `--dir` is not given. A cwd-relative default works both for
   `uv run otelq.py` from a checkout (run from the repo root) and for an installed
@@ -440,7 +440,7 @@ configuration that produces the raw files.
   cannot be coerced into reading an unrelated file; `sql` retains file access so
   `read_csv`/`COPY` continue to work as documented. (FR-27)
 - **EC-21 — Quote in `--dir`.** A telemetry directory whose path contains a single
-  quote (e.g. `.../Robert's Mac/telemetry`) is queried normally — no SQL syntax
+  quote (e.g. `.../Robert's Mac/.telemetry`) is queried normally — no SQL syntax
   error, identical result cached vs `--no-cache`. (FR-28)
 
 ## Acceptance Criteria

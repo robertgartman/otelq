@@ -35,7 +35,7 @@ semantic_tags:
 Define the exact behavior of an incremental, persistent cache for the `otelq`
 dev-telemetry CLI (`otelq.py`), so that repeated and recent queries
 read a small delta of newly-written telemetry instead of re-parsing the entire
-`telemetry/*.jsonl` corpus on every invocation — while returning results
+`.telemetry/*.jsonl` corpus on every invocation — while returning results
 identical to the current full-scan tool.
 
 Architectural context is recorded in
@@ -64,7 +64,7 @@ rationale for the cache (see
 ### Definitions
 
 - **Raw files** — the Collector's append-only, size-rotated JSONL outputs
-  (`telemetry/<signal>.jsonl` active file + `telemetry/<signal>-<ts>.jsonl`
+  (`.telemetry/<signal>.jsonl` active file + `.telemetry/<signal>-<ts>.jsonl`
   rotated backups). otelq treats these as read-only inputs.
 - **Signal** — one of the six cache signals: `traces`, `logs`, `metrics_gauge`,
   `metrics_sum`, `metrics_histogram`, `metrics_exp_histogram`. The single
@@ -74,7 +74,7 @@ rationale for the cache (see
 - **Event-time** — a record's own timestamp (`timeUnixNano`), never wall-clock.
 - **Minute M** — the UTC clock-minute `[M, M+1)`, keyed filename-safe as
   `<date>T<hour>-<minute>` (e.g. `2026-06-22T10-30`; colon-free).
-- **Cache** — `telemetry/.otelq-cache/`, containing per-signal sealed parquet
+- **Cache** — `.telemetry/.otelq-cache/`, containing per-signal sealed parquet
   partitions `<signal>/<minute>.parquet`, an unsealed-tail `pending` parquet per
   signal, and a `cursor.json` state file.
 - **RETENTION_HORIZON** — the event-time age beyond which sealed partitions are
@@ -103,9 +103,9 @@ rationale for the cache (see
 ## Functional Requirements
 
 - **FR-1 — Cache store layout.** otelq **must** persist sealed telemetry as
-  `telemetry/.otelq-cache/<signal>/<minute>.parquet` for each signal, alongside a
+  `.telemetry/.otelq-cache/<signal>/<minute>.parquet` for each signal, alongside a
   per-signal pending-tail parquet and a single
-  `telemetry/.otelq-cache/cursor.json` state file.
+  `.telemetry/.otelq-cache/cursor.json` state file.
 - **FR-2 — Incremental ingest.** On each run, ingest **must** read only the
   raw bytes not yet recorded as consumed by the cursor, and **must not** re-parse
   raw data already consumed in a previous run.
@@ -213,7 +213,7 @@ rationale for the cache (see
   error) and of a single export batch exceeding the reader's 2048-row limit (skip
   with a warning).
 - **FR-16 — `otel-clean` wipes the cache.** Clearing captured telemetry **must**
-  also remove `telemetry/.otelq-cache/`, so a clean is a full reset.
+  also remove `.telemetry/.otelq-cache/`, so a clean is a full reset.
 - **FR-17 — `--no-cache` bypass.** A `--no-cache` global flag **must** force a
   pure-raw scan that neither reads nor writes the cache, for debugging and for
   equivalence verification (FR-11).
@@ -328,7 +328,7 @@ rationale for the cache (see
 
 - **AC-1** (Verifies FR-1, FR-5): Given fabricated traces spanning three complete,
   sealable minutes, when otelq runs once, then
-  `telemetry/.otelq-cache/traces/<minute>.parquet` exists for each sealed minute
+  `.telemetry/.otelq-cache/traces/<minute>.parquet` exists for each sealed minute
   and each file contains exactly that minute's records.
   *Verification hint: run a command via the cache, then list the cache dir and
   read each parquet with DuckDB `read_parquet`.*
@@ -413,7 +413,7 @@ rationale for the cache (see
   *Verification hint: fabricate both conditions in a temp corpus; assert exit
   success and warning on stderr.*
 - **AC-16** (Verifies FR-16): Given a populated cache, when `just otel-clean` runs,
-  then `telemetry/.otelq-cache/` no longer exists.
+  then `.telemetry/.otelq-cache/` no longer exists.
   *Verification hint: seed cache; run the recipe; assert the directory is gone.*
 - **AC-17** (Verifies FR-17): Given `--no-cache`, when any command runs, then no
   cache files are read or written and the result is correct.

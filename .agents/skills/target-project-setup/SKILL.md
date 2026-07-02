@@ -20,7 +20,7 @@ copies it into `$TARGET`; reading the otelq repo is fine, editing it is not.) Th
 only otelq command you run is `otelq collector-config` (and the read-only `doctor` /
 `summary` checks).
 
-otelq reads OTLP signals as JSONL from a shared `telemetry/` directory — that
+otelq reads OTLP signals as JSONL from a shared `.telemetry/` directory — that
 directory is the entire contract (see
 `context/contract/CONTRACT-telemetry-directory.md`). Any Collector that writes the
 right files works; otelq does not need to own the Collector.
@@ -61,7 +61,7 @@ uvx otelq …
 
 The first run downloads otelq and fetches the DuckDB `otlp` community extension
 (network once, then cached). For the `doctor` / `summary` checks below, pass
-`--dir $TARGET/telemetry` so otelq reads the target project's output folder. To
+`--dir $TARGET/.telemetry` so otelq reads the target project's output folder. To
 pin a version: `uvx otelq@0.1.0 …`.
 
 ## Step 0 — Ask for `$TARGET`, secure its working tree, then preflight
@@ -141,7 +141,7 @@ pin a version: `uvx otelq@0.1.0 …`.
      canonical version.** otelq is the master for these definitions: the rotation
      and path settings are generated from otelq's own constants and the contract
      depends on them (e.g. `send_batch_max_size`/rotation interplay, the exact
-     `/telemetry/<signal>.jsonl` paths otelq reads). A stale local copy that merely
+     `/.telemetry/<signal>.jsonl` paths otelq reads). A stale local copy that merely
      *looks* wired up can silently break `doctor`/queries, so do not preserve the
      target's drifted values — overwrite them.
 
@@ -165,11 +165,11 @@ pin a version: `uvx otelq@0.1.0 …`.
 6. **Create the host telemetry dir and bind-mount it** into the Collector service:
 
    ```sh
-   mkdir -p "$TARGET/telemetry"          # create it first, or Docker makes it root-owned
+   mkdir -p "$TARGET/.telemetry"          # create it first, or Docker makes it root-owned
    ```
    ```yaml
    volumes:
-     - ./telemetry:/telemetry            # host dir : the contract mount path
+     - ./.telemetry:/.telemetry            # host dir : the contract mount path
    ```
 
 7. **Gitignore the captured telemetry** in `$TARGET` (mirror otelq's own rule), so
@@ -177,8 +177,8 @@ pin a version: `uvx otelq@0.1.0 …`.
 
    ```gitignore
    # otelq: local telemetry capture + query cache — never committed
-   /telemetry/*
-   !/telemetry/.gitkeep
+   /.telemetry/*
+   !/.telemetry/.gitkeep
    ```
 
 If every exporter definition, pipeline membership entry, bind mount, telemetry
@@ -198,10 +198,10 @@ otelq), modelled on otelq's reference producer:
    console spam.
 2. Add a Collector service to `$TARGET`'s Compose (create `compose.yaml` if absent),
    using the `otel/opentelemetry-collector-contrib` image, mounting that config and
-   `./telemetry:/telemetry`, and publishing the OTLP ports the app needs
+   `./.telemetry:/.telemetry`, and publishing the OTLP ports the app needs
    (`4317`/`4318`). `otelq collector-config` documents the same exporters/mount for
    cross-reference.
-3. `mkdir -p "$TARGET/telemetry"` and add the **same gitignore** rule as Path A
+3. `mkdir -p "$TARGET/.telemetry"` and add the **same gitignore** rule as Path A
    step 7.
 
 If `$TARGET` already has this scaffold with the canonical config, service, mount,
@@ -240,8 +240,8 @@ Offer the user two ways to prove telemetry actually lands:
 Either way, the check is:
 
 ```sh
-otelq --dir "$TARGET/telemetry" doctor      # exit 0 + OK rows = wiring is good
-otelq --dir "$TARGET/telemetry" summary     # see counts per signal
+otelq --dir "$TARGET/.telemetry" doctor      # exit 0 + OK rows = wiring is good
+otelq --dir "$TARGET/.telemetry" summary     # see counts per signal
 ```
 
 `doctor` is read-only — it only validates files already on disk (files present,
@@ -297,7 +297,7 @@ emits.
    ```
 
 5. **Verify** with the `doctor` + `summary` commands above, and show the user a real
-   query result, e.g. `otelq --dir "$TARGET/telemetry" slow --top 5`. Synthetic rows
+   query result, e.g. `otelq --dir "$TARGET/.telemetry" slow --top 5`. Synthetic rows
    carry `service.name = otelq-probe`.
 
 6. **Revert the probe** — drop the temporary service so `$TARGET` is back at the
@@ -305,10 +305,10 @@ emits.
 
    ```sh
    git -C "$TARGET" checkout -- <compose-file>   # remove the telemetrygen-probe service
-   rm -rf "$TARGET/telemetry/.otelq-cache"        # otelq's own cache — safe to delete, not held open
+   rm -rf "$TARGET/.telemetry/.otelq-cache"        # otelq's own cache — safe to delete, not held open
    ```
 
-   The synthetic capture left in `telemetry/*.jsonl` is tagged
+   The synthetic capture left in `.telemetry/*.jsonl` is tagged
    `service.name = otelq-probe` and is gitignored, so it is never committed and is
    trivial to filter out. **Do not truncate those active files while the Collector
    is running** — its `file` exporter writes at a tracked offset (not `O_APPEND`),

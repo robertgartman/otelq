@@ -11,14 +11,14 @@
 # only after confirming the extension exists for the target version.
 """otelq — query OTLP telemetry captured by the dev OTel Collector.
 
-Reads telemetry/*.jsonl (OTLP JSONL written by the Collector fileexporter)
+Reads .telemetry/*.jsonl (OTLP JSONL written by the Collector fileexporter)
 via the smithclay/duckdb-otlp DuckDB extension.
 
 Incremental parquet cache (SPEC-otelq-incremental-cache)
 --------------------------------------------------------
-Repeated queries no longer re-parse the whole telemetry/ corpus. A per-signal
+Repeated queries no longer re-parse the whole .telemetry/ corpus. A per-signal
 cursor reads only the new bytes of each raw file; complete minutes are sealed to
-parquet under telemetry/.otelq-cache/<signal>/<minute>.parquet once the signal's
+parquet under .telemetry/.otelq-cache/<signal>/<minute>.parquet once the signal's
 max observed event-time has advanced MARGIN_MINUTES past the minute's end. A
 rolling RETENTION_MINUTES window bounds the cache; queries reaching older data
 fall back to a stateless cold scan of the raw files. Results are identical to a
@@ -118,12 +118,13 @@ __all__ = [
     "_fmt_ts",
 ]
 
-# Default to ./telemetry under the *current working directory* so the zero-config
+# Default to ./.telemetry under the *current working directory* so the zero-config
 # default works the same whether otelq is `uv run otelq.py` from a checkout (run
 # from the repo root) or installed via uvx/pipx and run from a project dir. A
 # script-relative default (Path(__file__).parent) would resolve into the install
 # location — e.g. site-packages — for an installed copy. `--dir` overrides.
-DEFAULT_DIR = Path.cwd() / "telemetry"
+# The leading dot marks it as transient, not-git-tracked runtime capture.
+DEFAULT_DIR = Path.cwd() / ".telemetry"
 
 SIGNAL_GLOBS = {
     "traces": "traces*.jsonl",
@@ -132,13 +133,13 @@ SIGNAL_GLOBS = {
 }
 
 # --- Reference producer (collector-config / doctor) --------------------------
-# The Collector that writes the telemetry/ contract is interchangeable (see
+# The Collector that writes the .telemetry/ contract is interchangeable (see
 # CONTRACT-telemetry-directory: any conformant producer interoperates). otelq
 # ships the reference producer settings here so `otelq collector-config` emits
 # exactly the pinned values the consumer expects, generated — never hand-copied
 # — so they cannot drift from this module. These MUST stay in lockstep with
 # otel-collector-dev.yaml and the contract; a test asserts they match.
-COLLECTOR_MOUNT_PATH = "/telemetry"  # producer-side bind-mount target
+COLLECTOR_MOUNT_PATH = "/.telemetry"  # producer-side bind-mount target
 ROTATION_MAX_MEGABYTES = 50  # rotation threshold per active file (< 100 MB reader cap)
 ROTATION_MAX_BACKUPS = 5  # retained rotated backups per signal
 # The OTLP/JSON top-level key each signal's lines must carry (contract framing).
@@ -1941,7 +1942,7 @@ def render_collector_config() -> str:
     """Emit the reference file-export fragment to merge into a Collector.
 
     Generated from this module's pinned constants so the rotation thresholds and
-    paths can never drift from the telemetry/ contract. Serves both humans and
+    paths can never drift from the .telemetry/ contract. Serves both humans and
     AI agents wiring otelq into an existing (integrated) Collector.
     """
     signals = ("traces", "logs", "metrics")
@@ -1965,7 +1966,7 @@ def render_collector_config() -> str:
     return "\n".join(
         [
             "# ── otelq collector integration ─────────────────────────────────────────────",
-            "# Make an existing OpenTelemetry Collector write the telemetry/ contract that",
+            "# Make an existing OpenTelemetry Collector write the .telemetry/ contract that",
             "# otelq reads. Requires the *-contrib collector image: the `file` exporter is",
             "# not in the core distribution.",
             "#",
@@ -1980,12 +1981,12 @@ def render_collector_config() -> str:
             "# 3) Bind-mount a host telemetry dir into the collector service (compose):",
             "#",
             "#      volumes:",
-            f"#        - ./telemetry:{COLLECTOR_MOUNT_PATH}",
+            f"#        - ./.telemetry:{COLLECTOR_MOUNT_PATH}",
             "#",
             "# 4) Query it, pointing otelq at that dir:",
             "#",
-            "#      otelq --dir ./telemetry summary",
-            "#      otelq --dir ./telemetry doctor      # verify the wiring",
+            "#      otelq --dir ./.telemetry summary",
+            "#      otelq --dir ./.telemetry doctor      # verify the wiring",
         ]
     )
 

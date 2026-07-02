@@ -23,7 +23,7 @@ uvx otelq --dir telemetry ...
 ```
 
 - **`--dir telemetry` is required.** It points otelq at the Collector's output
-  folder — the `telemetry/` directory at this project's root (the bind-mounted
+  folder — the `.telemetry/` directory at this project's root (the bind-mounted
   dir set up when otelq was wired in). Because `uvx` runs otelq from an isolated
   build, the default would not resolve to your project, so always pass `--dir`.
   Adjust the path if your Collector writes elsewhere.

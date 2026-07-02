@@ -752,7 +752,7 @@ def write_jsonl(
 
 @pytest.fixture
 def temp_telemetry(tmp_path: Path) -> Path:
-    d = tmp_path / "telemetry"
+    d = tmp_path / ".telemetry"
     d.mkdir()
     return d
 
@@ -1118,7 +1118,7 @@ def test_ac13_portable_file_ops() -> None:
 
 def test_ac16_otel_clean_recipe_removes_cache() -> None:
     justfile = (Path(__file__).resolve().parents[1] / "justfile").read_text()
-    assert "rm -rf telemetry/.otelq-cache" in justfile
+    assert "rm -rf .telemetry/.otelq-cache" in justfile
 
 
 import os as _os  # noqa: E402
@@ -1598,7 +1598,7 @@ def test_errors_names_gap_when_only_metrics_present() -> None:
 # --- collector-config: reference producer fragment ---------------------------
 # `otelq collector-config` emits the file-export settings to merge into an
 # existing Collector (the "integrated" setup). It is GENERATED from this
-# module's pinned constants so it can never drift from the telemetry/ contract;
+# module's pinned constants so it can never drift from the .telemetry/ contract;
 # the drift guard below ties those constants back to the shipped dev config.
 
 
@@ -1790,12 +1790,12 @@ def test_help_command_unknown_topic_errors() -> None:
 
 
 def test_default_dir_is_cwd_relative() -> None:
-    # FR-12 / ADR-001: the default telemetry dir is <cwd>/telemetry, resolved from
+    # FR-12 / ADR-001: the default telemetry dir is <cwd>/.telemetry, resolved from
     # the current working directory — NOT the script's install location. A
     # script-relative default put it under site-packages for `uvx ... otelq`.
-    assert otelq.DEFAULT_DIR == Path.cwd() / "telemetry"
+    assert otelq.DEFAULT_DIR == Path.cwd() / ".telemetry"
     parsed = otelq.build_parser().parse_args(["summary"])
-    assert parsed.dir == Path.cwd() / "telemetry"
+    assert parsed.dir == Path.cwd() / ".telemetry"
 
 
 # --- broken pipe: `otelq ... | head` must exit cleanly, not dump a traceback ---
@@ -2042,7 +2042,7 @@ def test_b5_single_quote_in_dir_path_is_sql_safe(tmp_path: Path) -> None:
     # B-5 / SPEC-cli FR-28, EC-21, AC-36: a --dir whose path contains a single
     # quote must not break the SQL that splices raw-file paths. The query must
     # still return rows and stay identical cached vs --no-cache (FR-11).
-    d = tmp_path / "o'brien" / "telemetry"
+    d = tmp_path / "o'brien" / ".telemetry"
     d.mkdir(parents=True)
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     write_jsonl(d / "logs.jsonl", [make_log(base, body="hi"), make_log(base, body="yo")])

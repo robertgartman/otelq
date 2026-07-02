@@ -179,7 +179,7 @@ stream has a watermark, not only staged ones.
   `uv run otelq.py otelq summary` — doubled `otelq`; should be `uv run otelq.py summary`.
 - "This is a dump from running `uvx otelq.py --help`" — wrong invocation
   (`uvx otelq` or `uv run otelq.py --help`), and the dump leaks a machine-specific
-  default (`--dir DIR … default: /Users/robertgartman/dev/otelq/telemetry`).
+  default (`--dir DIR … default: /Users/robertgartman/dev/otelq/.telemetry`).
 - Dangling sentence: "Run  the full, authoritative command behavior." (missing the
   command name, double space).
 - The help epilog (and its README copy) omits `severity_number` from the `logs`

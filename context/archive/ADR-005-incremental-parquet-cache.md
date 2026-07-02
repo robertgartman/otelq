@@ -20,7 +20,7 @@ related_documents:
   - CONTRACT-telemetry-directory
 supersedes: null
 superseded_by: ADR-008-unified-cache-first-read-and-retention
-ai_summary: "A per-minute parquet cache under telemetry/.otelq-cache/ accelerates recent/repeated queries while staying byte-identical to a full raw re-scan."
+ai_summary: "A per-minute parquet cache under .telemetry/.otelq-cache/ accelerates recent/repeated queries while staying byte-identical to a full raw re-scan."
 semantic_tags:
   - otelq
   - parquet
@@ -47,7 +47,7 @@ semantic_tags:
 ([ADR-006](../adr/ADR-006-read-otlp-extension-quirks.md)). The reader cannot tail,
 follow, or seek a file; every invocation re-parses whole files from byte zero.
 For the dev workflow — repeated, narrow, recent-window queries against a
-`telemetry/` corpus that only grows ([ADR-004](../adr/ADR-004-collector-in-docker-bind-mount.md))
+`.telemetry/` corpus that only grows ([ADR-004](../adr/ADR-004-collector-in-docker-bind-mount.md))
 — re-parsing the entire corpus on every command is wasteful and gets slower as
 captured data accumulates.
 
@@ -64,7 +64,7 @@ cross-platform requirements — is the authoritative contract in
 
 ## Decision
 
-Introduce a **per-minute Parquet cache** under `telemetry/.otelq-cache/` that
+Introduce a **per-minute Parquet cache** under `.telemetry/.otelq-cache/` that
 acts as a **transparent accelerator** for recent and repeated queries. Its
 defining property is an **equivalence invariant**: for any command and time
 range, a query answered from the cache returns results **byte-identical** to the
@@ -122,7 +122,7 @@ The mechanics (rationale here; the binding contract is the SPEC) are:
   guarded by a test** that diffs cached output against `--no-cache` output across
   commands and ranges. If that test ever diverges, the cache is wrong, by
   definition.
-- The cache lives **inside** `telemetry/` (`telemetry/.otelq-cache/`), so it is
+- The cache lives **inside** `.telemetry/` (`.telemetry/.otelq-cache/`), so it is
   scoped to the `CONTRACT-telemetry-directory` capture seam
   ([ADR-004](../adr/ADR-004-collector-in-docker-bind-mount.md)) and is cleared when that
   directory is reset.

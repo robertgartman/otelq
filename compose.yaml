@@ -1,7 +1,7 @@
 # Standalone dev OpenTelemetry Collector for otelq.
 #
 # The contract is the bind mount: the Collector writes OTLP signals as JSONL into
-# ./telemetry on the host, and the otelq CLI reads those same files. There is no
+# ./.telemetry on the host, and the otelq CLI reads those same files. There is no
 # network coupling between collector and CLI — the shared directory IS the API.
 #
 # The "otel" profile keeps the Collector opt-in: it only starts when explicitly
@@ -9,7 +9,7 @@
 #
 # The "demo" profile adds telemetrygen generators that push synthetic traces,
 # metrics, and logs through the Collector — a zero-instrumentation way to populate
-# telemetry/ so otelq (and the otelq skill) can be tried on a fresh
+# .telemetry/ so otelq (and the otelq skill) can be tried on a fresh
 # clone. Driven by `just otel-demo` (which starts the Collector first, then runs
 # the generators).
 
@@ -32,12 +32,12 @@ services:
     command: ["--config=/etc/otelcol/config.yaml"]
     volumes:
       - ./otel-collector-dev.yaml:/etc/otelcol/config.yaml:ro
-      - ./telemetry:/telemetry
+      - ./.telemetry:/.telemetry
     ports: ["4317:4317", "4318:4318"]
     restart: unless-stopped
 
   # telemetrygen generators: each sends ONE signal over OTLP gRPC to the
-  # Collector, which writes it to telemetry/<signal>.jsonl. The signal subcommand
+  # Collector, which writes it to .telemetry/<signal>.jsonl. The signal subcommand
   # comes first, then flags. The gRPC exporter retries while the Collector comes
   # up, so no depends_on gate is needed (the just recipe starts the Collector
   # first regardless).

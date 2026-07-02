@@ -1,6 +1,6 @@
 # Dev OpenTelemetry Collector
 # Writes OTLP traces/logs/metrics as JSONL
-# to /telemetry for the otelq CLI.
+# to /.telemetry for the otelq CLI.
 
 receivers:
   otlp:
@@ -26,19 +26,19 @@ processors:
 
 exporters:
   file/traces:
-    path: /telemetry/traces.jsonl
+    path: /.telemetry/traces.jsonl
     flush_interval: 1s
     rotation:
       max_megabytes: 50
       max_backups: 5
   file/logs:
-    path: /telemetry/logs.jsonl
+    path: /.telemetry/logs.jsonl
     flush_interval: 1s
     rotation:
       max_megabytes: 50
       max_backups: 5
   file/metrics:
-    path: /telemetry/metrics.jsonl
+    path: /.telemetry/metrics.jsonl
     flush_interval: 1s
     rotation:
       max_megabytes: 50

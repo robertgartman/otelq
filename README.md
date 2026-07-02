@@ -98,8 +98,8 @@ flowchart TB
     end
 
     subgraph project["Your project"]
-      signals["folder: ./telemetry<br/><br/>traces.jsonl · logs.jsonl · metrics.jsonl"]
-      cache["folder: ./telemetry/.otelq-cache<br/><br/>parquet query cache"]
+      signals["folder: ./.telemetry<br/><br/>traces.jsonl · logs.jsonl · metrics.jsonl"]
+      cache["folder: ./.telemetry/.otelq-cache<br/><br/>parquet query cache"]
       skill["otelq skill"]
     end
   end
@@ -117,7 +117,7 @@ flowchart TB
   class docker,project whiteBg
 ```
 
-Your application(s) send OpenTelemetry over OTLP to a Collector running in Docker. The Collector writes each signal as plain JSONL into a `telemetry/` directory bind-mounted from your project. otelq runs on the host — invoked directly or by the `otelq` skill — and reads those `.jsonl` files in-process with DuckDB, keeping an incremental parquet cache under `telemetry/.otelq-cache/` for fast repeat queries.
+Your application(s) send OpenTelemetry over OTLP to a Collector running in Docker. The Collector writes each signal as plain JSONL into a `.telemetry/` directory bind-mounted from your project. otelq runs on the host — invoked directly or by the `otelq` skill — and reads those `.jsonl` files in-process with DuckDB, keeping an incremental parquet cache under `.telemetry/.otelq-cache/` for fast repeat queries.
 
 The bind-mounted directory is the entire contract: the Collector writes `traces.jsonl`, `logs.jsonl`, and `metrics.jsonl`; otelq reads those same files. There is no network coupling between the Collector and the CLI — the shared directory is the API.
 
@@ -132,8 +132,8 @@ The _direction_ of integration matters: you work **from the otelq repo** and int
 alias otelq="uvx otelq"
 
 otelq collector-config                      # prints the exporters + pipeline wiring to add
-# ...paste the fragment into your project's Collector config, bind-mount its ./telemetry, restart...
-otelq --dir /Users/me/dev/my-service/telemetry doctor    # verify your wiring satisfies the contract
+# ...paste the fragment into your project's Collector config, bind-mount its ./.telemetry, restart...
+otelq --dir /Users/me/dev/my-service/.telemetry doctor    # verify your wiring satisfies the contract
 ```
 
 `collector-config` is generated from otelq's pinned constants, so it never drifts from the contract; `doctor` checks a telemetry directory against it. The `file` exporter requires the `*-contrib` Collector image. The **target-project-setup** skill automates all of this and asks for the target project's path; see below. When exercising your own app is inconvenient, the skill can also confirm the wiring end-to-end with a throwaway [`telemetrygen`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen) probe — committed, run against your Collector over its own network, then reverted — flagging first if the teed pipeline also feeds a real backend.
@@ -144,14 +144,14 @@ otelq --dir /Users/me/dev/my-service/telemetry doctor    # verify your wiring sa
 
 otelq is a **local development** tool — nothing about it ships to production. The OpenTelemetry Collector, however, remains a perfectly valid (though not strictly necessary) component of your production stack: the same Collector your application sends OTLP to locally can run in production too, fronting your real observability backend.
 
-The thing that must **not** carry over is otelq's wiring. When otelq is integrated into your project it adds a `file`-exporter pipeline that writes `traces.jsonl` / `logs.jsonl` / `metrics.jsonl` to a local `telemetry/` directory — that is exactly what otelq reads, and exactly what you do **not** want in production, where you ship telemetry to a remote service rather than storing it on a box.
+The thing that must **not** carry over is otelq's wiring. When otelq is integrated into your project it adds a `file`-exporter pipeline that writes `traces.jsonl` / `logs.jsonl` / `metrics.jsonl` to a local `.telemetry/` directory — that is exactly what otelq reads, and exactly what you do **not** want in production, where you ship telemetry to a remote service rather than storing it on a box.
 
 So if you keep the Collector in production, make the configuration this project introduced into your Docker Compose **environment-conditional**:
 
-- **Local / dev** — the `file` exporters and the bind-mounted `telemetry/` directory are active, so otelq can query the signals on your machine.
+- **Local / dev** — the `file` exporters and the bind-mounted `.telemetry/` directory are active, so otelq can query the signals on your machine.
 - **Production** — that local-storage path is switched off and the same pipelines instead point at production-grade, OTLP-compliant collectors or backends (your APM/observability vendor, a managed OTLP endpoint, etc.), shipping telemetry to the remote service instead of writing JSONL to disk.
 
-Concretely, that means parameterizing the pieces otelq added — gating the `file` exporters and the `telemetry/` bind mount behind a profile or environment variable, and selecting the production exporter set when deploying — so a single Compose definition flips cleanly between *"store telemetry locally for otelq"* and *"ship telemetry to a remote, production-compliant collector."*
+Concretely, that means parameterizing the pieces otelq added — gating the `file` exporters and the `.telemetry/` bind mount behind a profile or environment variable, and selecting the production exporter set when deploying — so a single Compose definition flips cleanly between *"store telemetry locally for otelq"* and *"ship telemetry to a remote, production-compliant collector."*
 
 ## Install / run options
 
@@ -199,7 +199,7 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
   --version             print otelq's version and exit
-  --dir DIR             telemetry folder (default: <cwd>/telemetry)
+  --dir DIR             telemetry folder (default: <cwd>/.telemetry)
   --format {table,json,jsonl,csv}
                         output format (default: table; json/jsonl are compact for agents)
   --all                 widen the query to the full raw history (cold scan)

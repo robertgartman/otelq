@@ -68,10 +68,10 @@ brought up only when telemetry capture is wanted.
 The Collector bind-mounts two host paths:
 
 1. its configuration file, mounted **read-only**, and
-2. the host `telemetry/` directory, mounted read-write, into which it writes.
+2. the host `.telemetry/` directory, mounted read-write, into which it writes.
 
 Its pipelines use three `file` exporters, one per signal, each writing
-`/telemetry/<signal>.jsonl` (`traces.jsonl`, `logs.jsonl`, `metrics.jsonl`).
+`/.telemetry/<signal>.jsonl` (`traces.jsonl`, `logs.jsonl`, `metrics.jsonl`).
 The OTLP receiver listens on the standard gRPC `4317` and HTTP `4318` ports; an
 instrumented application captures telemetry by pointing its
 `OTEL_EXPORTER_OTLP_ENDPOINT` at `localhost:4317` (gRPC) or `localhost:4318`
@@ -119,7 +119,7 @@ application emitted.
 - **An always-on Collector.** Rejected: capture is a debugging aid, not a
   baseline dependency. Gating it behind the `otel` Compose profile keeps it off
   by default so a normal `compose up` neither runs the container nor writes to
-  `telemetry/`; it is opted into only when needed.
+  `.telemetry/`; it is opted into only when needed.
 - **A non-stock, locally patched image to work around reader quirks.** Rejected:
   the `duckdb-otlp` quirks are mitigated **client-side** in `otelq`
   ([ADR-006](ADR-006-read-otlp-extension-quirks.md)), leaving the Collector

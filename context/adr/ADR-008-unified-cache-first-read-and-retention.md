@@ -204,7 +204,7 @@ the SPEC alone.
 - **Disk footprint grows substantially** — a ~24h horizon is roughly two orders of
   magnitude more partitions per signal than the former short window. This is
   acceptable for dev telemetry but must be a documented, ideally configurable,
-  number, and it remains scoped inside `telemetry/.otelq-cache/`
+  number, and it remains scoped inside `.telemetry/.otelq-cache/`
   ([CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md)) so
   `otel-clean` still resets it.
 
