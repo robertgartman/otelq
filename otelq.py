@@ -1568,6 +1568,14 @@ def format_output(columns: list[str], rows: list[tuple[Any, ...]], fmt: str) -> 
             json.dumps(dict(zip(columns, r)), default=str, separators=(",", ":"))
             for r in rows
         )
+    if fmt == "compact":
+        # Columns declared once, each row a positional array: losslessly the same
+        # data as `json` without repeating the column keys per row, so fewer
+        # tokens for the AI-agent consumer (PRD P-5). Reconstruct downstream with
+        # zip(columns, row). Order matches `table`/`json` (INV-3).
+        return json.dumps(
+            {"columns": columns, "rows": rows}, default=str, separators=(",", ":")
+        )
     if fmt == "csv":
         buf = io.StringIO()
         writer = csv.writer(buf)
@@ -2215,10 +2223,20 @@ def build_parser() -> argparse.ArgumentParser:
             argument order:
               --dir / --format / --all / --no-cache / --since / --verbose are
               GLOBAL flags and must come BEFORE the subcommand:
-                otelq --since 10m --format json errors
+                otelq --since 10m --format compact errors
               (not: otelq errors --since 10m). Per-command flags (--top, --service,
-              --level, --grep) go AFTER the subcommand. Prefer --format json (or
-              jsonl, one compact object per line) so output is parsed, not scraped.
+              --level, --grep) go AFTER the subcommand.
+
+            output format (pick the fewest tokens the consumer can parse):
+              --format compact  BEST for agents/LLMs: a single
+                                {"columns":[...],"rows":[[...]]} object — column
+                                names once, each row a positional array. Lossless
+                                and the smallest machine format (no repeated keys).
+                                Reconstruct rows with zip(columns, row).
+              --format json     a JSON array of per-row objects; use only when a
+              --format jsonl    consumer needs self-describing rows / streaming.
+              --format csv      spreadsheet/interchange.
+              --format table    default; for humans, not for parsing.
 
             time window (filters by each record's own event-time):
               (default)            a recent window (the cache's hot window)
@@ -2268,9 +2286,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--format",
-        choices=["table", "json", "jsonl", "csv"],
+        choices=["table", "json", "jsonl", "csv", "compact"],
         default="table",
-        help="output format (default: table; json/jsonl are compact for agents)",
+        help="output format (default: table; json/jsonl/compact are compact for agents)",
     )
     parser.add_argument(
         "--all",

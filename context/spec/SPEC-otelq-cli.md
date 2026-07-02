@@ -57,7 +57,7 @@ Product intent lives in [PRD-otelq](../prd/PRD-otelq.md).
 seven subcommands (`summary`, `errors`, `slow`, `trace`, `logs`, `metric`,
 `sql`); the global flags (`--format`, `--dir`, `--all`, `--no-cache`, `--since`,
 `--verbose`, `--version`) and the rule that global flags precede the subcommand;
-the per-command output row bound (`--top`); the four output formats and their
+the per-command output row bound (`--top`); the five output formats and their
 format-independence; the `sql` filesystem-access boundary and the external-access
 lockdown for built-in commands; timestamp correction (and far-future clamping) in
 the presented output; and otelq's exit-code and stderr behavior when telemetry is
@@ -226,13 +226,18 @@ configuration that produces the raw files.
 ### Global flags and argument order
 
 - **FR-10 — `--format`.** A `--format` global flag **must** accept exactly
-  `table`, `json`, `jsonl`, or `csv`, defaulting to `table`, and **must** select
-  the rendering of the result. `table` is for human reading; `json` is a single
-  compact JSON array for programmatic consumption (compact separators, no
-  insignificant whitespace, to minimize tokens for the AI-agent consumer per
-  [PRD-otelq](../prd/PRD-otelq.md)); `jsonl` emits one compact JSON object per
-  line for streaming/line-oriented consumers; `csv` is the spreadsheet/interchange
-  format.
+  `table`, `json`, `jsonl`, `csv`, or `compact`, defaulting to `table`, and
+  **must** select the rendering of the result. `table` is for human reading;
+  `json` is a single compact JSON array for programmatic consumption (compact
+  separators, no insignificant whitespace, to minimize tokens for the AI-agent
+  consumer per [PRD-otelq](../prd/PRD-otelq.md)); `jsonl` emits one compact JSON
+  object per line for streaming/line-oriented consumers; `csv` is the
+  spreadsheet/interchange format; `compact` is a single compact JSON object of
+  the form `{"columns":[...],"rows":[[...]]}` that declares the column names once
+  and carries each row as a positional array — losslessly the same data as `json`
+  but without repeating the column keys on every row, further reducing tokens for
+  the AI-agent consumer. A `compact` result **must** be reconstructible to the
+  exact records `json` would emit by zipping each `rows` entry with `columns`.
 - **FR-11 — Global flags precede the subcommand.** `--format`, `--dir`,
   `--all`, `--no-cache`, and `--since` are global flags and **must** be accepted
   *before* the subcommand. Supplying a global flag *after* the subcommand
@@ -442,6 +447,11 @@ configuration that produces the raw files.
 - **EC-21 — Quote in `--dir`.** A telemetry directory whose path contains a single
   quote (e.g. `.../Robert's Mac/.telemetry`) is queried normally — no SQL syntax
   error, identical result cached vs `--no-cache`. (FR-28)
+- **EC-22 — `compact` format.** `--format compact` emits a single JSON object
+  `{"columns":[...],"rows":[[...]]}` — the column names once, then one positional
+  array per row — carrying the same logical rows in the same order as `table` and
+  `json`. Zipping each `rows` entry with `columns` reconstructs exactly the
+  objects `--format json` would emit. (FR-10, INV-2, INV-3)
 
 ## Acceptance Criteria
 
@@ -650,6 +660,13 @@ configuration that produces the raw files.
   with no SQL error, identical cached vs `--no-cache`.
   *Verification hint: cross-checked by the incremental-cache SPEC's path-escaping
   criteria; assert a quoted `--dir` yields the same rows on both paths.*
+- **AC-37** (Verifies FR-10, EC-22, INV-2, INV-3): Given any result, when
+  `--format compact` is selected it is a single compact JSON object with a
+  `columns` array and a `rows` array of positional arrays; zipping each row with
+  `columns` yields exactly the objects `--format json` produces, in the same
+  order.
+  *Verification hint: `test_p5_format_compact_columns_rows`,
+  `test_p5_format_compact_via_cli`.*
 
 ### Examples
 
@@ -683,9 +700,10 @@ configuration that produces the raw files.
   the raw telemetry files it reads. Its output is a pure function of (the
   telemetry it reads, the command, and the flags).
 - **INV-2** — Output-format roles are fixed: `table` is the human-facing default;
-  `json` (a single compact array) and `jsonl` (one compact object per line) are
-  the machine/automation formats; `csv` is the spreadsheet/interchange format.
-  Choosing a format never changes which command runs.
+  `json` (a single compact array), `jsonl` (one compact object per line), and
+  `compact` (a single object with a `columns` header and positional `rows`
+  arrays) are the machine/automation formats; `csv` is the spreadsheet/interchange
+  format. Choosing a format never changes which command runs.
 - **INV-3** — Format independence: the rows a command returns, and their order,
   do not depend on which `--format` is chosen; only the rendering differs.
 - **INV-4** — Friendly failure: absent telemetry yields a human-readable stderr

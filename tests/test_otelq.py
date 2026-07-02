@@ -1729,6 +1729,8 @@ def test_help_epilog_documents_argument_order_and_sql_schema() -> None:
     help_text = otelq.build_parser().format_help()
     assert "GLOBAL flags" in help_text
     assert "BEFORE the subcommand" in help_text
+    # The help must steer agents to the token-efficient machine format (AC-37).
+    assert "compact" in help_text
     for view in (
         "traces",
         "logs",
@@ -1965,6 +1967,36 @@ def test_p5_format_jsonl_via_cli(temp_telemetry: Path) -> None:
     assert len(lines) == 2
     for ln in lines:
         assert isinstance(_json.loads(ln), dict)  # each line is a standalone object
+
+
+def test_p5_format_compact_columns_rows() -> None:
+    # P-5 (AC-37): compact declares columns once, rows as positional arrays;
+    # losslessly reconstructs to the same objects `json` emits.
+    cols = ["a", "b"]
+    rows = [(1, 2), (3, 4)]
+    out = otelq.format_output(cols, rows, "compact")
+    assert out == '{"columns":["a","b"],"rows":[[1,2],[3,4]]}'
+    parsed = _json.loads(out)
+    reconstructed = [dict(zip(parsed["columns"], r)) for r in parsed["rows"]]
+    assert reconstructed == _json.loads(otelq.format_output(cols, rows, "json"))
+
+
+def test_p5_format_compact_via_cli(temp_telemetry: Path) -> None:
+    import io as _io
+    from contextlib import redirect_stdout
+
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base), make_log(base + timedelta(seconds=1))])
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        otelq.main(["--dir", str(temp_telemetry), "--format", "compact", "logs"])
+    obj: dict[str, Any] = _json.loads(buf.getvalue())
+    assert set(obj) == {"columns", "rows"}
+    columns: list[str] = obj["columns"]
+    rows: list[list[Any]] = obj["rows"]
+    assert len(rows) == 2
+    for row in rows:
+        assert len(row) == len(columns)  # positional arrays align to columns
 
 
 def test_d2_sql_boundary_locks_builtins_not_sql(tmp_path: Path) -> None:
