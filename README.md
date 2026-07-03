@@ -175,7 +175,8 @@ This is a dump from running `uv run otelq.py --help` within the project root:
 
 ```text
 
-usage: otelq [-h] [--version] [--dir DIR] [--format {table,json,jsonl,csv}] [--all] [--no-cache]
+usage: otelq [-h] [--version] [--dir DIR]
+             [--format {table,json,jsonl,csv,compact}] [--all] [--no-cache]
              [--verbose] [--since SINCE]
              {summary,sql,errors,slow,trace,logs,metric,collector-config,doctor,troubleshoot,help}
              ...
@@ -191,7 +192,8 @@ positional arguments:
     trace               all spans of one trace as a tree
     logs                filtered log records
     metric              time series for one metric
-    collector-config    print the file-export fragment to add to an existing Collector
+    collector-config    print the file-export fragment to add to an existing
+                        Collector
     doctor              check that --dir satisfies the telemetry contract
     troubleshoot        print the capture → query loop and common fixes
     help                show help for otelq or a command
@@ -200,20 +202,39 @@ options:
   -h, --help            show this help message and exit
   --version             print otelq's version and exit
   --dir DIR             telemetry folder (default: <cwd>/.telemetry)
-  --format {table,json,jsonl,csv}
-                        output format (default: table; json/jsonl are compact for agents)
+  --format {table,json,jsonl,csv,compact}
+                        output format (default: compact, the fewest-token
+                        format for agents; pass --format table for a human-
+                        readable view)
   --all                 widen the query to the full raw history (cold scan)
   --no-cache            bypass the parquet cache entirely (pure cold scan)
   --verbose             print the resolved time window and route to stderr
-  --since SINCE         restrict to a trailing time window: Ns/Nm/Nh/Nd (e.g. 30s, 10m, 2h, 1d)
+  --since SINCE         restrict to a trailing time window: Ns/Nm/Nh/Nd (e.g.
+                        30s, 10m, 2h, 1d)
+
+timestamps: ALL timestamps — printed by otelq and written into a
+  `sql` query — are UTC. Write `sql` timestamp literals bare
+  ('YYYY-MM-DD HH:MM:SS') or 'Z'-suffixed ('...T10:00:00Z'); never
+  a non-Z offset (e.g. +02:00) — DuckDB silently drops it instead
+  of converting, so the comparison would be silently wrong.
 
 argument order:
   --dir / --format / --all / --no-cache / --since / --verbose are
   GLOBAL flags and must come BEFORE the subcommand:
-    otelq --since 10m --format json errors
+    otelq --since 10m --format compact errors
   (not: otelq errors --since 10m). Per-command flags (--top, --service,
-  --level, --grep) go AFTER the subcommand. Prefer --format json (or
-  jsonl, one compact object per line) so output is parsed, not scraped.
+  --level, --grep) go AFTER the subcommand.
+
+output format (pick the fewest tokens the consumer can parse):
+  --format compact  DEFAULT. BEST for agents/LLMs: a single
+                    {"columns":[...],"rows":[[...]]} object — column
+                    names once, each row a positional array. Lossless
+                    and the smallest machine format (no repeated keys).
+                    Reconstruct rows with zip(columns, row).
+  --format json     a JSON array of per-row objects; use only when a
+  --format jsonl    consumer needs self-describing rows / streaming.
+  --format csv      spreadsheet/interchange.
+  --format table    for a human reading the terminal, not for parsing.
 
 time window (filters by each record's own event-time):
   (default)            a recent window (the cache's hot window)
@@ -240,6 +261,8 @@ sql views (for `otelq sql "<query>"`):
     metrics_histogram, metrics_exp_histogram  count, sum, min, max
            (+ bucket_counts/explicit_bounds, or scale/zero_count/…)
   (the OTel Summary metric type is unsupported by the reader extension)
+  timestamp columns are naive UTC — see "timestamps" above for the
+  literal convention when filtering on them.
   the built-in commands read only the telemetry under --dir. `sql`
   is an escape hatch that runs with YOUR user's file access (it can
   read/write local files via read_csv/COPY), so treat untrusted

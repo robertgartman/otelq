@@ -524,6 +524,9 @@ Row = tuple[Any, ...]
 CommandResult = tuple[list[str], list[Row]]
 # A subcommand handler: a built connection + parsed args -> a CommandResult.
 Command = Callable[["duckdb.DuckDBPyConnection", argparse.Namespace], CommandResult]
+# The min/max `timestamp` among a result's rows, for the FR-29 response header;
+# both are None for a zero-row result.
+TimeRange = tuple[datetime | None, datetime | None]
 
 
 def _one_row(rel: duckdb.DuckDBPyConnection) -> Row:
@@ -628,6 +631,18 @@ def _require(conn: duckdb.DuckDBPyConnection, *relations: str) -> None:
 def _fmt_ts(dt: datetime) -> str:
     """Format a datetime as a DuckDB TIMESTAMP literal / cursor string."""
     return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
+def _iso_utc(dt: datetime) -> str:
+    """Render a naive UTC datetime as an explicit-UTC ISO-8601/RFC-3339 string
+    (a trailing 'Z'), so the value itself asserts UTC — a naive `str(datetime)`
+    (space separator, no offset) is indistinguishable from any other timezone
+    and would leave FR-29's "all timestamps are UTC" notice unverifiable from
+    the data alone (FR-16). Millisecond precision (3 decimals, fixed): matches
+    `duration`'s own millisecond granularity (FR-2) and keeps the value
+    readable — sub-millisecond digits add width without adding signal an
+    agent would act on."""
+    return dt.isoformat(timespec="milliseconds") + "Z"
 
 
 def _utc_now() -> datetime:
@@ -1516,7 +1531,97 @@ def _seal_external_access(conn: duckdb.DuckDBPyConnection, command: str) -> None
     conn.execute("SET enable_external_access=false")
 
 
-def run_command(args: argparse.Namespace) -> CommandResult:
+# The six commands whose results carry a clear OpenTelemetry signal and thus get
+# the FR-29 response header; `sql` (no fixed signal) and the non-query commands
+# (collector-config/troubleshoot/doctor, handled outside run_command) do not.
+_HEADER_COMMANDS = frozenset({"summary", "errors", "slow", "trace", "logs", "metric"})
+_HEADER_SIGNAL_ORDER = ("traces", "logs", "metrics")
+# cmd_errors tags each row "span" or "log" (FR-4); map that to the plural
+# Signal names the response header uses (FR-29).
+_ERRORS_KIND_SIGNAL = {"span": "traces", "log": "logs"}
+
+
+def _result_time_range(
+    conn: duckdb.DuckDBPyConnection,
+    command: str,
+    columns: list[str],
+    rows: list[Row],
+) -> TimeRange:
+    """The min/max `timestamp` among a result's rows, for the FR-29 response
+    header. `summary`'s rows carry per-bucket `earliest`/`latest` instead of a
+    single `timestamp` column (some buckets are zero-count with null bounds);
+    `trace`'s rows carry neither (FR-6's columns describe the tree shape, not
+    raw fields), so its range is looked up from `traces` by the returned rows'
+    own `span_id`s — still strictly derived from the rows actually returned,
+    not the query's search window. Not computed for `sql` (arbitrary column
+    shapes, no response header to feed anyway)."""
+    if not rows or command not in _HEADER_COMMANDS:
+        return None, None
+    if command == "summary":
+        los = [r[3] for r in rows if r[3] is not None]
+        his = [r[4] for r in rows if r[4] is not None]
+        return (min(los) if los else None, max(his) if his else None)
+    if "timestamp" in columns:
+        idx = columns.index("timestamp")
+        values = [r[idx] for r in rows]
+        return (min(values), max(values))
+    if command == "trace":
+        span_ids = [r[-1] for r in rows]
+        placeholders = ",".join("?" * len(span_ids))
+        lo, hi = _one_row(
+            conn.execute(
+                f"SELECT min(timestamp), max(timestamp) FROM traces "
+                f"WHERE span_id IN ({placeholders})",
+                span_ids,
+            )
+        )
+        return (lo, hi)
+    return None, None
+
+
+def _result_signal(command: str, rows: list[Row]) -> str:
+    """The FR-29 header's `<signal>` value: a fixed mapping for the five
+    single-signal commands, or the set of signals actually represented among
+    the returned rows for `summary`/`errors`, whose rows can span more than one
+    OpenTelemetry signal (FR-3, FR-4)."""
+    if command in ("slow", "trace"):
+        return "traces"
+    if command == "logs":
+        return "logs"
+    if command == "metric":
+        return "metrics"
+    if command == "summary":
+        present = {r[0] for r in rows}
+    elif command == "errors":
+        present = {_ERRORS_KIND_SIGNAL[r[0]] for r in rows}
+    else:
+        return "n/a"
+    ordered = [s for s in _HEADER_SIGNAL_ORDER if s in present]
+    return ", ".join(ordered) if ordered else "n/a"
+
+
+def _format_response_header(
+    command: str, fmt: str, rows: list[Row], time_range: TimeRange
+) -> str:
+    """Render the FR-29 response header: a fixed plain-text block naming the
+    command, format, OpenTelemetry signal(s), and UTC time range, so an LLM
+    consumer cannot mistake a rendered `timestamp` for local time."""
+    lo, hi = time_range
+    from_str = _iso_utc(lo) if lo is not None else "n/a"
+    to_str = _iso_utc(hi) if hi is not None else "n/a"
+    return "\n".join(
+        [
+            "==========",
+            f"otelq {command} response, format {fmt}",
+            f"OpenTelemetry signal: {_result_signal(command, rows)}",
+            f"Time range: {from_str} - {to_str}",
+            "IMPORTANT: all timestamps are UTC",
+            "----------",
+        ]
+    )
+
+
+def run_command(args: argparse.Namespace) -> tuple[list[str], list[Row], TimeRange]:
     """Plan, build the connection, dispatch, and apply trace/metric cold-fallback."""
     # A --dir that exists but is not a directory (e.g. a regular file) would
     # crash deep in the cache layer: _acquire_lock does mkdir('<file>/.otelq-cache')
@@ -1540,7 +1645,8 @@ def run_command(args: argparse.Namespace) -> CommandResult:
                 raise
         else:
             if not (fallback and not rows):
-                return columns, rows
+                time_range = _result_time_range(conn, args.command, columns, rows)
+                return columns, rows, time_range
     # Fell through: the hot window held no answer and this command may widen to a
     # full-history cold scan (only `trace` today). closing() has already released
     # the hot connection before we open the cold one (D-3).
@@ -1551,10 +1657,19 @@ def run_command(args: argparse.Namespace) -> CommandResult:
         )
     with closing(build_connection(args.dir, Plan("COLD", None, True))) as conn:
         _seal_external_access(conn, args.command)
-        return command(conn, args)
+        columns, rows = command(conn, args)
+        time_range = _result_time_range(conn, args.command, columns, rows)
+        return columns, rows, time_range
 
 
 def format_output(columns: list[str], rows: list[tuple[Any, ...]], fmt: str) -> str:
+    # Render every `timestamp`/`earliest`/`latest` value as an explicit-UTC
+    # ISO-8601 string up front, once, so all five formats (table/json/jsonl/
+    # csv/compact) show a value that asserts UTC itself (FR-16) rather than a
+    # naive `str(datetime)` that looks identical for any timezone.
+    rows = [
+        tuple(_iso_utc(v) if isinstance(v, datetime) else v for v in r) for r in rows
+    ]
     if fmt == "json":
         # Compact separators (no spaces): pretty-printing roughly doubles the
         # token count for the tool's primary consumer — AI agents — against the
@@ -2220,6 +2335,12 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
             """\
+            timestamps: ALL timestamps — printed by otelq and written into a
+              `sql` query — are UTC. Write `sql` timestamp literals bare
+              ('YYYY-MM-DD HH:MM:SS') or 'Z'-suffixed ('...T10:00:00Z'); never
+              a non-Z offset (e.g. +02:00) — DuckDB silently drops it instead
+              of converting, so the comparison would be silently wrong.
+
             argument order:
               --dir / --format / --all / --no-cache / --since / --verbose are
               GLOBAL flags and must come BEFORE the subcommand:
@@ -2228,7 +2349,7 @@ def build_parser() -> argparse.ArgumentParser:
               --level, --grep) go AFTER the subcommand.
 
             output format (pick the fewest tokens the consumer can parse):
-              --format compact  BEST for agents/LLMs: a single
+              --format compact  DEFAULT. BEST for agents/LLMs: a single
                                 {"columns":[...],"rows":[[...]]} object — column
                                 names once, each row a positional array. Lossless
                                 and the smallest machine format (no repeated keys).
@@ -2236,7 +2357,7 @@ def build_parser() -> argparse.ArgumentParser:
               --format json     a JSON array of per-row objects; use only when a
               --format jsonl    consumer needs self-describing rows / streaming.
               --format csv      spreadsheet/interchange.
-              --format table    default; for humans, not for parsing.
+              --format table    for a human reading the terminal, not for parsing.
 
             time window (filters by each record's own event-time):
               (default)            a recent window (the cache's hot window)
@@ -2263,6 +2384,8 @@ def build_parser() -> argparse.ArgumentParser:
                 metrics_histogram, metrics_exp_histogram  count, sum, min, max
                        (+ bucket_counts/explicit_bounds, or scale/zero_count/…)
               (the OTel Summary metric type is unsupported by the reader extension)
+              timestamp columns are naive UTC — see "timestamps" above for the
+              literal convention when filtering on them.
               the built-in commands read only the telemetry under --dir. `sql`
               is an escape hatch that runs with YOUR user's file access (it can
               read/write local files via read_csv/COPY), so treat untrusted
@@ -2287,8 +2410,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--format",
         choices=["table", "json", "jsonl", "csv", "compact"],
-        default="table",
-        help="output format (default: table; json/jsonl/compact are compact for agents)",
+        default="compact",
+        help="output format (default: compact, the fewest-token format for "
+        "agents; pass --format table for a human-readable view)",
     )
     parser.add_argument(
         "--all",
@@ -2377,10 +2501,12 @@ def _dispatch(args: argparse.Namespace) -> int:
         print(format_output(["check", "status", "detail"], rows, args.format))
         return 0 if ok else 1
     try:
-        columns, rows = run_command(args)
+        columns, rows, time_range = run_command(args)
     except NoTelemetryError as exc:
         print(exc, file=sys.stderr)
         return 0
+    if args.command in _HEADER_COMMANDS:
+        print(_format_response_header(args.command, args.format, rows, time_range))
     print(format_output(columns, rows, args.format))
     return 0
 

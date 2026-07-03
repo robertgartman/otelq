@@ -757,6 +757,21 @@ def temp_telemetry(tmp_path: Path) -> Path:
     return d
 
 
+import re as _re  # noqa: E402
+
+# The FR-29 response header (====== ... ------) that precedes the FR-10 payload
+# for summary/errors/slow/trace/logs/metric, in every --format. A no-op on
+# output that carries no header (sql/doctor/help/etc.), so tests that just need
+# the bare payload can apply this unconditionally.
+_HEADER_RE = _re.compile(r"\A==========\n.*?\n----------\n", _re.DOTALL)
+
+
+def _strip_header(out: str) -> str:
+    """Strip the FR-29 response header from otelq stdout, leaving the bare
+    FR-10 payload for tests that parse or compare it directly."""
+    return _HEADER_RE.sub("", out, count=1)
+
+
 def _run(dirpath: Path, *argv: str) -> str:
     """Run the CLI in-process; return its stdout string."""
     import io as _io
@@ -845,7 +860,7 @@ def test_absent_signals_resolve_empty_metrics_only(temp_telemetry: Path) -> None
         nocache = _run(temp_telemetry, "--no-cache", "sql", f"SELECT count(*) AS n FROM {rel}")
         assert _json.loads(cached) == [{"n": 0}]  # resolves empty, not an error
         assert cached == nocache, f"cached != --no-cache for {rel}"
-    rows = _json.loads(_run(temp_telemetry, "summary"))
+    rows = _json.loads(_strip_header(_run(temp_telemetry, "summary")))
     assert {r["signal"] for r in rows} == {"metrics"}  # no trace/log skeleton
     for argv in (["slow"], ["trace", "deadbeef"], ["errors"]):
         out, err = _run_both(temp_telemetry, *argv)
@@ -927,7 +942,8 @@ def test_bug3_logs_grep_is_literal_substring(temp_telemetry: Path) -> None:
     )
 
     def bodies(*flags: str) -> list[str]:
-        return [r["body"] for r in _json.loads(_run(temp_telemetry, "logs", *flags))]
+        out = _strip_header(_run(temp_telemetry, "logs", *flags))
+        return [r["body"] for r in _json.loads(out)]
 
     # '_' is literal: matches "user_id matched" only, not "userXid mismatch"
     assert bodies("--grep", "user_id") == ["user_id matched"]
@@ -976,7 +992,7 @@ def test_bug6_logs_order_deterministic_across_cache_paths(temp_telemetry: Path) 
     cached = _run(temp_telemetry, "logs")
     nocache = _run(temp_telemetry, "--no-cache", "logs")
     assert cached == nocache  # tie-breaker makes equal-timestamp order deterministic
-    assert len(_json.loads(cached)) == 4
+    assert len(_json.loads(_strip_header(cached))) == 4
 
 
 # --- AC-1 / FR-1, FR-5: sealing produces per-minute partitions ----------------
@@ -1153,7 +1169,8 @@ def _signal_count(dirpath: Path, signal: str, *argv: str) -> int:
 
 def _sum_signal(out: str, signal: str = "traces") -> int:
     """Total count for a signal across summary's per-row breakdown."""
-    return sum(r["count"] for r in _json.loads(out) if r["signal"] == signal)
+    rows = _json.loads(_strip_header(out))
+    return sum(r["count"] for r in rows if r["signal"] == signal)
 
 
 def _minutes_per_minute(base: datetime, n: int) -> list[dict[str, Any]]:
@@ -1269,7 +1286,7 @@ def test_ac10_trace_cold_fallback(temp_telemetry: Path) -> None:
     write_jsonl(temp_telemetry / "traces.jsonl", _minutes_per_minute(base, 90))
     # t5 is ~85 minutes old: absent from the hot cache, found via cold fallback
     out = _run(temp_telemetry, "trace", trace_hex("t5"))
-    assert len(_json.loads(out)) == 1
+    assert len(_json.loads(_strip_header(out))) == 1
     assert out == _run(temp_telemetry, "--no-cache", "trace", trace_hex("t5"))
 
 
@@ -1729,6 +1746,10 @@ def test_help_epilog_documents_argument_order_and_sql_schema() -> None:
     help_text = otelq.build_parser().format_help()
     assert "GLOBAL flags" in help_text
     assert "BEFORE the subcommand" in help_text
+    # FR-30: the UTC timestamp convention must be stated early/prominently, not
+    # buried only in the sql cheat-sheet — it precedes "argument order:".
+    assert help_text.index("timestamps:") < help_text.index("argument order:")
+    assert "UTC" in help_text and "non-Z offset" in help_text
     # The help must steer agents to the token-efficient machine format (AC-37).
     assert "compact" in help_text
     for view in (
@@ -1741,6 +1762,28 @@ def test_help_epilog_documents_argument_order_and_sql_schema() -> None:
         "metrics_exp_histogram",
     ):
         assert view in help_text
+
+
+def test_readme_help_dump_matches_live_help() -> None:
+    # Drift guard: the README's `otelq --help` dump (## Commands) must match
+    # the real output, so a future flag/epilog change is caught here instead
+    # of the README silently rotting — as it had, before this test existed.
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    marker = "```text\n"
+    start = readme.index(marker, readme.index("## Commands")) + len(marker)
+    end = readme.index("\n```", start)
+    dumped = readme[start:end]
+
+    # The README shows a generic <cwd>/.telemetry placeholder for --dir's
+    # default; the real absolute path is a different length and wraps the
+    # help text differently, so patch it before rendering rather than after.
+    original_default = otelq.DEFAULT_DIR
+    otelq.DEFAULT_DIR = Path("<cwd>/.telemetry")
+    try:
+        live = otelq.build_parser().format_help()
+    finally:
+        otelq.DEFAULT_DIR = original_default
+    assert dumped.strip("\n") == live.strip("\n")
 
 
 def test_bare_otelq_prints_full_help() -> None:
@@ -1860,11 +1903,11 @@ def test_f1_top_caps_rows_and_warns_on_stderr(temp_telemetry: Path) -> None:
         [make_log(base + timedelta(seconds=i), body=f"m{i}") for i in range(6)],
     )
     out, err = _run_err(temp_telemetry, "logs", "--top", "2")
-    assert len(_json.loads(out)) == 2
+    assert len(_json.loads(_strip_header(out))) == 2
     assert "truncated to 2 rows" in err
     # Under the cap: full result, no notice on stderr.
     out2, err2 = _run_err(temp_telemetry, "logs", "--top", "50")
-    assert len(_json.loads(out2)) == 6
+    assert len(_json.loads(_strip_header(out2))) == 6
     assert "truncated" not in err2
 
 
@@ -1887,7 +1930,8 @@ def test_f2_since_seconds_windows_end_to_end(temp_telemetry: Path) -> None:
         ],
     )
     # Anchor is the max event-time (base+40s); a 30s window keeps mid+newest.
-    bodies = [r["body"] for r in _json.loads(_run(temp_telemetry, "--since", "30s", "logs"))]
+    out = _strip_header(_run(temp_telemetry, "--since", "30s", "logs"))
+    bodies = [r["body"] for r in _json.loads(out)]
     assert "oldest" not in bodies
     assert set(bodies) == {"mid", "newest"}
     assert _run(temp_telemetry, "--since", "30s", "logs") == _run(
@@ -1935,10 +1979,10 @@ def test_f4_trace_prefix_resolves_and_flags_ambiguity(temp_telemetry: Path) -> N
         ],
     )
     # A unique prefix resolves to the one trace (its single span).
-    rows = _json.loads(_run(temp_telemetry, "--all", "trace", "bbbb"))
+    rows = _json.loads(_strip_header(_run(temp_telemetry, "--all", "trace", "bbbb")))
     assert [r["span_name"].strip() for r in rows] == ["span-b"]
     # An exact id still works.
-    exact = _json.loads(_run(temp_telemetry, "--all", "trace", tid_a1))
+    exact = _json.loads(_strip_header(_run(temp_telemetry, "--all", "trace", tid_a1)))
     assert [r["span_name"].strip() for r in exact] == ["span-a1"]
     # An ambiguous prefix is a friendly SystemExit, not a silent pick.
     with pytest.raises(SystemExit) as exc:
@@ -1963,7 +2007,7 @@ def test_p5_format_jsonl_via_cli(temp_telemetry: Path) -> None:
     buf = _io.StringIO()
     with redirect_stdout(buf):
         otelq.main(["--dir", str(temp_telemetry), "--format", "jsonl", "logs"])
-    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    lines = [ln for ln in _strip_header(buf.getvalue()).splitlines() if ln.strip()]
     assert len(lines) == 2
     for ln in lines:
         assert isinstance(_json.loads(ln), dict)  # each line is a standalone object
@@ -1990,7 +2034,7 @@ def test_p5_format_compact_via_cli(temp_telemetry: Path) -> None:
     buf = _io.StringIO()
     with redirect_stdout(buf):
         otelq.main(["--dir", str(temp_telemetry), "--format", "compact", "logs"])
-    obj: dict[str, Any] = _json.loads(buf.getvalue())
+    obj: dict[str, Any] = _json.loads(_strip_header(buf.getvalue()))
     assert set(obj) == {"columns", "rows"}
     columns: list[str] = obj["columns"]
     rows: list[list[Any]] = obj["rows"]
@@ -2082,3 +2126,214 @@ def test_b5_single_quote_in_dir_path_is_sql_safe(tmp_path: Path) -> None:
     nocache = _run(d, "--all", "--no-cache", "sql", "SELECT count(*) AS n FROM logs")
     assert _json.loads(cached) == [{"n": 2}]  # no SQL breakage on the quoted path
     assert cached == nocache
+
+
+# =============================================================================
+# FR-29 / AC-38..AC-42: the response header
+# =============================================================================
+
+
+def _run_fmt(dirpath: Path, fmt: str, *argv: str) -> str:
+    """Run the CLI in-process with an explicit --format; return stdout."""
+    import io as _io
+    from contextlib import redirect_stdout
+
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        otelq.main(["--dir", str(dirpath), "--format", fmt, *argv])
+    return buf.getvalue()
+
+
+def test_ac38_response_header_shape_and_placement(temp_telemetry: Path) -> None:
+    # AC-38: summary/errors/slow/trace/logs/metric print a fixed header before
+    # the FR-10 rendering, for every --format; the payload after it is
+    # unchanged from the header-less rendering of the same rows.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
+    conn = otelq.connect(temp_telemetry)
+    columns, rows = otelq.cmd_logs(conn, Namespace(service=None, level=None, grep=None))
+    for fmt in ("table", "json", "jsonl", "csv", "compact"):
+        out = _run_fmt(temp_telemetry, fmt, "logs")
+        lines = out.splitlines()
+        assert lines[0] == "=" * 10
+        assert lines[1] == f"otelq logs response, format {fmt}"
+        assert lines[2] == "OpenTelemetry signal: logs"
+        assert lines[3].startswith("Time range: ") and " - " in lines[3]
+        assert lines[4] == "IMPORTANT: all timestamps are UTC"
+        assert lines[5] == "-" * 10
+        assert _strip_header(out) == otelq.format_output(columns, rows, fmt) + "\n"
+
+
+def test_ac39_no_header_on_non_governed_commands(temp_telemetry: Path) -> None:
+    # AC-39: sql (no fixed signal) and the non-query commands print no header.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base)])
+    sql_out = _run(temp_telemetry, "sql", "SELECT count(*) AS n FROM logs")
+    assert not sql_out.startswith("==========")
+
+    import io as _io
+    from contextlib import redirect_stdout
+
+    for argv in (
+        ["--dir", str(temp_telemetry), "doctor"],
+        ["collector-config"],
+        ["troubleshoot"],
+    ):
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            otelq.main(argv)
+        assert not buf.getvalue().startswith("==========")
+
+
+def test_ac40_zero_row_time_range_is_na(temp_telemetry: Path) -> None:
+    # AC-40: a zero-row result (an unknown metric name) still prints the
+    # header, with Time range: n/a - n/a rather than failing or omitting it.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "metrics.jsonl", [make_gauge(base, name="db.pool")])
+    out = _run(temp_telemetry, "metric", "does.not.exist")
+    lines = out.splitlines()
+    assert lines[2] == "OpenTelemetry signal: metrics"
+    assert lines[3] == "Time range: n/a - n/a"
+    assert _json.loads(_strip_header(out)) == []
+
+
+def test_ac41_summary_and_errors_signal_lists_present_signals(
+    temp_telemetry: Path,
+) -> None:
+    # AC-41: summary/errors rows can span more than one signal; the header
+    # lists whichever of traces/logs/metrics are actually present, comma-joined
+    # in that fixed order.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base, status_code=2)])
+    write_jsonl(
+        temp_telemetry / "logs.jsonl", [make_log(base, severity="ERROR", sevnum=17)]
+    )
+    summary_out = _run(temp_telemetry, "summary")
+    assert summary_out.splitlines()[2] == "OpenTelemetry signal: traces, logs"
+    errors_out = _run(temp_telemetry, "errors")
+    assert errors_out.splitlines()[2] == "OpenTelemetry signal: traces, logs"
+
+
+def test_ac41_errors_signal_is_traces_only_when_no_error_logs(
+    temp_telemetry: Path,
+) -> None:
+    # AC-41 (single-signal case): a traces-only-error corpus (no error/fatal
+    # logs) makes errors's header signal field read "traces" alone.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base, status_code=2)])
+    write_jsonl(
+        temp_telemetry / "logs.jsonl", [make_log(base, severity="INFO", sevnum=9)]
+    )
+    out = _run(temp_telemetry, "errors")
+    assert out.splitlines()[2] == "OpenTelemetry signal: traces"
+
+
+def test_ac42_errors_zero_rows_signal_is_na(temp_telemetry: Path) -> None:
+    # AC-42: errors's signal is derived from the returned rows (unlike the
+    # fixed single-signal commands), so a zero-row result reads n/a for the
+    # signal too, not just the time range.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base, status_code=0)])
+    write_jsonl(
+        temp_telemetry / "logs.jsonl", [make_log(base, severity="INFO", sevnum=9)]
+    )
+    out = _run(temp_telemetry, "errors")
+    lines = out.splitlines()
+    assert lines[2] == "OpenTelemetry signal: n/a"
+    assert lines[3] == "Time range: n/a - n/a"
+    assert _json.loads(_strip_header(out)) == []
+
+
+# =============================================================================
+# FR-30 / AC-43, AC-44: sql timestamp-literal UTC convention
+# =============================================================================
+
+
+def test_ac43_sql_timestamp_literal_utc_convention(temp_telemetry: Path) -> None:
+    # FR-30/EC-24: timestamp columns are naive UTC. A bare or Z-suffixed
+    # literal must match a known-UTC record; a literal carrying an explicit
+    # non-Z offset for the SAME instant must NOT match, because DuckDB
+    # silently discards the offset instead of converting it — pinning the
+    # documented footgun against otelq's own relations (not an isolated
+    # DuckDB sanity check), so a future DuckDB upgrade that changes this
+    # parsing behavior is caught rather than silently masked.
+    base = datetime(2026, 7, 1, 10, 0, 0, tzinfo=timezone.utc)  # == 12:00 at +02:00
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
+
+    def count(literal: str) -> int:
+        out = _run(
+            temp_telemetry,
+            "sql",
+            f"SELECT count(*) AS n FROM logs WHERE timestamp = '{literal}'",
+        )
+        return _json.loads(out)[0]["n"]
+
+    assert count("2026-07-01 10:00:00") == 1  # bare UTC literal matches
+    assert count("2026-07-01T10:00:00Z") == 1  # Z-suffixed literal matches
+    # Same instant, correctly converted, written with an explicit +02:00
+    # offset: DuckDB discards the offset instead of applying it, so this must
+    # NOT match — the silently-wrong result the convention warns against.
+    assert count("2026-07-01T12:00:00+02:00") == 0
+
+
+_UTC_TS_RE = _re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+
+
+def test_ac45_timestamps_render_explicit_utc(temp_telemetry: Path) -> None:
+    # FR-16/EC-25: every rendered timestamp — in every format, plus summary's
+    # earliest/latest and the FR-29 header's Time range — is an explicit-UTC
+    # ISO-8601 string (a trailing Z), never a naive str(datetime) that looks
+    # identical for any timezone.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
+
+    for fmt in ("table", "json", "jsonl", "csv", "compact"):
+        out = _run_fmt(temp_telemetry, fmt, "logs")
+        lines = out.splitlines()
+        from_str, to_str = lines[3].removeprefix("Time range: ").split(" - ")
+        assert _UTC_TS_RE.match(from_str) and _UTC_TS_RE.match(to_str)
+        payload = _strip_header(out)
+        if fmt == "json":
+            ts = _json.loads(payload)[0]["timestamp"]
+        elif fmt == "jsonl":
+            ts = _json.loads(payload.splitlines()[0])["timestamp"]
+        elif fmt == "compact":
+            obj = _json.loads(payload)
+            ts = obj["rows"][0][obj["columns"].index("timestamp")]
+        elif fmt == "csv":
+            ts = payload.splitlines()[1].split(",")[0]
+        else:  # table
+            ts = payload.splitlines()[2].split()[0]
+        assert _UTC_TS_RE.match(ts), f"{fmt}: {ts!r} is not explicit-UTC ISO-8601"
+
+    # summary's earliest/latest columns too
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base, status_code=0)])
+    rows = _json.loads(_strip_header(_run(temp_telemetry, "summary")))
+    for r in rows:
+        if r["count"] > 0:
+            assert _UTC_TS_RE.match(r["earliest"])
+            assert _UTC_TS_RE.match(r["latest"])
+
+
+def test_ac46_compact_is_the_default_format(temp_telemetry: Path) -> None:
+    # FR-10/EC-26: omitting --format defaults to compact (the fewest-token
+    # format) — otelq's primary consumer is an AI agent; --format table
+    # remains available as the explicit human-reading opt-in.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
+
+    import io as _io
+    from contextlib import redirect_stdout
+
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        otelq.main(["--dir", str(temp_telemetry), "logs"])  # no --format
+    default_out = buf.getvalue()
+
+    assert default_out == _run_fmt(temp_telemetry, "compact", "logs")
+    payload = _strip_header(default_out)
+    obj = _json.loads(payload)
+    assert set(obj) == {"columns", "rows"}  # the compact shape, not a table
+
+    table_out = _run_fmt(temp_telemetry, "table", "logs")
+    assert table_out != default_out  # table remains an explicit opt-in

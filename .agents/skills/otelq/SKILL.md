@@ -20,6 +20,14 @@ output folder (the bind-mounted `.telemetry/` at the project root). Start with
 `summary` when you don't yet know what to query. Pin a version with
 `uvx otelq@<version> …`.
 
+## Timestamps are UTC
+
+**All timestamps are UTC** — every `timestamp` otelq prints, and every one you
+write into a `sql` filter. Each response also restates this up front. For
+`sql` literals, write them bare (`'2026-07-01 10:00:00'`) or `Z`-suffixed
+(`'2026-07-01T10:00:00Z'`); never a `+02:00`-style offset — DuckDB silently
+drops it instead of converting, so the comparison would be silently wrong.
+
 ## Pick the fewest-token format
 
 **Default to `--format compact` for anything you parse yourself.** It returns one

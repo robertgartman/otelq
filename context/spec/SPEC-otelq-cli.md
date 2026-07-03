@@ -12,7 +12,7 @@ must_not_contain:
   - architectural_rationale
   - external_data_schemas
 created: 2026-06-23
-last_updated: 2026-07-02
+last_updated: 2026-07-03
 related_documents:
   - PRD-otelq
   - SPEC-otelq-incremental-cache
@@ -60,8 +60,11 @@ seven subcommands (`summary`, `errors`, `slow`, `trace`, `logs`, `metric`,
 the per-command output row bound (`--top`); the five output formats and their
 format-independence; the `sql` filesystem-access boundary and the external-access
 lockdown for built-in commands; timestamp correction (and far-future clamping) in
-the presented output; and otelq's exit-code and stderr behavior when telemetry is
-absent, partial, or malformed.
+the presented output; the response header printed before the six signal-bearing
+commands' results, naming the command, format, signal, and UTC time range; the
+UTC convention for `timestamp` literals a caller writes into `sql`; and
+otelq's exit-code and stderr behavior when telemetry is absent, partial, or
+malformed.
 
 **Not covered:** the raw telemetry directory and OTLP JSONL schema (an external
 input — see [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md));
@@ -94,6 +97,11 @@ configuration that produces the raw files.
   `timestamp` column (see FR-16).
 - **Result** — the `(columns, rows)` pair a command produces, rendered by the
   selected output format.
+- **Response header** — a fixed-format plain-text preamble that otelq prints to
+  stdout before the rendered result of the six signal-bearing commands (see
+  FR-29), naming the invoked command, the resolved format, the OpenTelemetry
+  signal(s) involved, and the returned rows' time range, so an LLM consumer
+  cannot mistake a rendered `timestamp` for local time.
 
 ## Functional Requirements
 
@@ -226,8 +234,10 @@ configuration that produces the raw files.
 ### Global flags and argument order
 
 - **FR-10 — `--format`.** A `--format` global flag **must** accept exactly
-  `table`, `json`, `jsonl`, `csv`, or `compact`, defaulting to `table`, and
-  **must** select the rendering of the result. `table` is for human reading;
+  `table`, `json`, `jsonl`, `csv`, or `compact`, defaulting to `compact` (otelq's
+  primary consumer is an AI agent, per [PRD-otelq](../prd/PRD-otelq.md); a human
+  reading the terminal opts in with `--format table`), and **must** select the
+  rendering of the result. `table` is for human reading;
   `json` is a single compact JSON array for programmatic consumption (compact
   separators, no insignificant whitespace, to minimize tokens for the AI-agent
   consumer per [PRD-otelq](../prd/PRD-otelq.md)); `jsonl` emits one compact JSON
@@ -238,6 +248,9 @@ configuration that produces the raw files.
   but without repeating the column keys on every row, further reducing tokens for
   the AI-agent consumer. A `compact` result **must** be reconstructible to the
   exact records `json` would emit by zipping each `rows` entry with `columns`.
+  For `summary`, `errors`, `slow`, `trace`, `logs`, and `metric`, this rendering
+  is the **payload** that follows the response header of FR-29 on stdout; FR-10
+  governs that payload, not the header itself.
 - **FR-11 — Global flags precede the subcommand.** `--format`, `--dir`,
   `--all`, `--no-cache`, and `--since` are global flags and **must** be accepted
   *before* the subcommand. Supplying a global flag *after* the subcommand
@@ -274,7 +287,36 @@ configuration that produces the raw files.
   rather than pushing the window past all real data. The clamp is defined once, as
   the window/watermark anchor, in
   [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md) (INV-7, EC-12);
-  `doctor` surfaces the condition as a non-fatal warning (FR-26).
+  `doctor` surfaces the condition as a non-fatal warning (FR-26). Every rendered
+  timestamp value — every relation's `timestamp` column, `summary`'s `earliest`/
+  `latest` columns, and the FR-29 response header's `Time range` — **must** be an
+  explicit-UTC ISO-8601/RFC-3339 string carrying a trailing `Z`, at fixed
+  millisecond precision (`YYYY-MM-DDTHH:MM:SS.fffZ`, exactly 3 fractional
+  digits, matching `duration`'s own millisecond granularity, FR-2), in every
+  `--format`, so the value itself asserts UTC. A naive `str(datetime)`
+  rendering (a space separator and no offset/designator) **must not** be used:
+  it is visually indistinguishable from any other timezone, which would leave
+  FR-29's "all timestamps are UTC" notice unverifiable from the data itself.
+- **FR-30 — `sql` timestamp-literal input convention.** `timestamp` columns
+  (FR-2) are naive (timezone-free) and always represent corrected UTC
+  wall-clock (FR-16); this is the counterpart requirement for the one place a
+  caller writes a timestamp back **into** otelq, `sql`'s free-form `WHERE`
+  clauses (FR-9). A caller **must** write a `timestamp` literal either bare
+  (`'YYYY-MM-DD HH:MM:SS[.ffffff]'`) or as an ISO-8601 string with a trailing
+  `Z` (e.g. `'2026-07-01T10:00:00Z'`) — both **must** be treated as UTC and
+  compare correctly against the column. A literal carrying an explicit non-`Z`
+  offset (e.g. `'2026-07-01T12:00:00+02:00'`) **must not** be used: the
+  underlying DuckDB TIMESTAMP cast silently **discards** the offset rather than
+  converting it, so the literal is compared as if its wall-clock digits were
+  already UTC — a wrong comparison with no error, not a rejection. otelq
+  **cannot** correct this by rewriting the caller's SQL text (`sql` is
+  arbitrary, unparsed free-form SQL, FR-9/FR-27) — the convention is enforced
+  only by documentation. otelq's `--help` **must** state it in an early,
+  prominent block (ahead of the "argument order" section), not only inside the
+  `sql views` cheat-sheet, since an agent may act on a truncated read of long
+  help text. The convention is pinned by a test against otelq's actual
+  relations, so a future DuckDB upgrade that changes
+  this literal-parsing behavior is caught rather than silently masked.
 - **FR-17 — Exit codes.** otelq **must** exit `0` on success, including when a
   command produces zero result rows, prints a friendly "no telemetry" message
   (FR-18, FR-19), or prints help (a bare `otelq` or `otelq help`, FR-22). A
@@ -369,6 +411,39 @@ configuration that produces the raw files.
   e.g. `Robert's Mac`). Such a path **must not** cause a SQL syntax error or
   permit injection; every filesystem path spliced into SQL **must** be escaped or
   bound. This holds identically on the cache and `--no-cache` paths.
+- **FR-29 — Response header.** For `summary`, `errors`, `slow`, `trace`, `logs`,
+  and `metric` — **not** `sql`, `collector-config`, `troubleshoot`, or `doctor` —
+  otelq **must** print a fixed-format response header to **stdout**, immediately
+  before the command's rendered result, for **every** `--format` value:
+  ```
+  ==========
+  otelq <command> response, format <format>
+  OpenTelemetry signal: <signal>
+  Time range: <from> - <to>
+  IMPORTANT: all timestamps are UTC
+  ----------
+  ```
+  - `<command>` **must** be the literal invoked subcommand name.
+  - `<format>` **must** be the resolved `--format` value (`table`, `json`,
+    `jsonl`, `csv`, or `compact`).
+  - `<signal>` **must** use the plural signal names already defined in
+    Definitions (`traces`, `logs`, `metrics`): `traces` for `slow` and `trace`;
+    `logs` for `logs`; `metrics` for `metric`. For `summary` and `errors`, whose
+    rows can span more than one OpenTelemetry signal (FR-3, FR-4), `<signal>`
+    **must** be the set of signals actually represented among the returned rows,
+    comma-joined in the fixed order `traces, logs, metrics` (only the present
+    ones listed), or `n/a` when the result has zero rows.
+  - `<from>` and `<to>` **must** be the minimum and maximum `timestamp` value
+    among the command's returned rows, rendered with the same corrected-UTC
+    formatting used elsewhere in the output (FR-16); both **must** render as
+    `n/a` when the result has zero rows.
+  - The header **must** precede the FR-10 rendering of the result and **must
+    not** itself be rendered as `json`/`jsonl`/`csv`/`compact` — it is always
+    this fixed plain-text block, byte-identical in structure regardless of
+    `--format` (only the `<format>` value inside it varies). A consumer that
+    needs the bare payload skips past the line of ten `-` characters.
+  - The header **must not** change which rows are returned, their order, or the
+    FR-10 rendering rules applied to the payload that follows it (INV-6).
 
 ## Edge Cases & Failure Modes
 
@@ -452,6 +527,30 @@ configuration that produces the raw files.
   array per row — carrying the same logical rows in the same order as `table` and
   `json`. Zipping each `rows` entry with `columns` reconstructs exactly the
   objects `--format json` would emit. (FR-10, INV-2, INV-3)
+- **EC-23 — Response header present/absent.** `otelq --format json summary` (and
+  likewise `errors`/`slow`/`trace`/`logs`/`metric`) prints the fixed FR-29 header
+  to stdout before the JSON payload; `otelq sql "..."`, `doctor`,
+  `collector-config`, and `troubleshoot` print no such header. A zero-row result
+  (e.g. `metric <unknown-name>`) still prints the header, with
+  `Time range: n/a - n/a`. A corpus with both traces and logs makes `summary`'s
+  and `errors`'s header signal field read `traces, logs`; a traces-only corpus
+  makes `errors`'s read `traces` alone. (FR-29)
+- **EC-24 — `sql` timestamp-literal offset is silently discarded.** Given a
+  `timestamp` value known to be `2026-07-01 10:00:00` UTC, `sql "SELECT * FROM
+  logs WHERE timestamp = '2026-07-01 10:00:00'"` and `sql "SELECT * FROM logs
+  WHERE timestamp = '2026-07-01T10:00:00Z'"` both match the row; `sql "SELECT *
+  FROM logs WHERE timestamp = '2026-07-01T12:00:00+02:00'"` — the same instant,
+  correctly converted — does **not** match, because the offset is discarded
+  rather than applied. (FR-30)
+- **EC-25 — Explicit-UTC timestamp rendering.** A presented `timestamp` (or
+  `summary`'s `earliest`/`latest`, or the FR-29 header's `Time range`) matches
+  `YYYY-MM-DDTHH:MM:SS\.\d{3}Z` (exactly 3 fractional digits) in every
+  `--format` — never a bare `YYYY-MM-DD HH:MM:SS` with no trailing `Z`/offset,
+  and never 6-digit microseconds. (FR-16)
+- **EC-26 — `compact` is the default with no `--format`.** `otelq summary` (no
+  `--format` given) prints the same `{"columns":[...],"rows":[[...]]}` rendering
+  as `otelq --format compact summary`; `otelq --format table summary` remains
+  available as the explicit human-reading opt-in. (FR-10)
 
 ## Acceptance Criteria
 
@@ -512,7 +611,7 @@ configuration that produces the raw files.
 - **AC-10** (Verifies FR-10, INV-2): Given any result, when `--format json` is
   selected, then the output is a JSON array of objects keyed by the result
   columns; `--format csv` emits a header row plus CSV rows; `--format table` is
-  the default human layout.
+  the human-facing layout, opted into explicitly (not the default).
   *Verification hint: `test_format_output_json`, `test_format_output_csv`,
   `test_format_output_table_empty`.*
 - **AC-11** (Verifies FR-11, EC-5): Given a subcommand, when a global flag such as
@@ -667,6 +766,68 @@ configuration that produces the raw files.
   order.
   *Verification hint: `test_p5_format_compact_columns_rows`,
   `test_p5_format_compact_via_cli`.*
+- **AC-38** (Verifies FR-29): Given any of `summary`/`errors`/`slow`/`trace`/
+  `logs`/`metric`, when the command runs with any `--format`, then stdout begins
+  with the fixed header (a `==========` line; `otelq <command> response, format
+  <format>`; `OpenTelemetry signal: <signal>`; `Time range: <from> - <to>`; the
+  UTC notice; a `----------` line) naming the invoked command and resolved
+  format, followed by the FR-10 rendering of the result; the header's `<from>`/
+  `<to>` equal the min/max `timestamp` among the returned rows.
+  *Verification hint: run each of the six commands with `--format table` and
+  `--format json`; assert the header's exact five content lines and that the
+  payload following it is unchanged from the pre-header rendering.*
+- **AC-39** (Verifies FR-29, INV-6): Given `sql`, `doctor`, `collector-config`, or
+  `troubleshoot`, when the command runs, then stdout contains no response header.
+  *Verification hint: run each via `main`; assert stdout does not start with
+  `==========`.*
+- **AC-40** (Verifies FR-29): Given a command whose result has zero rows (e.g.
+  `metric` with an unknown name), when it runs, then the header is still printed
+  with `Time range: n/a - n/a` rather than failing or omitting the header.
+  *Verification hint: `metric <unknown-name>`; assert the header's time-range
+  line reads `n/a - n/a`.*
+- **AC-41** (Verifies FR-29): Given a corpus with both traces and logs, when
+  `summary` or `errors` runs, then the header's signal field reads
+  `traces, logs` (both present, comma-joined in the fixed order
+  `traces, logs, metrics`); given a traces-only corpus, `errors`'s header signal
+  field reads `traces` alone.
+  *Verification hint: vary the fixture's captured signals; assert the header's
+  `OpenTelemetry signal:` line for `summary` and `errors`.*
+- **AC-42** (Verifies FR-29): Given a corpus with no error-status spans and no
+  error/fatal logs, when `errors` runs, then its result has zero rows and the
+  header's signal field — not just the time range — reads `n/a`, since
+  `errors`'s signal (unlike `slow`/`trace`/`logs`/`metric`'s fixed mapping) is
+  derived from the returned rows.
+  *Verification hint: a fixture with only healthy (non-error) traces/logs; run
+  `errors`; assert `OpenTelemetry signal: n/a` and `Time range: n/a - n/a`.*
+- **AC-43** (Verifies FR-30, EC-24): Given a record with a known UTC
+  `timestamp`, when `sql` filters on that value as a bare literal or as a
+  `Z`-suffixed ISO-8601 literal, then both match the record; when it filters on
+  the same instant written with an explicit non-`Z` offset, then it does
+  **not** match, pinning that the offset is silently discarded rather than
+  converted.
+  *Verification hint: `test_ac43_sql_timestamp_literal_utc_convention` against
+  otelq's own `traces`/`logs`/`metrics` relations (not an isolated DuckDB
+  sanity check), so a DuckDB upgrade that changes this parsing behavior is
+  caught.*
+- **AC-44** (Verifies FR-30): Given `otelq --help`, when its text is rendered,
+  then a "timestamps" block stating the UTC convention appears before the
+  "argument order" section, not only inside the `sql views` cheat-sheet.
+  *Verification hint:
+  `test_help_epilog_documents_argument_order_and_sql_schema`; assert the
+  "timestamps:" block's index precedes "argument order:"'s.*
+- **AC-45** (Verifies FR-16, EC-25): Given any command that returns rows with a
+  `timestamp` (or `summary`'s `earliest`/`latest`), when it is rendered in
+  **each** of `table`, `json`, `jsonl`, `csv`, and `compact`, then every such
+  value in every one of those five renderings matches
+  `YYYY-MM-DDTHH:MM:SS\.\d{3}Z` (exactly 3 fractional digits); the FR-29
+  response header's `Time range` values do too.
+  *Verification hint: `test_ac45_timestamps_render_explicit_utc`; regex-match
+  the rendered value in each format plus the header's `Time range` line.*
+- **AC-46** (Verifies FR-10, EC-26): Given a command with no `--format` flag,
+  when it runs, then its stdout equals the same command run with an explicit
+  `--format compact`; `--format table` still renders the human table.
+  *Verification hint: `test_ac46_compact_is_the_default_format`; compare stdout
+  with and without an explicit `--format compact`.*
 
 ### Examples
 
@@ -699,11 +860,12 @@ configuration that produces the raw files.
 - **INV-1** — Read-only over telemetry: otelq never modifies, creates, or deletes
   the raw telemetry files it reads. Its output is a pure function of (the
   telemetry it reads, the command, and the flags).
-- **INV-2** — Output-format roles are fixed: `table` is the human-facing default;
-  `json` (a single compact array), `jsonl` (one compact object per line), and
-  `compact` (a single object with a `columns` header and positional `rows`
-  arrays) are the machine/automation formats; `csv` is the spreadsheet/interchange
-  format. Choosing a format never changes which command runs.
+- **INV-2** — Output-format roles are fixed: `compact` (a single object with a
+  `columns` header and positional `rows` arrays) is the default, lowest-token
+  machine/automation format, alongside `json` (a single compact array) and
+  `jsonl` (one compact object per line); `table` is the human-facing format, an
+  explicit `--format table` opt-in; `csv` is the spreadsheet/interchange format.
+  Choosing a format never changes which command runs.
 - **INV-3** — Format independence: the rows a command returns, and their order,
   do not depend on which `--format` is chosen; only the rendering differs.
 - **INV-4** — Friendly failure: absent telemetry yields a human-readable stderr
@@ -712,3 +874,8 @@ configuration that produces the raw files.
 - **INV-5** — Exit-code discipline: exit `0` covers every success including empty
   results and the friendly "no telemetry" path; a non-zero exit is reserved for
   real errors (malformed SQL, malformed `--since`, argument-order parse failure).
+- **INV-6** — Header is additive, not substitutive: the FR-29 response header is
+  prepended to stdout for its six governed commands but never changes the
+  columns/rows a command returns (INV-3) nor the FR-10 rendering of the payload
+  that follows it. For `sql`, `collector-config`, `troubleshoot`, and `doctor`,
+  stdout is unchanged from FR-10's payload rendering — no header is printed.
