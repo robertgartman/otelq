@@ -1777,12 +1777,22 @@ def test_readme_help_dump_matches_live_help() -> None:
     # The README shows a generic <cwd>/.telemetry placeholder for --dir's
     # default; the real absolute path is a different length and wraps the
     # help text differently, so patch it before rendering rather than after.
+    # argparse also wraps "usage:"/options text to the terminal width (via
+    # shutil.get_terminal_size(), which honors COLUMNS) — pin it to the width
+    # the README was dumped at (80) so this test is deterministic regardless
+    # of the width of whatever terminal/CI runner actually executes it.
     original_default = otelq.DEFAULT_DIR
+    original_columns = _os.environ.get("COLUMNS")
     otelq.DEFAULT_DIR = Path("<cwd>/.telemetry")
+    _os.environ["COLUMNS"] = "80"
     try:
         live = otelq.build_parser().format_help()
     finally:
         otelq.DEFAULT_DIR = original_default
+        if original_columns is None:
+            _os.environ.pop("COLUMNS", None)
+        else:
+            _os.environ["COLUMNS"] = original_columns
     assert dumped.strip("\n") == live.strip("\n")
 
 
