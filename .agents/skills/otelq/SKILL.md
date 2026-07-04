@@ -42,9 +42,13 @@ never "look at everything."
 
 **1 · GROUND with `summary`.** One cheap call maps the terrain: which signals
 have data at all, per-level log counts (any ERROR/FATAL?), the `>1s` span
-bucket, metric types, and each subset's time span. Skip it only when you
-already hold a trace_id or an exact target. Target signal at 0 rows? Fix
-capture first (`troubleshoot`) — don't query a void.
+bucket, metric types, and each subset's time span. Its second block —
+`** List of services in telemetry data **`, a `service`/`count` table ordered
+most-active-first — tells you which service dominates the window and is the
+first candidate to zoom in on (scope later queries with its name via
+`--service` / a `--regex` / a `sql WHERE service_name = '…'`). Skip `summary`
+only when you already hold a trace_id or an exact target. Target signal at 0
+rows? Fix capture first (`troubleshoot`) — don't query a void.
 
 **2 · TRIAGE — commit to ONE signal per symptom.** Each command below is a
 pre-built aggregate; don't hand-roll `sql` for these:

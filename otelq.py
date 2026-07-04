@@ -117,6 +117,7 @@ __all__ = [
     "_seal_external_access",
     "_future_ceiling",
     "_fmt_ts",
+    "_SUMMARY_SERVICE_LABEL",
 ]
 
 # Default to ./.telemetry under the *current working directory* so the zero-config
@@ -1689,14 +1690,15 @@ def _resolve_regex_arg(args: argparse.Namespace) -> re.Pattern[str] | None:
 
 def run_command(
     args: argparse.Namespace, regex: re.Pattern[str] | None
-) -> tuple[list[str], list[Row], TimeRange, int | None]:
+) -> tuple[list[str], list[Row], TimeRange, int | None, list[Row] | None]:
     """Plan, build the connection, dispatch, and apply trace/metric cold-fallback.
 
     `regex` (already compiled and scope-validated by the caller, FR-32) is
     applied to each candidate result before the time range is computed, so
     `Time range` in the header reflects the rows actually returned. The
     fourth return value is the regex-removed row count, or `None` when no
-    `--regex` was supplied."""
+    `--regex` was supplied. The fifth is `summary`'s service-list second block
+    (FR-3), or `None` for every other command."""
     # A --dir that exists but is not a directory (e.g. a regular file) would
     # crash deep in the cache layer: _acquire_lock does mkdir('<file>/.otelq-cache')
     # and raises NotADirectoryError. Reject it up front with a friendly message
@@ -1723,7 +1725,8 @@ def run_command(
                 if regex is not None:
                     rows, regex_removed = _apply_regex_filter(regex, rows)
                 time_range = _result_time_range(conn, args.command, columns, rows)
-                return columns, rows, time_range, regex_removed
+                services = _maybe_service_rows(conn, args.command)
+                return columns, rows, time_range, regex_removed, services
     # Fell through: the hot window held no answer and this command may widen to a
     # full-history cold scan (only `trace` today). closing() has already released
     # the hot connection before we open the cold one (D-3).
@@ -1739,7 +1742,8 @@ def run_command(
         if regex is not None:
             rows, regex_removed = _apply_regex_filter(regex, rows)
         time_range = _result_time_range(conn, args.command, columns, rows)
-        return columns, rows, time_range, regex_removed
+        services = _maybe_service_rows(conn, args.command)
+        return columns, rows, time_range, regex_removed, services
 
 
 def format_output(columns: list[str], rows: list[tuple[Any, ...]], fmt: str) -> str:
@@ -1916,6 +1920,38 @@ def cmd_summary(
     if not rows:  # no signal has data -> friendly empty-telemetry path (FR-18)
         raise NoTelemetryError(_NO_TELEMETRY_MSG)
     return columns, rows
+
+
+# `summary`'s service-list second block (FR-3): the pivot of the per-signal
+# view — one row per service, counted across all three signals — so a caller
+# sees which services dominate the window and are worth zooming in on. Printed
+# after the per-signal block in every --format, behind a plain-text delimiter
+# that keeps the two format-rendered blocks unambiguous for a machine consumer.
+_SUMMARY_SERVICE_COLUMNS = ["service", "count"]
+_SUMMARY_SERVICE_LABEL = "** List of services in telemetry data **"
+
+
+def _summary_by_service(conn: duckdb.DuckDBPyConnection) -> list[Row]:
+    """Per-service total record count across traces ∪ logs ∪ metrics, ordered
+    by count desc then service_name for determinism (byte-identical cached vs
+    --no-cache). All three relations always resolve under expose-empty (FR-1),
+    so the union is safe even when a signal is absent."""
+    return conn.execute(
+        "SELECT service_name, count(*) AS n FROM ("
+        "  SELECT service_name FROM traces"
+        "  UNION ALL SELECT service_name FROM logs"
+        "  UNION ALL SELECT service_name FROM metrics"
+        ") GROUP BY service_name ORDER BY n DESC, service_name"
+    ).fetchall()
+
+
+def _maybe_service_rows(
+    conn: duckdb.DuckDBPyConnection, command: str
+) -> list[Row] | None:
+    """`summary`'s service-list second block (FR-3), or `None` for every other
+    command — computed here (not in `cmd_summary`) so it stays out of the
+    command's own single-result contract and the direct-call summary tests."""
+    return _summary_by_service(conn) if command == "summary" else None
 
 
 def _execute_sql(
@@ -2625,7 +2661,7 @@ def _dispatch(args: argparse.Namespace) -> int:
         print(format_output(["check", "status", "detail"], rows, args.format))
         return 0 if ok else 1
     try:
-        columns, rows, time_range, regex_removed = run_command(args, regex)
+        columns, rows, time_range, regex_removed, services = run_command(args, regex)
     except NoTelemetryError as exc:
         print(exc, file=sys.stderr)
         return 0
@@ -2636,6 +2672,14 @@ def _dispatch(args: argparse.Namespace) -> int:
             )
         )
     print(format_output(columns, rows, args.format))
+    if services is not None:
+        # summary's second block (FR-3): a plain-text delimiter makes the two
+        # format-rendered blocks unambiguous for a machine consumer, in every
+        # --format. The first block above is byte-identical to summary's output
+        # before this block existed.
+        print()
+        print(_SUMMARY_SERVICE_LABEL)
+        print(format_output(_SUMMARY_SERVICE_COLUMNS, services, args.format))
     return 0
 
 

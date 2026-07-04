@@ -772,6 +772,12 @@ def _strip_header(out: str) -> str:
     return _HEADER_RE.sub("", out, count=1)
 
 
+def _summary_first_block(out: str) -> str:
+    """summary emits a labeled service second block (FR-3); return only the
+    first (per-signal) block's payload for tests that parse it as one object."""
+    return _strip_header(out).split("\n\n" + otelq._SUMMARY_SERVICE_LABEL, 1)[0]
+
+
 def _run(dirpath: Path, *argv: str) -> str:
     """Run the CLI in-process; return its stdout string."""
     import io as _io
@@ -860,7 +866,7 @@ def test_absent_signals_resolve_empty_metrics_only(temp_telemetry: Path) -> None
         nocache = _run(temp_telemetry, "--no-cache", "sql", f"SELECT count(*) AS n FROM {rel}")
         assert _json.loads(cached) == [{"n": 0}]  # resolves empty, not an error
         assert cached == nocache, f"cached != --no-cache for {rel}"
-    rows = _json.loads(_strip_header(_run(temp_telemetry, "summary")))
+    rows = _json.loads(_summary_first_block(_run(temp_telemetry, "summary")))
     assert {r["signal"] for r in rows} == {"metrics"}  # no trace/log skeleton
     for argv in (["slow"], ["trace", "deadbeef"], ["errors"]):
         out, err = _run_both(temp_telemetry, *argv)
@@ -1169,7 +1175,7 @@ def _signal_count(dirpath: Path, signal: str, *argv: str) -> int:
 
 def _sum_signal(out: str, signal: str = "traces") -> int:
     """Total count for a signal across summary's per-row breakdown."""
-    rows = _json.loads(_strip_header(out))
+    rows = _json.loads(_summary_first_block(out))
     return sum(r["count"] for r in rows if r["signal"] == signal)
 
 
@@ -2324,7 +2330,7 @@ def test_ac45_timestamps_render_explicit_utc(temp_telemetry: Path) -> None:
 
     # summary's earliest/latest columns too
     write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base, status_code=0)])
-    rows = _json.loads(_strip_header(_run(temp_telemetry, "summary")))
+    rows = _json.loads(_summary_first_block(_run(temp_telemetry, "summary")))
     for r in rows:
         if r["count"] > 0:
             assert _UTC_TS_RE.match(r["earliest"])
@@ -2497,9 +2503,10 @@ def test_ac54_regex_case_sensitive_and_skips_none_cells(temp_telemetry: Path) ->
     assert len(_json.loads(_strip_header(out_ci))) == 1
 
     # summary's zero-count skeleton rows (e.g. WARN/ERROR/...) have
-    # earliest/latest = None; "None" must not match those rows.
+    # earliest/latest = None; "None" must not match those rows. (First block
+    # only — the service second block is independent of --regex, FR-3.)
     out_none = _run(temp_telemetry, "--regex", "None", "summary")
-    assert _json.loads(_strip_header(out_none)) == []
+    assert _json.loads(_summary_first_block(out_none)) == []
 
 
 def test_ac55_regex_operates_on_already_capped_result(temp_telemetry: Path) -> None:
@@ -2542,3 +2549,48 @@ def test_ac56_errors_rows_carry_trace_id_for_pivot(temp_telemetry: Path) -> None
     # The carried id pivots straight into the trace tree (FR-6).
     tree = _json.loads(_strip_header(_run(temp_telemetry, "trace", span_row["trace_id"])))
     assert [s["span_name"].strip() for s in tree] == ["GET /x"]
+
+
+def test_ac57_summary_service_list_second_block(temp_telemetry: Path) -> None:
+    # FR-3/EC-32: summary emits a labeled service second block in every format,
+    # with per-service totals across all signals ordered by count desc; the
+    # first block is byte-identical to summary without the second block.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "traces.jsonl",
+        [make_span(base + timedelta(seconds=i), service="busy-svc") for i in range(3)],
+    )
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            make_log(base, service="busy-svc", body="a"),
+            make_log(base + timedelta(seconds=1), service="quiet-svc", body="b"),
+        ],
+    )
+    label = otelq._SUMMARY_SERVICE_LABEL
+
+    # --format json: block 2 is rendered in the same format (an array of objects).
+    out = _run(temp_telemetry, "summary")
+    assert label in out
+    first, second = _strip_header(out).split("\n\n" + label + "\n", 1)
+    assert {r["signal"] for r in _json.loads(first)} == {"traces", "logs"}
+    svc = _json.loads(second)  # per-service totals across ALL signals, count desc
+    assert svc == [
+        {"service": "busy-svc", "count": 4},  # 3 spans + 1 log
+        {"service": "quiet-svc", "count": 1},  # 1 log
+    ]
+
+    # --format compact: block 2 is a compact object in the same shape as block 1.
+    cout = _run_fmt(temp_telemetry, "compact", "summary")
+    csecond = _strip_header(cout).split("\n\n" + label + "\n", 1)[1]
+    assert _json.loads(csecond) == {
+        "columns": ["service", "count"],
+        "rows": [["busy-svc", 4], ["quiet-svc", 1]],
+    }
+
+    # Present in every format; the first block matches the second-block-free render.
+    for fmt in ("table", "json", "jsonl", "csv", "compact"):
+        assert label in _run_fmt(temp_telemetry, fmt, "summary")
+
+    # errors (a non-summary command) never emits the service block.
+    assert label not in _run(temp_telemetry, "errors")

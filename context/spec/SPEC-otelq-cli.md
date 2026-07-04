@@ -201,6 +201,26 @@ configuration that produces the raw files.
   behavior applies (FR-18). The zero-count rule thus governs *sub-rows within a
   signal that has data* (e.g. an `ERROR` level with no records), not signals
   without data.
+
+  **Service list (second block).** `summary`'s output **must** consist of two
+  blocks. The first is the per-signal breakdown above, rendered as the single
+  FR-10 object/array (unchanged — the per-signal `services` column keeps its
+  per-row distinct-service count). After it, `summary` **must** print, in
+  **every** `--format`, a second block: a plain-text delimiter line
+  `** List of services in telemetry data **` followed by a `service`/`count`
+  table rendered in the same `--format`, one row per distinct `service_name`
+  with `count` being that service's total record count across **all** signals
+  (`traces` ∪ `logs` ∪ `metrics`), ordered by `count` descending (then
+  `service_name` ascending for determinism), so a caller sees which services
+  dominate the window and are worth zooming in on. The delimiter line makes the
+  two blocks unambiguous: a machine consumer parses the first object/array
+  (before the delimiter) and, if it wants the service list, the second
+  (after it) — this is the one command whose stdout carries two format-rendered
+  blocks, so each block individually honors the FR-10 shape rather than the
+  whole stdout being one object. The second block is derived from the same
+  windowed relations and is **independent** of any `--regex` filter applied to
+  the first block's rows (FR-32); a record with no `service_name` contributes
+  its raw (null) value as its own group.
 - **FR-4 — `errors`.** `errors` **must** return error-status spans
   (`traces` rows with `status_code == 2`) and error/fatal logs (`logs` rows with
   `severity_text` in `{ERROR, FATAL}`, matched **case-insensitively** since
@@ -625,6 +645,14 @@ configuration that produces the raw files.
   --regex ERROR sql "SELECT 1"` (and likewise `doctor`/`collector-config`/
   `troubleshoot`) exits non-zero naming the command as unsupported for
   `--regex`, rather than silently ignoring the flag. (FR-32, FR-17)
+- **EC-32 — `summary` emits a labeled service second block.** `otelq --format
+  compact summary` prints the per-signal object, then a
+  `** List of services in telemetry data **` delimiter line, then a second
+  compact object `{"columns":["service","count"],"rows":[...]}` ordered by
+  count descending; the same two-block structure appears in every `--format`
+  (the second block rendered in that format), and the first block is
+  byte-identical to what `summary` emitted before the second block existed.
+  (FR-3, FR-10)
 
 ## Acceptance Criteria
 
@@ -963,6 +991,15 @@ configuration that produces the raw files.
   and feeding the span row's `trace_id` to `trace` returns that span's tree —
   the triage→localization pivot needs no intermediate `sql` lookup.
   *Verification hint: `test_ac56_errors_rows_carry_trace_id_for_pivot`.*
+- **AC-57** (Verifies FR-3, EC-32): Given a corpus with several services of
+  differing total volume, when `summary` runs in any `--format`, then stdout
+  carries two blocks — the unchanged per-signal breakdown, then a
+  `** List of services in telemetry data **` delimiter and a `service`/`count`
+  block listing each distinct service with its total record count across all
+  signals, ordered by count descending; the second block is rendered in the
+  selected format and the first block is byte-identical to summary's output
+  without the second block.
+  *Verification hint: `test_ac57_summary_service_list_second_block`.*
 
 ### Examples
 
