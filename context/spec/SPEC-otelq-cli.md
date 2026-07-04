@@ -18,7 +18,8 @@ related_documents:
   - SPEC-otelq-incremental-cache
   - CONTRACT-telemetry-directory
   - ADR-006-read-otlp-extension-quirks
-ai_summary: "otelq CLI base behavior: the query relations/columns it exposes, its seven subcommands, global flags and argument order, and its friendly read-only failure handling."
+  - ADR-009-query-history-triage-store
+ai_summary: "otelq CLI base behavior: the query relations/columns it exposes, its subcommands (incl. history/triage over the query-history store), global flags and argument order, and its friendly read-only failure handling."
 semantic_tags:
   - otelq
   - cli
@@ -101,8 +102,15 @@ configuration that produces the raw files.
 - **Response header** — a fixed-format plain-text preamble that otelq prints to
   stdout before the rendered result of the six signal-bearing commands (see
   FR-29), naming the invoked command, the resolved format, the OpenTelemetry
-  signal(s) involved, and the returned rows' time range, so an LLM consumer
-  cannot mistake a rendered `timestamp` for local time.
+  signal(s) involved, the returned rows' time range, and the session id, so an
+  LLM consumer cannot mistake a rendered `timestamp` for local time.
+- **Session id** — an id (see FR-33) that tags the consecutive invocations of
+  one investigation so they can be correlated: a caller-supplied `--session-id`,
+  or, when omitted, a freshly generated UUIDv7. Echoed verbatim in the response
+  header's `Session:` line and in the stderr session footer.
+- **Session footer** — a one-line stderr guidance notice (see FR-33) printed
+  after every command's answer, naming the resolved session id and reminding the
+  caller to reuse it via `--session-id` on related follow-up invocations.
 
 ## Functional Requirements
 
@@ -290,8 +298,8 @@ configuration that produces the raw files.
   is the **payload** that follows the response header of FR-29 on stdout; FR-10
   governs that payload, not the header itself.
 - **FR-11 — Global flags precede the subcommand.** `--format`, `--dir`,
-  `--all`, `--no-cache`, `--since`, and `--regex` are global flags and **must**
-  be accepted *before* the subcommand. Supplying a global flag *after* the
+  `--all`, `--no-cache`, `--since`, `--regex`, and `--session-id` are global
+  flags and **must** be accepted *before* the subcommand. Supplying a global flag *after* the
   subcommand **must** be rejected as an unrecognized argument (a hard parse
   error), not silently accepted. Subcommand-specific flags and positionals
   continue to follow the subcommand.
@@ -432,6 +440,25 @@ configuration that produces the raw files.
   additionally report the verbatim pattern and how many rows it removed, so a
   caller is never blind to what was filtered away (unlike post-hoc `grep` on
   rendered output).
+- **FR-33 — Session id.** A `--session-id <string>` global flag **must** tag an
+  invocation with a caller-chosen id that groups the consecutive invocations of
+  one investigation. When supplied, the id **must** be reported **verbatim** in
+  the FR-29 response header's `Session:` line (for the six header-bearing
+  commands). When **not** supplied, otelq **must** generate a fresh id per
+  invocation using **UUIDv7** (RFC 9562 — a time-ordered, collision-resistant
+  id), with **no** third-party dependency added (otelq's runtime dependency set
+  stays `duckdb` alone). The resolved id (supplied or generated) **must** be
+  identical everywhere it appears within a single invocation — the header
+  `Session:` line and the session footer below. Additionally, on **every**
+  command invocation (including the header-less `sql`/`doctor`/`history`/
+  `collector-config`/`troubleshoot`), otelq **must** print a **session footer**
+  to **stderr** — preceded by a blank line — that names the resolved id and
+  instructs the caller to pass `--session-id <id>` on consecutive related
+  invocations to keep the analysis correlated. The footer **must** be on stderr,
+  never stdout, so it never corrupts the machine-parseable payload (mirroring
+  otelq's other stderr guidance notices, and preserving `sql`'s pure-data
+  stdout contract per INV-6). The footer does not alter the result rows, their
+  order, or their rendering (INV-3).
 - **FR-24 — `--version`.** A `--version` global flag **must** print otelq's own
   version and exit `0`. The reported version **must** match the packaged
   distribution version (so an agent can name the exact build it drives, relevant
@@ -482,6 +509,7 @@ configuration that produces the raw files.
   OpenTelemetry signal: <signal>
   Time range: <from> - <to>
   IMPORTANT: all timestamps are UTC
+  Session: <session-id>
   ----------
   ```
   - `<command>` **must** be the literal invoked subcommand name.
@@ -509,6 +537,9 @@ configuration that produces the raw files.
     labels) regardless of `--format` (only the `<format>` value, and the
     `compact`-only shape hint, vary within the format line). A consumer that
     needs the bare payload skips past the line of ten `-` characters.
+  - The header **must** include a `Session: <session-id>` line (immediately
+    after the `IMPORTANT` line, before the closing `----------`) carrying the
+    verbatim session id resolved for the invocation (FR-33).
   - The header **must not** change which rows are returned, their order, or the
     FR-10 rendering rules applied to the payload that follows it (INV-6).
   - When `--regex <pattern>` (FR-32) is supplied, the header **must** insert
@@ -518,6 +549,76 @@ configuration that produces the raw files.
     **must not** appear when `--regex` is not supplied — the header's line
     count is otherwise fixed, but this pair is the one deliberate exception,
     mirroring the `compact`-only format-line suffix.
+
+### Query history and triage
+
+> The on-disk query-history store (`.otelq-history/`) is governed by
+> [ADR-009](../adr/ADR-009-query-history-triage-store.md); these requirements
+> pin the CLI behaviour over it.
+
+- **FR-34 — `history` command.** A `history` subcommand **must** report the
+  stored past-query templates ranked most-promising-first, capped by `--top`
+  (default `10`). Output columns **must** be `rank`, `score`, `terminal_pct`,
+  `uses`, `last_used`, `command`, `query` (the template's latest concrete
+  invocation). `score` **must** equal `rf × (wf + 1) / (rf + 2)`, where
+  `rf = Σ 0.5^(age / half-life)` over the template's invocations and `wf` is
+  the same decayed sum restricted to invocations that **ended their session**
+  with a *usable* row count (`1..max-rows` — neither zero nor a flood).
+  `half-life` (default 7 days) and `max-rows` **must** be
+  environment-configurable with these defaults. `last_used` **must** render as
+  an explicit-UTC `Z`-suffixed string (FR-16). Over a store that does not yet
+  exist, `history` **must** print a friendly stderr notice and exit `0`
+  (FR-18's fail-friendly rule); over a torn/unreadable store it **must**
+  return an empty report, never a traceback. Neither `history` nor `triage`
+  is ever itself recorded into the store.
+- **FR-35 — `triage` command.** A `triage` subcommand **must** decide, from
+  the store alone, whether the caller is mid-investigation or starting fresh,
+  and act:
+  - **Anchor detection.** With `--session-id` supplied, the anchor is the
+    latest stored invocation carrying that id (any age — the caller asserted
+    continuity). Without it, triage **must** treat the call as fresh-start:
+    recency **must never** anchor a chain, because concurrent agent sessions
+    interleave in one store and the latest row can belong to a different
+    investigation entirely.
+  - **Candidates.** Mid-chain: the decay-weighted **first-order successors**
+    (adjacent within a session) of the anchor's template, each weighted by its
+    own FR-34 score. Fresh-start: session-**opening** templates weighted by
+    the decayed weight of the successful sessions they opened.
+  - **Auto-run.** The best candidate **must** be executed as a real otelq
+    invocation — banner line first, then the command's normal output — **only
+    when** its evidence (decayed observation weight) and share (fraction of
+    observations from that anchor) clear the configured thresholds (defaults
+    `2.0` / `0.5`) **and** the template is *concrete* (normalisation
+    introduced no `?` placeholder). The run **must** execute under the
+    anchor's session id, and **must** be recorded into history so the chain
+    advances; the `triage` wrapper itself **must not** be recorded.
+  - **Suggestion.** After an auto-run — or instead of one, when the winning
+    candidate is confident but not concrete — triage **must** print, as the
+    **last stdout line**, the full next invocation to copy
+    (`otelq --dir <dir> --session-id <id> <template's latest raw form>`),
+    gated by the softer suggest thresholds (defaults `1.0` / `0.4`).
+  - **Grounded fallback.** With no candidate clearing any threshold: when the
+    current session has **not** yet run `summary`, triage **must** auto-run
+    `summary` itself — the RCA guide's grounding step — with a banner naming
+    why, recorded and suggestion-checked like any auto-run (a fresh session
+    trivially qualifies). Only when the session **already** contains a
+    `summary` may triage refuse: it **must** say it has no strong candidate
+    (stderr) and print the FR-34 ranked list (`--top` default `20`) instead of
+    guessing. With no store at all it **must** print a friendly stderr notice
+    directing the caller to the RCA guide and exit `0`.
+  - All four thresholds **must** be environment-configurable.
+- **FR-36 — Sessions are explicit session ids, and nothing else.** Only an
+  **explicitly supplied** `--session-id` may be stored on a history row; a
+  generated (FR-33 default) id **must** be stored as NULL — it is an offer in
+  the footer, not an asserted correlation. When sessionising (FR-34/FR-35), a
+  session **is** the set of rows sharing one non-null session id, ordered by
+  event time (an investigation resumed hours later stays one session; two ids
+  interleaved seconds apart stay two sessions). Timestamps **must never** be
+  used to infer session membership — concurrent agent sessions writing to one
+  store interleave in time, and a gap heuristic would chain unrelated
+  investigations. A row with **no** session id belongs to **no** session: it
+  **must** still count toward frequency/recency ranking evidence, and **must
+  not** contribute terminal, transition, or session-opening evidence.
 
 ## Edge Cases & Failure Modes
 
@@ -653,6 +754,16 @@ configuration that produces the raw files.
   (the second block rendered in that format), and the first block is
   byte-identical to what `summary` emitted before the second block existed.
   (FR-3, FR-10)
+- **EC-33 — Stored template no longer runs.** A `triage` auto-run candidate
+  whose stored invocation no longer parses (flag renamed since it was
+  recorded) or fails at runtime (stale SQL against a changed schema) is
+  **suggested or reported** instead of crashing triage: the parse failure
+  downgrades the candidate to the printed suggestion, the runtime failure is
+  named on stderr, and triage exits `0` either way. (FR-35, FR-17)
+- **EC-34 — Torn or foreign history store.** An unreadable/corrupt
+  `.otelq-history/` parquet yields an **empty** `history` report and routes
+  `triage` to its honest-refusal path — never a traceback, and never any
+  effect on the telemetry query commands themselves. (FR-34, FR-35, FR-17)
 
 ## Acceptance Criteria
 
@@ -1000,6 +1111,76 @@ configuration that produces the raw files.
   selected format and the first block is byte-identical to summary's output
   without the second block.
   *Verification hint: `test_ac57_summary_service_list_second_block`.*
+- **AC-58** (Verifies FR-33): Given `--session-id rca-42` on a header-bearing
+  command, when it runs, then the response header's `Session:` line reads the
+  supplied id verbatim, and the stderr session footer names `--session-id rca-42`.
+  *Verification hint: `test_ac58_supplied_session_id_echoed_verbatim`.*
+- **AC-59** (Verifies FR-33): Given no `--session-id`, when a header-bearing
+  command runs, then the header's `Session:` id is a valid UUIDv7 (version 7),
+  and the stderr footer advertises that same id.
+  *Verification hint: `test_ac59_default_session_id_is_uuid7`.*
+- **AC-60** (Verifies FR-33, INV-6): Given any command — including the
+  header-less `sql`/`doctor`/`collector-config`/`troubleshoot` — when it runs,
+  then the session footer is printed to **stderr** (never stdout, so `sql`'s
+  stdout stays pure machine-parseable data) and no header appears on the
+  header-less commands' stdout.
+  *Verification hint: `test_ac60_footer_on_every_command_including_headerless`.*
+- **AC-61** (Verifies FR-33): Given two consecutive invocations with no
+  `--session-id`, when each runs, then they are stamped with **different**
+  generated ids, so unrelated one-off calls are not conflated.
+  *Verification hint: `test_ac61_generated_session_ids_are_unique_per_invocation`.*
+- **AC-62** (Verifies FR-34): Given a template used 6 times 10 days ago and a
+  template used twice within the last hour (both always terminal-successful)
+  and a 1-day half-life, when `history` runs, then the recent template ranks
+  **first** despite the lower raw use count — decayed frequency beats lifetime
+  volume.
+  *Verification hint: `test_history_scoring_prefers_recent_over_stale_heavy_use`.*
+- **AC-63** (Verifies FR-34): Given a telemetry dir with no history store,
+  when `history` runs, then a friendly notice goes to stderr, stdout carries
+  no table, and the exit code is `0`.
+  *Verification hint: `test_history_command_fresh_store_friendly`.*
+- **AC-64** (Verifies FR-36): Given one invocation with
+  `--session-id sess-explicit` and one without, when both are recorded, then
+  the stored `session_id` values are exactly `sess-explicit` and NULL — a
+  generated id is never stored.
+  *Verification hint: `test_history_stores_only_supplied_session_ids`.*
+- **AC-65** (Verifies FR-36): Given two rows 3 hours apart sharing one
+  explicit session id and a third row 1 minute later under a different id,
+  when sessionised, then the first two form **one** session and the third a
+  **separate** one — elapsed time plays no part in either direction.
+  *Verification hint: `test_sessionization_explicit_ids_bridge_and_split`.*
+- **AC-70** (Verifies FR-36): Given two explicit sessions whose rows
+  interleave seconds apart (concurrent agents) plus one id-less row between
+  them, when `history` computes terminal rates, then each session's own last
+  query scores terminal for **its** session only, and the id-less row scores
+  terminal for nothing.
+  *Verification hint:
+  `test_sessionization_survives_interleaved_concurrent_agents`.*
+- **AC-66** (Verifies FR-35): Given past sessions `summary → errors → logs`
+  observed twice and an anchor session ending at `summary`, when
+  `triage --session-id <anchor>` runs with thresholds met, then the concrete
+  successor (`errors …`) is auto-run under the **anchor's** session id, the
+  run is recorded into history under that id, and the **last stdout line** is
+  the full suggested follow-up (`… --session-id <anchor> logs …`).
+  *Verification hint: `test_triage_markov_autoruns_and_suggests_next`.*
+- **AC-67** (Verifies FR-35): Given a confident successor whose template
+  contains a `?` placeholder (a normalised SQL literal), when triage runs,
+  then **no** auto-run happens and the suggestion line carrying the stored raw
+  form (and the session id) is printed instead.
+  *Verification hint: `test_triage_nonconcrete_candidate_suggests_instead_of_running`.*
+- **AC-68** (Verifies FR-35): Given no history store, when `triage` runs, then
+  a friendly stderr notice appears and stdout is empty (exit `0`); given a
+  store whose evidence clears no threshold AND an anchor session that already
+  ran `summary`, then the honest-refusal notice appears on stderr and stdout
+  carries the FR-34 ranked list — no second grounding run.
+  *Verification hints: `test_triage_no_history_is_friendly`,
+  `test_triage_refuses_and_dumps_once_session_is_grounded`.*
+- **AC-69** (Verifies FR-35): Given a store whose evidence clears no threshold
+  and a session with **no** prior `summary`, when `triage` runs, then it
+  auto-runs `summary` (banner naming the grounding, followed by summary's real
+  response), records that run into history, and does **not** print the
+  refusal notice.
+  *Verification hint: `test_triage_grounds_with_summary_when_session_unseeded`.*
 
 ### Examples
 

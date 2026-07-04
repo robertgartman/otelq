@@ -178,13 +178,14 @@ This is a dump from running `uv run otelq.py --help` within the project root:
 usage: otelq [-h] [--version] [--dir DIR]
              [--format {table,json,jsonl,csv,compact}] [--all] [--no-cache]
              [--verbose] [--since SINCE] [--regex REGEX]
-             {summary,sql,errors,slow,trace,logs,metric,collector-config,doctor,troubleshoot,help}
+             [--session-id SESSION_ID]
+             {summary,sql,errors,slow,trace,logs,metric,history,triage,collector-config,doctor,troubleshoot,help}
              ...
 
 Query OTLP telemetry captured by the dev OTel Collector.
 
 positional arguments:
-  {summary,sql,errors,slow,trace,logs,metric,collector-config,doctor,troubleshoot,help}
+  {summary,sql,errors,slow,trace,logs,metric,history,triage,collector-config,doctor,troubleshoot,help}
     summary             counts and time span per signal
     sql                 run an ad-hoc SQL query
     errors              error spans and ERROR/FATAL logs
@@ -192,6 +193,14 @@ positional arguments:
     trace               all spans of one trace as a tree
     logs                filtered log records
     metric              time series for one metric
+    history             ranked past-query history — the templates most likely
+                        to crack an investigation (triage assistant; also as
+                        sql views history_queries/history_invocations)
+    triage              start or continue an investigation from history: auto-
+                        runs the most likely next query when the evidence is
+                        strong (Markov step over past sessions), suggests the
+                        follow-up invocation, or admits it doesn't know and
+                        lists the top templates
     collector-config    print the file-export fragment to add to an existing
                         Collector
     doctor              check that --dir satisfies the telemetry contract
@@ -214,6 +223,10 @@ options:
   --regex REGEX         keep only rows matching this pattern in some cell
                         (summary/errors/slow/trace/logs/metric only); reported
                         in the response header
+  --session-id SESSION_ID
+                        tag this and consecutive related invocations with a
+                        shared id (default: a generated UUIDv7); echoed in the
+                        header and session footer
 
 timestamps: ALL timestamps — printed by otelq and written into a
   `sql` query — are UTC. Write `sql` timestamp literals bare

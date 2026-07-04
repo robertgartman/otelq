@@ -46,6 +46,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import sys
 import tempfile
@@ -56,7 +57,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict, cast
 
 # duckdb is imported lazily inside the three functions that actually open a
 # connection (connect/build_connection) or catch its errors (cmd_sql), so commands
@@ -104,6 +105,7 @@ __all__ = [
     "render_collector_config",
     "doctor_report",
     "CACHE_DIRNAME",
+    "HISTORY_DIRNAME",
     "PENDING_DIRNAME",
     "CURSOR_FILENAME",
     "CURSOR_SCHEMA_VERSION",
@@ -118,6 +120,14 @@ __all__ = [
     "_future_ceiling",
     "_fmt_ts",
     "_SUMMARY_SERVICE_LABEL",
+    "_history_normalize",
+    "_history_raw",
+    "_history_config",
+    "_history_janitor",
+    "_HISTORY_NO_STORE_MSG",
+    "_triage_config",
+    "_TRIAGE_NO_HISTORY_MSG",
+    "_TRIAGE_NO_CANDIDATE_MSG",
 ]
 
 # Default to ./.telemetry under the *current working directory* so the zero-config
@@ -1616,17 +1626,65 @@ _FORMAT_SHAPE_HINT = {
 }
 
 
+def _uuid7() -> str:
+    """Generate a UUIDv7 (RFC 9562): a 48-bit Unix-millisecond timestamp prefix
+    followed by random bits, so ids sort by creation time yet stay collision-
+    resistant. Used as the default `--session-id` (FR-33) so consecutive
+    invocations of one investigation can share a time-ordered tag without the
+    caller having to supply one. Delegates to the stdlib generator when it
+    exists (Python 3.14+); otherwise assembles the layout by hand — no third-
+    party dependency, keeping otelq's single-dep footprint (duckdb) intact."""
+    import uuid
+
+    generator = getattr(uuid, "uuid7", None)
+    if generator is not None:
+        return str(generator())
+    unix_ms = time.time_ns() // 1_000_000
+    rand_a = int.from_bytes(os.urandom(2), "big") & 0x0FFF  # 12 bits
+    rand_b = int.from_bytes(os.urandom(8), "big") & ((1 << 62) - 1)  # 62 bits
+    value = (unix_ms & ((1 << 48) - 1)) << 80
+    value |= 0x7 << 76  # version 7
+    value |= rand_a << 64
+    value |= 0b10 << 62  # RFC 9562 variant
+    value |= rand_b
+    return str(uuid.UUID(int=value))
+
+
+def resolve_session_id(args: argparse.Namespace) -> str:
+    """The effective session id for this invocation (FR-33): the verbatim
+    `--session-id` when supplied, else a freshly generated UUIDv7. Resolved once
+    per run and reused for both the response header's `Session` line and the
+    stderr session footer, so the id an answer is stamped with is exactly the id
+    the footer tells the caller to reuse."""
+    supplied = getattr(args, "session_id", None)
+    return supplied if supplied else _uuid7()
+
+
+# The stderr session footer (FR-33), printed after EVERY command's answer so an
+# agent driving otelq is reminded — on every invocation — how to correlate the
+# follow-up calls of one investigation. It lives on stderr, not stdout, so it
+# never corrupts the machine-parseable payload (`sql`/json/csv/compact), mirroring
+# otelq's other stderr guidance notices (truncation, cold-widen, friendly-empty).
+def _session_footer(session_id: str) -> str:
+    return (
+        f"To track this ongoing analysis, include --session-id {session_id} "
+        f"in any consecutive otelq invocations related to the current analysis."
+    )
+
+
 def _format_response_header(
     command: str,
     fmt: str,
     rows: list[Row],
     time_range: TimeRange,
+    session_id: str,
     regex: str | None = None,
     regex_removed: int | None = None,
 ) -> str:
     """Render the FR-29 response header: a fixed plain-text block naming the
-    command, format, OpenTelemetry signal(s), and UTC time range, so an LLM
-    consumer cannot mistake a rendered `timestamp` for local time. When
+    command, format, OpenTelemetry signal(s), UTC time range, and the FR-33
+    `Session` id, so an LLM consumer cannot mistake a rendered `timestamp` for
+    local time and can carry the session tag into follow-up calls. When
     `--regex` (FR-32) was supplied, two extra lines report the verbatim
     pattern and how many rows it removed, so a caller is never blind to what
     was filtered away — unlike post-hoc `grep` on rendered output."""
@@ -1644,6 +1702,7 @@ def _format_response_header(
         lines.append(f"Regex filter applied: {regex}")
         lines.append(f"Rows removed by regex: {regex_removed}")
     lines.append("IMPORTANT: all timestamps are UTC")
+    lines.append(f"Session: {session_id}")
     lines.append("----------")
     return "\n".join(lines)
 
@@ -1969,6 +2028,16 @@ def cmd_sql(
 ) -> CommandResult:
     import duckdb  # lazy; see TYPE_CHECKING note above
 
+    # The query-history tables ride along as views in the sql escape hatch
+    # (ADR-009); best-effort — a torn store must never break an unrelated
+    # query. `dir` is absent when cmd_sql is driven directly over a bare
+    # connection (tests/fixtures); there is no store to expose then.
+    tdir = getattr(args, "dir", None)
+    if tdir is not None:
+        try:
+            _history_create_views(conn, tdir)
+        except duckdb.Error:
+            pass
     try:
         result = _execute_sql(conn, args.query)
         # An empty / whitespace / comment-only query has no statement to run, so
@@ -2595,6 +2664,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="keep only rows matching this pattern in some cell (summary/errors/"
         "slow/trace/logs/metric only); reported in the response header",
     )
+    # --session-id is a GLOBAL flag: it tags a run of related invocations that
+    # make up one investigation, echoed verbatim in the response header and the
+    # stderr session footer so consecutive calls can be correlated. Omitted -> a
+    # fresh time-ordered UUIDv7 is generated per invocation. See FR-33.
+    parser.add_argument(
+        "--session-id",
+        help="tag this and consecutive related invocations with a shared id "
+        "(default: a generated UUIDv7); echoed in the header and session footer",
+    )
 
     # Not required: a bare `otelq` (command is None) prints full help in main().
     sub = parser.add_subparsers(dest="command", required=False)
@@ -2629,6 +2707,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_metric.add_argument(
         "--top", type=_non_negative_int, default=_DEFAULT_TOP, help="rows to show"
     )
+    p_history = sub.add_parser(
+        "history",
+        help="ranked past-query history — the templates most likely to crack "
+        "an investigation (triage assistant; also as sql views "
+        "history_queries/history_invocations)",
+    )
+    p_history.add_argument(
+        "--top", type=_non_negative_int, default=10, help="rows to show"
+    )
+    p_triage = sub.add_parser(
+        "triage",
+        help="start or continue an investigation from history: auto-runs the "
+        "most likely next query when the evidence is strong (Markov step over "
+        "past sessions), suggests the follow-up invocation, or admits it "
+        "doesn't know and lists the top templates",
+    )
+    p_triage.add_argument(
+        "--top",
+        type=_non_negative_int,
+        default=20,
+        help="templates listed when no candidate is convincing",
+    )
     sub.add_parser(
         "collector-config",
         help="print the file-export fragment to add to an existing Collector",
@@ -2648,7 +2748,911 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# --- query-history triage store (ADR-009) ------------------------------------
+# otelq records every telemetry-interrogating invocation in a consumer-owned
+# `.otelq-history/` subtree of the target telemetry dir (CONTRACT v1.1) so an
+# LLM agent can mine past investigations: which queries run most, which ones
+# tend to END a troubleshooting burst (the terminal-query success proxy), and
+# what typically follows what. The write path is one atomic O_APPEND line into
+# journal.jsonl; a janitor at the END of the invocation — after the answer has
+# already been printed, mirroring ADR-008's "answer first, then maintain" — and
+# only if it wins the store's own O_EXCL lock, compacts the journal into two
+# Parquet tables and applies the retention rules. Merging dedupes on the full
+# invocation row, so re-consuming journal lines after a lost race or crash is
+# idempotent. Recording is strictly best-effort: any failure is swallowed and
+# can never change a command's result or exit code.
+
+HISTORY_DIRNAME = ".otelq-history"
+_HISTORY_JOURNAL = "journal.jsonl"
+_HISTORY_QUERIES = "queries.parquet"
+_HISTORY_INVOCATIONS = "invocations.parquet"
+_HISTORY_AUDIT = "audit.jsonl"
+# Commands recorded in history: the telemetry-interrogating ones only. Meta
+# commands (doctor/troubleshoot/collector-config/help) and the history read
+# surface itself are excluded — the latter also bounds the feedback loop
+# (reading history never generates history).
+_HISTORY_COMMANDS = frozenset(
+    {"summary", "sql", "errors", "slow", "trace", "logs", "metric"}
+)
+# Any of these (case-insensitive) in OTELQ_HISTORY disables recording;
+# anything else — including unset/empty — leaves it on.
+_HISTORY_DISABLE_VALUES = frozenset({"0", "false", "off", "no"})
+
+# Per-command --top parser defaults: a --top equal to its default is omitted
+# from the canonical invocation string so `errors` and `errors --top 50` are
+# one template, not two.
+_HISTORY_TOP_DEFAULTS = {"errors": 50, "slow": 20, "logs": 50, "metric": 50}
+
+# Normalisation: raw invocations rarely repeat verbatim (trace ids, quoted SQL
+# literals); templates do, and template identity is what makes frequency and
+# transition statistics meaningful. Quoted SQL literals ('' escapes included)
+# and long hex ids collapse to '?'; everything else — including --regex/--grep
+# patterns and --since windows — stays verbatim, because those values ARE the
+# reusable recipe.
+_HISTORY_SQL_LITERAL_RE = re.compile(r"'(?:[^']|'')*'")
+_HISTORY_HEX_ID_RE = re.compile(r"\b[0-9a-fA-F]{16,}\b")
+
+
+class _HistoryConfig(NamedTuple):
+    """Janitor business rules (ADR-009 decision 5). Every threshold is
+    env-overridable so tests can trigger the janitor without waiting out
+    wall-clock rules."""
+
+    min_age_hours: int  # rows must be older than this to be removable
+    keep_min: int  # never shrink the query table below this many templates
+    max_rows: int  # a query whose every run returned more rows is a flooder
+    stale_days: int  # a query unused this long is removable
+    half_life_days: int  # recency decay: an invocation this old counts as 0.5
+
+
+_HISTORY_DEFAULTS = _HistoryConfig(
+    min_age_hours=24,
+    keep_min=500,
+    max_rows=500,
+    stale_days=30,
+    half_life_days=7,
+)
+
+
+class _TriageConfig(NamedTuple):
+    """`triage` decision thresholds (ADR-009 amendment). A candidate next
+    query is AUTO-RUN only with both evidence (decayed transition weight) and
+    dominance (its share of all observed transitions from the anchor); the
+    softer suggest_* pair gates the printed next-query suggestion. All
+    env-overridable so tests can force either behaviour deterministically."""
+
+    evidence: float  # min decayed weight to act (≈ 2 recent observations)
+    share: float  # min fraction of transitions that agree
+    suggest_evidence: float
+    suggest_share: float
+
+
+_TRIAGE_DEFAULTS = _TriageConfig(
+    evidence=2.0, share=0.5, suggest_evidence=1.0, suggest_share=0.4
+)
+
+
+def _history_int_env(name: str, default: int) -> int:
+    """A non-negative int from the environment, or the default on anything
+    unparsable/negative — a bad env var must never break recording."""
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def _history_float_env(name: str, default: float) -> float:
+    """A non-negative float from the environment, defaulting like
+    _history_int_env."""
+    try:
+        value = float(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def _history_config() -> _HistoryConfig:
+    d = _HISTORY_DEFAULTS
+    return _HistoryConfig(
+        min_age_hours=_history_int_env("OTELQ_HISTORY_MIN_AGE_HOURS", d.min_age_hours),
+        keep_min=_history_int_env("OTELQ_HISTORY_KEEP_MIN", d.keep_min),
+        max_rows=_history_int_env("OTELQ_HISTORY_MAX_ROWS", d.max_rows),
+        stale_days=_history_int_env("OTELQ_HISTORY_STALE_DAYS", d.stale_days),
+        half_life_days=max(
+            1, _history_int_env("OTELQ_HISTORY_HALF_LIFE_DAYS", d.half_life_days)
+        ),
+    )
+
+
+def _triage_config() -> _TriageConfig:
+    d = _TRIAGE_DEFAULTS
+    return _TriageConfig(
+        evidence=_history_float_env("OTELQ_TRIAGE_EVIDENCE", d.evidence),
+        share=_history_float_env("OTELQ_TRIAGE_SHARE", d.share),
+        suggest_evidence=_history_float_env(
+            "OTELQ_TRIAGE_SUGGEST_EVIDENCE", d.suggest_evidence
+        ),
+        suggest_share=_history_float_env(
+            "OTELQ_TRIAGE_SUGGEST_SHARE", d.suggest_share
+        ),
+    )
+
+
+def _history_enabled() -> bool:
+    return (
+        os.environ.get("OTELQ_HISTORY", "").strip().lower()
+        not in _HISTORY_DISABLE_VALUES
+    )
+
+
+def history_dir(telemetry_dir: Path) -> Path:
+    return telemetry_dir / HISTORY_DIRNAME
+
+
+def _history_raw(args: argparse.Namespace) -> str:
+    """The canonical invocation string: the semantic parts of the command line,
+    in fixed order. Presentation flags (--format/--verbose) and perf flags
+    (--no-cache) are excluded — they don't change what was asked."""
+    parts: list[str] = []
+    since = getattr(args, "since", None)
+    if since:
+        parts += ["--since", str(since)]
+    if getattr(args, "all", False):
+        parts.append("--all")
+    regex = getattr(args, "regex", None)
+    if regex is not None:
+        parts += ["--regex", str(regex)]
+    parts.append(args.command)
+    if args.command == "sql":
+        parts.append(str(args.query))
+    elif args.command == "trace":
+        parts.append(str(args.trace_id))
+    elif args.command == "metric":
+        parts.append(str(args.name))
+    if args.command == "logs":
+        for flag in ("service", "level", "grep"):
+            value = getattr(args, flag, None)
+            if value is not None:
+                parts += [f"--{flag}", str(value)]
+    top = getattr(args, "top", None)
+    if top is not None and top != _HISTORY_TOP_DEFAULTS.get(args.command):
+        parts += ["--top", str(top)]
+    return " ".join(parts)
+
+
+def _history_normalize(command: str, raw: str) -> str:
+    """Collapse an invocation to its template (see the regex notes above)."""
+    norm = re.sub(r"\s+", " ", raw).strip()
+    if command == "sql":
+        norm = _HISTORY_SQL_LITERAL_RE.sub("'?'", norm)
+    norm = _HISTORY_HEX_ID_RE.sub("?", norm)
+    if command == "trace":
+        # trace ids are volatile even when short (a unique prefix is accepted);
+        # the template is the act of pivoting to a trace, not the id itself.
+        norm = re.sub(r"(\btrace )\S+", r"\1?", norm)
+    return norm
+
+
+def _history_qid(norm: str) -> str:
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+
+def _history_append(path: Path, line: str) -> None:
+    """Append one serialised line with a single atomic write. O_APPEND makes
+    the seek+write atomic per call and one small write is not split, so
+    concurrent otelq invocations never interleave lines; there is no external
+    rotator to race (unlike the Collector's files)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+# The row count of the current invocation's result, noted by _dispatch for the
+# recording hook in main(). A plain module-level slot is valid because otelq is
+# a single-shot, single-threaded CLI: one invocation, one result.
+_history_last_rows: int | None = None
+
+
+def _history_note_rows(n: int) -> None:
+    global _history_last_rows
+    _history_last_rows = n
+
+
+def _history_record(args: argparse.Namespace, exit_code: int, elapsed_ns: int) -> None:
+    """Append this invocation to the journal and run the janitor. Best-effort:
+    never raises, never fabricates a telemetry root, never records meta
+    commands or a disabled/absent store."""
+    try:
+        if args.command not in _HISTORY_COMMANDS or not _history_enabled():
+            return
+        if not args.dir.is_dir():
+            return
+        raw = _history_raw(args)
+        norm = _history_normalize(args.command, raw)
+        entry = {
+            "ts": _fmt_ts(_utc_now()),
+            "qid": _history_qid(norm),
+            # Only an EXPLICITLY supplied --session-id is stored (ground truth
+            # for sessionisation). A generated id is an offer in the footer,
+            # not a correlation the caller asserted — storing it would make
+            # every unflagged call a singleton session and break the time-gap
+            # heuristic that chains casual usage.
+            "session_id": (
+                args.session_id
+                if getattr(args, "_session_supplied", False)
+                else None
+            ),
+            "command": args.command,
+            "raw": raw,
+            "norm": norm,
+            "rows_returned": _history_last_rows if _history_last_rows is not None else 0,
+            "duration_ms": round(elapsed_ns / 1_000_000.0, 3),
+            "exit_code": exit_code,
+        }
+        hdir = history_dir(args.dir)
+        hdir.mkdir(parents=True, exist_ok=True)
+        _history_append(
+            hdir / _HISTORY_JOURNAL,
+            json.dumps(entry, separators=(",", ":")) + "\n",
+        )
+        _history_janitor(args.dir)
+    except Exception:
+        pass
+
+
+def _history_janitor(telemetry_dir: Path) -> None:
+    """Compact the journal into the Parquet tables and apply retention — only
+    if we win the store's own single-writer lock (same O_EXCL + stale-reap
+    machinery as the cache, in a separate directory so the two never contend).
+    Losing the race just defers compaction to the next invocation."""
+    hdir = history_dir(telemetry_dir)
+    fd = _acquire_lock(hdir)
+    if fd is None:
+        return
+    try:
+        _history_compact(hdir)
+    finally:
+        _release_lock(hdir, fd)
+
+
+# Fixed journal schema for read_json: explicit types (no inference surprises),
+# malformed lines skipped, missing keys NULL.
+_HISTORY_JOURNAL_COLUMNS = (
+    "{ts: 'TIMESTAMP', qid: 'VARCHAR', session_id: 'VARCHAR', "
+    "command: 'VARCHAR', raw: 'VARCHAR', "
+    "norm: 'VARCHAR', rows_returned: 'BIGINT', duration_ms: 'DOUBLE', "
+    "exit_code: 'INTEGER'}"
+)
+
+
+def _history_compact(hdir: Path) -> None:
+    """Merge journal lines into queries.parquet / invocations.parquet, apply
+    the retention rules, truncate the consumed journal, and audit-log what
+    happened. Caller holds the store lock.
+
+    Rule semantics (ADR-009 decision 5): a query template is REMOVABLE only
+    when its last use is older than min_age_hours AND it is bad — every run
+    returned 0 rows (never produced signal), every run returned more than
+    max_rows (always floods context), or it was last used over stale_days ago.
+    Victims are taken in badness order (0-row, flooder, stale), oldest first,
+    and never below keep_min surviving templates. Removing a template removes
+    its invocation rows."""
+    journal = hdir / _HISTORY_JOURNAL
+    q_path = hdir / _HISTORY_QUERIES
+    inv_path = hdir / _HISTORY_INVOCATIONS
+    try:
+        journal_size = journal.stat().st_size
+    except OSError:
+        journal_size = 0
+    if journal_size == 0 and not q_path.exists():
+        return  # nothing recorded yet
+
+    import duckdb  # lazy; see TYPE_CHECKING note above
+
+    cfg = _history_config()
+    conn = duckdb.connect(database=":memory:")
+    try:
+        inv_arms: list[str] = []
+        if inv_path.exists():
+            # SELECT * + BY NAME below: a parquet written before the
+            # session_id column existed still merges (missing column -> NULL).
+            inv_arms.append(
+                f"SELECT * FROM read_parquet({_sql_str(inv_path.as_posix())})"
+            )
+        if journal_size:
+            inv_arms.append(
+                f"SELECT qid, ts, session_id, rows_returned, duration_ms, "
+                f"exit_code "
+                f"FROM read_json({_sql_str(journal.as_posix())}, "
+                f"format='newline_delimited', ignore_errors=true, "
+                f"columns={_HISTORY_JOURNAL_COLUMNS}) WHERE qid IS NOT NULL"
+            )
+        if not inv_arms:
+            return
+        conn.execute(
+            "CREATE TABLE _inv_stage AS "
+            + " UNION ALL BY NAME ".join(f"(FROM ({arm}))" for arm in inv_arms)
+        )
+        has_session = _scalar(
+            conn.execute(
+                "SELECT count(*) FROM pragma_table_info('_inv_stage') "
+                "WHERE name = 'session_id'"
+            )
+        )
+        if not has_session:
+            # Store predates session ids entirely (old parquet, empty journal).
+            conn.execute("ALTER TABLE _inv_stage ADD COLUMN session_id VARCHAR")
+        # Full-row DISTINCT: a journal line re-consumed after a skipped truncate
+        # is byte-identical, so the merge is idempotent (no double-counting).
+        conn.execute(
+            "CREATE TABLE _inv AS SELECT DISTINCT qid, ts, session_id, "
+            "rows_returned, duration_ms, exit_code FROM _inv_stage"
+        )
+        meta_arms: list[str] = []
+        if q_path.exists():
+            meta_arms.append(
+                f"SELECT qid, command, norm, raw_example AS raw, "
+                f"first_seen AS ts FROM read_parquet({_sql_str(q_path.as_posix())})"
+            )
+        if journal_size:
+            meta_arms.append(
+                f"SELECT qid, command, norm, raw, ts "
+                f"FROM read_json({_sql_str(journal.as_posix())}, "
+                f"format='newline_delimited', ignore_errors=true, "
+                f"columns={_HISTORY_JOURNAL_COLUMNS}) WHERE qid IS NOT NULL"
+            )
+        # first_seen = the earliest ts ever associated with the template;
+        # raw_example = the raw string of its LATEST use (arg_max), so
+        # suggestions stay concrete and current.
+        conn.execute(
+            "CREATE TABLE _q AS "
+            "SELECT m.qid, m.command, m.norm, m.raw_example, m.first_seen, "
+            "       s.use_count, s.last_used, s.max_rows_ret, s.min_rows_ret "
+            "FROM ("
+            "  SELECT qid, any_value(command) AS command, any_value(norm) AS norm, "
+            "         arg_max(raw, ts) AS raw_example, min(ts) AS first_seen "
+            f"  FROM ({' UNION ALL '.join(meta_arms)}) GROUP BY qid"
+            ") m JOIN ("
+            "  SELECT qid, count(*) AS use_count, max(ts) AS last_used, "
+            "         max(rows_returned) AS max_rows_ret, "
+            "         min(rows_returned) AS min_rows_ret "
+            "  FROM _inv GROUP BY qid"
+            ") s USING (qid)"
+        )
+
+        total = int(_scalar(conn.execute("SELECT count(*) FROM _q")) or 0)
+        removed = 0
+        may_remove = total - cfg.keep_min
+        if may_remove > 0:
+            now = _utc_now()
+            age_cut = _fmt_ts(now - timedelta(hours=cfg.min_age_hours))
+            stale_cut = _fmt_ts(now - timedelta(days=cfg.stale_days))
+            conn.execute(
+                "CREATE TABLE _victims AS SELECT qid FROM ("
+                "  SELECT qid, "
+                "    CASE WHEN max_rows_ret = 0 THEN 1 "
+                f"        WHEN min_rows_ret > {cfg.max_rows} THEN 2 "
+                "         ELSE 3 END AS badness, last_used "
+                "  FROM _q "
+                f" WHERE last_used < TIMESTAMP '{age_cut}' "
+                "    AND (max_rows_ret = 0 "
+                f"        OR min_rows_ret > {cfg.max_rows} "
+                f"        OR last_used < TIMESTAMP '{stale_cut}') "
+                "  ORDER BY badness, last_used "
+                f" LIMIT {may_remove})"
+            )
+            removed = int(_scalar(conn.execute("SELECT count(*) FROM _victims")) or 0)
+            if removed:
+                conn.execute(
+                    "DELETE FROM _q WHERE qid IN (SELECT qid FROM _victims)"
+                )
+                conn.execute(
+                    "DELETE FROM _inv WHERE qid NOT IN (SELECT qid FROM _q)"
+                )
+
+        if journal_size == 0 and removed == 0:
+            return  # nothing changed; skip the Parquet rewrite entirely
+        for table, target in (("_q", q_path), ("_inv", inv_path)):
+            tmp = target.with_suffix(target.suffix + ".tmp")
+            conn.execute(
+                f"COPY {table} TO {_sql_str(tmp.as_posix())} (FORMAT PARQUET)"
+            )
+            os.replace(tmp, target)
+        if journal_size:
+            try:
+                # Truncate only when no line landed since we read; a concurrent
+                # append leaves the journal intact and the idempotent merge
+                # re-consumes those lines next round.
+                if journal.stat().st_size == journal_size:
+                    os.truncate(journal, 0)
+            except OSError:
+                pass
+        audit = {
+            "ts": _fmt_ts(_utc_now()),
+            "merged_bytes": journal_size,
+            "queries_total": total - removed,
+            "queries_removed": removed,
+        }
+        _history_append(
+            hdir / _HISTORY_AUDIT, json.dumps(audit, separators=(",", ":")) + "\n"
+        )
+    finally:
+        conn.close()
+
+
+# Stable empty-view schemas so `sql` users see the history relations even
+# before any history exists (expose-empty, matching FR-1's spirit).
+_HISTORY_VIEW_SCHEMAS = {
+    "history_queries": (
+        "CAST(NULL AS VARCHAR) AS qid, CAST(NULL AS VARCHAR) AS command, "
+        "CAST(NULL AS VARCHAR) AS norm, CAST(NULL AS VARCHAR) AS raw_example, "
+        "CAST(NULL AS TIMESTAMP) AS first_seen, CAST(NULL AS BIGINT) AS use_count, "
+        "CAST(NULL AS TIMESTAMP) AS last_used, CAST(NULL AS BIGINT) AS max_rows_ret, "
+        "CAST(NULL AS BIGINT) AS min_rows_ret"
+    ),
+    "history_invocations": (
+        "CAST(NULL AS VARCHAR) AS qid, CAST(NULL AS TIMESTAMP) AS ts, "
+        "CAST(NULL AS VARCHAR) AS session_id, "
+        "CAST(NULL AS BIGINT) AS rows_returned, CAST(NULL AS DOUBLE) AS duration_ms, "
+        "CAST(NULL AS INTEGER) AS exit_code"
+    ),
+}
+_HISTORY_VIEW_FILES = {
+    "history_queries": _HISTORY_QUERIES,
+    "history_invocations": _HISTORY_INVOCATIONS,
+}
+
+
+def _history_create_views(
+    conn: duckdb.DuckDBPyConnection, telemetry_dir: Path
+) -> None:
+    """Expose the history tables as `sql` views (ADR-009 decision 7). Lazy
+    parquet views are fine here: `sql` keeps external file access on purpose
+    (see _seal_external_access). Absent files yield empty, correctly-typed
+    views so recipes never fail on a fresh store."""
+    hdir = history_dir(telemetry_dir)
+    for view, filename in _HISTORY_VIEW_FILES.items():
+        path = hdir / filename
+        if path.exists():
+            conn.execute(
+                f"CREATE OR REPLACE VIEW {view} AS "
+                f"SELECT * FROM read_parquet({_sql_str(path.as_posix())})"
+            )
+        else:
+            conn.execute(
+                f"CREATE OR REPLACE VIEW {view} AS "
+                f"SELECT {_HISTORY_VIEW_SCHEMAS[view]} WHERE false"
+            )
+
+
+_HISTORY_NO_STORE_MSG = (
+    "no query history yet — history accumulates in .otelq-history/ as otelq "
+    "commands run"
+)
+
+
+def _history_sessions_cte(inv_path: Path, cfg: _HistoryConfig) -> str:
+    """The shared WITH-prefix over invocations: sessionise, flag terminals,
+    and attach the recency weight. Used by `history`'s ranking and by every
+    `triage` analysis so the session model can never drift between them.
+
+    Sessions are EXPLICIT session ids ONLY (ADR-009 amendment). Timestamps are
+    never used to infer session membership: concurrent agent sessions hitting
+    one store interleave in time, so any gap heuristic would chain unrelated
+    investigations together. A row recorded without a supplied --session-id
+    belongs to NO session — it still carries the recency weight (frequency
+    evidence for ranking) but can never be terminal, transition, or
+    session-opening evidence.
+
+    Per-row derived columns: `is_terminal` (last row of its explicit session;
+    always FALSE for session-less rows), `usable` (returned 1..max_rows rows —
+    neither silence nor a context flood), and `w` — the exponential recency
+    weight 0.5^(age/half_life), so yesterday counts ~1 and last month barely
+    at all."""
+    hl_seconds = cfg.half_life_days * 86400.0
+    now_lit = _fmt_ts(_utc_now())
+    return (
+        "WITH inv AS ("
+        f"  SELECT * FROM read_parquet({_sql_str(inv_path.as_posix())})"
+        "), term AS ("
+        "  SELECT qid, ts, session_id, rows_returned, "
+        "    CASE WHEN session_id IS NULL THEN FALSE "
+        "         ELSE ts = MAX(ts) OVER (PARTITION BY session_id) "
+        "    END AS is_terminal, "
+        f"   CASE WHEN rows_returned BETWEEN 1 AND {cfg.max_rows} "
+        "         THEN 1 ELSE 0 END AS usable, "
+        f"   POWER(0.5, GREATEST(0, date_diff('second', ts, "
+        f"     TIMESTAMP '{now_lit}')) / {hl_seconds}) AS w"
+        "  FROM inv)"
+    )
+
+
+# Per-template scoring (ADR-009 amendment): recency-decayed frequency times
+# Laplace-smoothed terminal-success. rf = Σw (recent uses count ~1, old ~0);
+# wf = Σw over invocations that ENDED their session with a usable row count;
+# smoothing (wf+1)/(rf+2) keeps a 1-for-1 fluke below a 9-for-10 workhorse and
+# gives never-successful templates a floor instead of zero. The product ranks
+# "frequent AND working, recently" above either property alone.
+_HISTORY_SCORE_CTE = (
+    ", per AS ("
+    "  SELECT qid, SUM(w) AS rf, "
+    "    SUM(w * CAST(is_terminal AS INTEGER) * usable) AS wf, "
+    "    count(*) AS uses_raw, "
+    "    SUM(CASE WHEN is_terminal AND usable = 1 THEN 1 ELSE 0 END) AS wins_raw "
+    "  FROM term GROUP BY qid"
+    "), scored AS ("
+    "  SELECT qid, rf, wf, uses_raw, wins_raw, "
+    "    rf * (wf + 1.0) / (rf + 2.0) AS score "
+    "  FROM per)"
+)
+
+
+def _history_report(telemetry_dir: Path, top: int) -> tuple[list[str], list[Row]]:
+    """The `history` command: past query templates ranked by the decayed
+    frequency × smoothed-success score (see _HISTORY_SCORE_CTE). terminal_pct
+    stays the raw lifetime rate — the human-readable evidence behind the
+    score."""
+    q_path = history_dir(telemetry_dir) / _HISTORY_QUERIES
+    inv_path = history_dir(telemetry_dir) / _HISTORY_INVOCATIONS
+    columns = [
+        "rank", "score", "terminal_pct", "uses", "last_used", "command", "query",
+    ]
+    if not q_path.exists() or not inv_path.exists():
+        return columns, []
+
+    import duckdb  # lazy; see TYPE_CHECKING note above
+
+    cfg = _history_config()
+    conn = duckdb.connect(database=":memory:")
+    try:
+        rows = conn.execute(
+            _history_sessions_cte(inv_path, cfg)
+            + _HISTORY_SCORE_CTE
+            + " SELECT CAST(row_number() OVER win AS BIGINT) AS rank, "
+            "  CAST(round(scored.score, 3) AS DOUBLE) AS score, "
+            "  CAST(round(100.0 * scored.wins_raw / scored.uses_raw) AS BIGINT)"
+            "    AS terminal_pct, "
+            "  q.use_count AS uses, "
+            "  strftime(q.last_used, '%Y-%m-%dT%H:%M:%S') || 'Z' AS last_used, "
+            "  q.command, q.raw_example AS query "
+            f"FROM scored JOIN read_parquet({_sql_str(q_path.as_posix())}) q "
+            "  USING (qid) "
+            "WINDOW win AS (ORDER BY scored.score DESC, q.last_used DESC) "
+            f"ORDER BY rank LIMIT {top}"
+        ).fetchall()
+    except duckdb.Error:
+        return columns, []  # torn/foreign parquet: an empty report, never a crash
+    finally:
+        conn.close()
+    return columns, rows
+
+
+# --- triage (ADR-009 amendment): act on the history, don't just report it ----
+
+_TRIAGE_NO_HISTORY_MSG = (
+    "triage: no query history yet — start with `summary` (the RCA guide's "
+    "grounding step); history accumulates as otelq commands run"
+)
+_TRIAGE_NO_CANDIDATE_MSG = (
+    "triage: no strong candidate from history, and this session is already "
+    "grounded (summary ran) — top templates below; pick one that matches the "
+    "symptom, or proceed with RCA step 2 (errors/slow/logs/metric)"
+)
+
+
+class _TriageCandidate(NamedTuple):
+    qid: str
+    raw_example: str
+    norm: str
+    command: str
+    evidence: float  # decayed observation weight backing this candidate
+    share: float  # its fraction of all observations from this anchor
+
+
+def _triage_concrete(candidate: _TriageCandidate) -> bool:
+    """A template is auto-runnable only when normalisation introduced no '?'
+    placeholders — i.e. the stored example IS the template. Re-running someone
+    else's stale trace id or SQL literal verbatim would query noise."""
+    return candidate.norm == re.sub(r"\s+", " ", candidate.raw_example).strip()
+
+
+def _triage_pick(
+    rows: list[Row], evidence: float, share: float
+) -> _TriageCandidate | None:
+    """Rows: (qid, raw_example, norm, command, evidence, total). Returns the
+    top candidate iff it clears both thresholds."""
+    if not rows:
+        return None
+    qid, raw_example, norm, command, ev, total = rows[0]
+    ev = float(ev or 0.0)
+    total = float(total or 0.0)
+    cand = _TriageCandidate(
+        qid=str(qid),
+        raw_example=str(raw_example),
+        norm=str(norm),
+        command=str(command),
+        evidence=ev,
+        share=(ev / total) if total > 0 else 0.0,
+    )
+    if cand.evidence >= evidence and cand.share >= share:
+        return cand
+    return None
+
+
+def _triage_next_candidates(
+    conn: duckdb.DuckDBPyConnection,
+    base_cte: str,
+    q_path: Path,
+    from_qid: str,
+) -> list[Row]:
+    """First-order Markov step: adjacent (within-session) successors of
+    from_qid, decay-weighted, best first — each weighted by the successor's
+    own smoothed success so a frequently-followed dead end ranks below a
+    slightly-rarer resolver."""
+    return conn.execute(
+        base_cte
+        + _HISTORY_SCORE_CTE
+        + ", steps AS ("
+        "  SELECT qid, session_id, ts, "
+        "    LEAD(qid) OVER (PARTITION BY session_id ORDER BY ts, qid) "
+        "      AS next_qid, "
+        "    LEAD(w) OVER (PARTITION BY session_id ORDER BY ts, qid) "
+        "      AS next_w "
+        "  FROM term WHERE session_id IS NOT NULL"
+        "), trans AS ("
+        "  SELECT next_qid AS qid, SUM(next_w) AS tw FROM steps "
+        f" WHERE qid = {_sql_str(from_qid)} AND next_qid IS NOT NULL "
+        "  GROUP BY 1"
+        ") "
+        "SELECT trans.qid, q.raw_example, q.norm, q.command, trans.tw, "
+        "  SUM(trans.tw) OVER () AS total "
+        f"FROM trans JOIN read_parquet({_sql_str(q_path.as_posix())}) q "
+        "  USING (qid) "
+        "JOIN scored USING (qid) "
+        "ORDER BY trans.tw * scored.score DESC, trans.tw DESC LIMIT 5"
+    ).fetchall()
+
+
+def _triage_starter_candidates(
+    conn: duckdb.DuckDBPyConnection, base_cte: str, q_path: Path
+) -> list[Row]:
+    """Fresh-start analysis: which template OPENS sessions that end
+    successfully? evidence = decayed weight of successful sessions it started;
+    share = its success ratio as an opener."""
+    return conn.execute(
+        base_cte
+        + ", outcome AS ("
+        "  SELECT *, MAX(CAST(is_terminal AS INTEGER) * usable) "
+        "      OVER (PARTITION BY session_id) AS won, "
+        "    ts = MIN(ts) OVER (PARTITION BY session_id) AS is_first "
+        "  FROM term WHERE session_id IS NOT NULL"
+        "), starters AS ("
+        "  SELECT qid, SUM(w * won) AS sw, SUM(w) AS fw FROM outcome "
+        "  WHERE is_first GROUP BY qid"
+        ") "
+        "SELECT starters.qid, q.raw_example, q.norm, q.command, starters.sw, "
+        "  starters.sw / (CASE WHEN starters.fw > 0 THEN starters.fw ELSE 1 END) "
+        "    * starters.sw AS _shareprod "
+        f"FROM starters JOIN read_parquet({_sql_str(q_path.as_posix())}) q "
+        "  USING (qid) "
+        "ORDER BY starters.sw DESC LIMIT 5"
+    ).fetchall()
+
+
+def _triage_anchor(
+    conn: duckdb.DuckDBPyConnection, base_cte: str, session_id: str | None
+) -> str | None:
+    """The template qid this triage continues from, or None for a fresh
+    start. ONLY an explicitly supplied session id can anchor — its session's
+    latest row, regardless of age (the caller asserted continuity). Recency
+    must never anchor: concurrent agent sessions interleave in one store, so
+    'the latest row' can belong to someone else's investigation entirely."""
+    if session_id is None:
+        return None
+    row = conn.execute(
+        base_cte
+        + " SELECT qid FROM term "
+        f"WHERE session_id = {_sql_str(session_id)} "
+        "ORDER BY ts DESC LIMIT 1"
+    ).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def _triage_session_ran_summary(
+    conn: duckdb.DuckDBPyConnection, base_cte: str, q_path: Path, session_id: str
+) -> bool:
+    """Whether the anchor's session already contains a `summary` invocation —
+    the gate on triage's grounded fallback (a session grounds at most once)."""
+    count = _scalar(
+        conn.execute(
+            base_cte
+            + " SELECT count(*) FROM term "
+            f"JOIN read_parquet({_sql_str(q_path.as_posix())}) q USING (qid) "
+            f"WHERE term.session_id = {_sql_str(session_id)} "
+            "AND q.command = 'summary'"
+        )
+    )
+    return bool(count)
+
+
+# The synthetic grounding candidate: when history offers nothing convincing
+# and the session has not been grounded yet, triage runs the RCA guide's own
+# step 1 instead of shrugging (`summary` is concrete by construction). Its qid
+# is the real template hash, so the post-run suggestion lookup still works —
+# past sessions that grounded with summary vote on what to run next.
+_TRIAGE_GROUND_CANDIDATE = _TriageCandidate(
+    qid=_history_qid("summary"), raw_example="summary", norm="summary",
+    command="summary", evidence=0.0, share=0.0,
+)
+
+
+def _triage_suggestion_line(
+    telemetry_dir: Path, session_id: str, candidate: _TriageCandidate
+) -> str:
+    """The full copy-paste next invocation, session id included — printed as
+    the LAST line of triage output so an agent can chain without thinking."""
+    return (
+        f"triage next suggestion (adapt any '?' parts): "
+        f"otelq --dir {telemetry_dir} --session-id {session_id} "
+        f"{candidate.raw_example}"
+    )
+
+
+def _run_triage(args: argparse.Namespace, session_supplied: bool) -> int:
+    """`otelq triage` (ADR-009 amendment): decide from history whether we are
+    mid-investigation (Markov next-step from the anchor query) or starting
+    fresh (best session-opener), AUTO-RUN the winning candidate when the
+    evidence clears the thresholds and the template is concrete, then print
+    the suggested follow-up as the last output line. With no convincing
+    candidate it says so and dumps the ranked template list instead of
+    guessing."""
+    hdir = history_dir(args.dir)
+    q_path = hdir / _HISTORY_QUERIES
+    inv_path = hdir / _HISTORY_INVOCATIONS
+    if not q_path.exists() or not inv_path.exists():
+        print(_TRIAGE_NO_HISTORY_MSG, file=sys.stderr)
+        return 0
+
+    import duckdb  # lazy; see TYPE_CHECKING note above
+
+    cfg = _history_config()
+    tcfg = _triage_config()
+    conn = duckdb.connect(database=":memory:")
+    summary_ran = False  # has THIS session already been grounded?
+    try:
+        base_cte = _history_sessions_cte(inv_path, cfg)
+        try:
+            anchor_qid = _triage_anchor(
+                conn, base_cte, args.session_id if session_supplied else None
+            )
+            if anchor_qid is not None:
+                # The anchor exists only for a SUPPLIED session id, so the
+                # chain, the auto-run, and the suggestion already share
+                # args.session_id — no adoption step.
+                summary_ran = _triage_session_ran_summary(
+                    conn, base_cte, q_path, args.session_id
+                )
+                candidates = _triage_next_candidates(
+                    conn, base_cte, q_path, anchor_qid
+                )
+            else:
+                candidates = _triage_starter_candidates(conn, base_cte, q_path)
+            picked = _triage_pick(candidates, tcfg.evidence, tcfg.share)
+            suggested = picked or _triage_pick(
+                candidates, tcfg.suggest_evidence, tcfg.suggest_share
+            )
+        except duckdb.Error:
+            picked = suggested = None  # torn store: fall through to the dump
+    finally:
+        conn.close()
+
+    if picked is not None and _triage_concrete(picked):
+        return _triage_autorun(args, picked)
+    if suggested is not None:
+        # Confident enough to point, not to run (soft evidence, or a template
+        # with '?' placeholders that only the caller can fill).
+        print(_triage_suggestion_line(args.dir, args.session_id, suggested))
+        return 0
+    if not summary_ran:
+        # No convincing candidate, and this session has not been grounded yet
+        # (a fresh session trivially hasn't): run the RCA guide's step 1 for
+        # the caller instead of refusing and telling them to run it themselves.
+        return _triage_autorun(
+            args,
+            _TRIAGE_GROUND_CANDIDATE,
+            banner=(
+                "triage: no strong history candidate — grounding with "
+                f"`summary` (RCA step 1; session {args.session_id})"
+            ),
+        )
+    print(_TRIAGE_NO_CANDIDATE_MSG, file=sys.stderr)
+    columns, rows = _history_report(args.dir, args.top)
+    print(format_output(columns, rows, args.format))
+    return 0
+
+
+def _triage_autorun(
+    args: argparse.Namespace,
+    picked: _TriageCandidate,
+    banner: str | None = None,
+) -> int:
+    """Execute the picked template as a full otelq invocation: banner, the
+    command's normal output (header, payload), a manual history record (so the
+    chain advances), then the next-step suggestion as the last line."""
+    argv = [
+        "--dir", str(args.dir),
+        "--format", args.format,
+        "--session-id", args.session_id,
+        *shlex.split(picked.raw_example),
+    ]
+    try:
+        inner = build_parser().parse_args(argv)
+    except SystemExit:
+        # A stored template that no longer parses (flag renamed, etc.) — point
+        # instead of run, never crash triage over stale history.
+        print(_triage_suggestion_line(args.dir, args.session_id, picked))
+        return 0
+    if inner.command not in _HISTORY_COMMANDS:
+        print(_triage_suggestion_line(args.dir, args.session_id, picked))
+        return 0
+    print(
+        banner
+        or f"triage: running `{picked.raw_example}` (session {args.session_id})"
+    )
+    t0 = time.monotonic_ns()
+    try:
+        code = _dispatch(inner)
+    except SystemExit as exc:
+        # The stored query failed at runtime (e.g. stale SQL against a changed
+        # schema): report and leave the caller in charge.
+        print(f"triage: candidate failed: {exc}", file=sys.stderr)
+        return 0
+    _history_record(inner, code, time.monotonic_ns() - t0)
+
+    # Second Markov step: with the picked query now the anchor, is there a
+    # reasonably likely follow-up? Printed last, full syntax, session included.
+    hdir = history_dir(args.dir)
+    q_path = hdir / _HISTORY_QUERIES
+    inv_path = hdir / _HISTORY_INVOCATIONS
+
+    import duckdb  # lazy; see TYPE_CHECKING note above
+
+    cfg = _history_config()
+    tcfg = _triage_config()
+    conn = duckdb.connect(database=":memory:")
+    try:
+        nxt = _triage_pick(
+            _triage_next_candidates(
+                conn, _history_sessions_cte(inv_path, cfg), q_path, picked.qid
+            ),
+            tcfg.suggest_evidence,
+            tcfg.suggest_share,
+        )
+    except duckdb.Error:
+        nxt = None
+    finally:
+        conn.close()
+    if nxt is not None:
+        print()
+        print(_triage_suggestion_line(args.dir, args.session_id, nxt))
+    return code
+
+
 def _dispatch(args: argparse.Namespace) -> int:
+    # Whether the caller EXPLICITLY passed --session-id (before resolve_
+    # session_id backfills a generated one): triage anchors to a supplied
+    # session's own history; a generated id can't have any.
+    session_supplied = getattr(args, "session_id", None) is not None
+    # Resolve the session id once up front (FR-33) and stash it back on `args`
+    # so the response header (below) and the stderr session footer (main) stamp
+    # and advertise the exact same id — including a generated UUIDv7 default.
+    # Suppliedness rides along for the history record (only explicit ids are
+    # stored) and for triage's anchor lookup.
+    args._session_supplied = session_supplied
+    args.session_id = resolve_session_id(args)
     regex = _resolve_regex_arg(args)
     if args.command == "collector-config":
         print(render_collector_config())
@@ -2660,15 +3664,33 @@ def _dispatch(args: argparse.Namespace) -> int:
         rows, ok = doctor_report(args.dir)
         print(format_output(["check", "status", "detail"], rows, args.format))
         return 0 if ok else 1
+    if args.command == "history":
+        columns, rows = _history_report(args.dir, args.top)
+        if not rows and not (history_dir(args.dir) / _HISTORY_QUERIES).exists():
+            # Fail FRIENDLY: a fresh store is normal, not an error.
+            print(_HISTORY_NO_STORE_MSG, file=sys.stderr)
+            return 0
+        print(format_output(columns, rows, args.format))
+        return 0
+    if args.command == "triage":
+        return _run_triage(args, session_supplied)
     try:
         columns, rows, time_range, regex_removed, services = run_command(args, regex)
     except NoTelemetryError as exc:
+        _history_note_rows(0)
         print(exc, file=sys.stderr)
         return 0
+    _history_note_rows(len(rows))
     if args.command in _HEADER_COMMANDS:
         print(
             _format_response_header(
-                args.command, args.format, rows, time_range, args.regex, regex_removed
+                args.command,
+                args.format,
+                rows,
+                time_range,
+                args.session_id,
+                args.regex,
+                regex_removed,
             )
         )
     print(format_output(columns, rows, args.format))
@@ -2707,8 +3729,23 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "help":
         return _help_for(parser, args.topic)
+    t0 = time.monotonic_ns()
     try:
-        return _dispatch(args)
+        code = _dispatch(args)
+        # Session footer (FR-33): reminds the caller — on EVERY command — how to
+        # correlate follow-up invocations. On stderr (never stdout) so it can't
+        # corrupt the machine-parseable answer. A leading blank line sets it off
+        # from the rendered answer above. Flush stdout first so the footer truly
+        # trails the answer even when stdout is block-buffered (piped, not a tty)
+        # while stderr is unbuffered. `_dispatch` has stashed the resolved id.
+        sys.stdout.flush()
+        print("\n" + _session_footer(args.session_id), file=sys.stderr)
+        # Record AFTER the answer is fully printed (ADR-009: history is
+        # maintenance, kept off the critical path by ordering — the same rule
+        # ADR-008 applies to cache sealing). Only commands that completed
+        # normally are recorded; _history_record is best-effort throughout.
+        _history_record(args, code, time.monotonic_ns() - t0)
+        return code
     except BrokenPipeError:
         # Downstream closed the pipe (e.g. `otelq ... | head`). Point stdout at
         # /dev/null so the interpreter's flush-on-exit doesn't re-raise, and exit

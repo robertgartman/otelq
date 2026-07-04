@@ -1,6 +1,6 @@
 ---
 name: otelq
-description: "Query logs, metrics, and traces captured from the OpenTelemetry feed using the otelq CLI."
+description: "This is the **default** tool for accessing logs, metrics, and traces generated from project codebase and infrastructure. Use otelq CLI to query telemetry captured by the OpenTelemetry Collector."
 ---
 
 # Query Telemetry
@@ -19,6 +19,43 @@ the default path won't resolve to your project. Point it at the Collector's
 output folder (the bind-mounted `.telemetry/` at the project root). Pin a
 version with `uvx otelq@<version> …`.
 
+## Start every investigation with `triage`
+
+**The first instruction of an investigation is `triage`, not `summary`.**
+otelq records every telemetry query it runs (locally, in `.otelq-history/`
+under the telemetry dir), and `triage` acts on that history:
+
+```
+uvx otelq --dir .telemetry --format compact triage
+```
+
+What it does, in order:
+
+1. **Detects where you are.** Pass `--session-id <id>` to continue a chain —
+   triage anchors on that session's last query. Without the flag you are
+   **always** starting fresh: the session id is the only chain signal
+   (timestamps are never trusted — other agents may be querying the same
+   store concurrently), which is why carrying the id matters.
+2. **Auto-runs the best next query** when history is convincing (a Markov step
+   over past investigation sessions: enough recent evidence, majority
+   agreement, and a concrete template). You get the query's normal output —
+   banner first, so you know triage chose it.
+3. **Suggests the follow-up as its last output line** — a full
+   `otelq --dir … --session-id … <query>` invocation to run next. Run it (or
+   adapt any `?` placeholders) to keep the chain going.
+4. **Grounds or admits ignorance** when history has no strong candidate: if
+   this session hasn't run `summary` yet, triage runs it for you (RCA step 1 —
+   read its output and proceed with step 2). If the session is already
+   grounded, triage says it doesn't know and prints the ranked template list
+   (`score` = recent-frequency × success; `terminal_pct` = how often the
+   template *ended* a burst with usable rows). Pick one that matches your
+   symptom, or fall through to the RCA guide below.
+
+`history --top 20` prints the ranked list directly; the raw tables are `sql`
+views (`history_queries`, `history_invocations` — sessions are `session_id`
+groups ONLY; id-less rows belong to no session). History never records
+`triage`/`history`/`doctor`/meta commands, and `OTELQ_HISTORY=0` disables it.
+
 ## How to investigate (RCA guide)
 
 A fixed procedure beats free-form exploration: SOP-guided agents roughly
@@ -36,11 +73,20 @@ anything list-shaped; the header's `Rows removed by regex` tells you what the
 filter cost, so over-filtering is visible and correctable. Widening a window
 or dropping a filter is one retry; flooding your context is unrecoverable.
 
+**Standing rule — carry one session id through the whole investigation.** The
+first call of an RCA stamps a `Session:` line in its response header and prints
+a footer naming a session id; pass that exact id as `--session-id <id>` on every
+follow-up call of the same investigation, so the run is correlated end-to-end.
+Start a fresh investigation → let otelq generate a new id (omit the flag on the
+first call); continue one → reuse the id it already gave you.
+
 **0 · FRAME.** Before any query, state the symptom and the time window.
 Tighten `--since` to the anomaly (e.g. `30s`/`10m` right after a repro run) —
 never "look at everything."
 
-**1 · GROUND with `summary`.** One cheap call maps the terrain: which signals
+**1 · GROUND with `summary`** *(skip when `triage` already ran a grounding
+query for you — build on its output instead of re-grounding)*. One cheap call
+maps the terrain: which signals
 have data at all, per-level log counts (any ERROR/FATAL?), the `>1s` span
 bucket, metric types, and each subset's time span. Its second block —
 `** List of services in telemetry data **`, a `service`/`count` table ordered
@@ -118,8 +164,8 @@ typically ~40–60% fewer tokens on the same rows, identical data.
 | `table` | only when showing output to a human |
 
 `--format` is a **global** flag: it (and `--all`, `--no-cache`, `--since`,
-`--regex`) goes **before** the subcommand; per-command flags (`--top`,
-`--service`, `--level`, `--grep`) go **after**:
+`--regex`, `--session-id`) goes **before** the subcommand; per-command flags
+(`--top`, `--service`, `--level`, `--grep`) go **after**:
 
 ```
 uvx otelq --dir .telemetry --since 10m --format compact errors --top 20
