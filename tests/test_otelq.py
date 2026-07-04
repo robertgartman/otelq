@@ -2400,3 +2400,123 @@ def test_ac48_sql_schema_discovery_documented_and_works(temp_telemetry: Path) ->
     }
     assert documented_columns <= described_columns  # cheat-sheet is a subset
     assert "span_attributes" in described_columns  # the undocumented escape hatch
+
+
+# =============================================================================
+# FR-32 / AC-49..AC-55: --regex result filtering
+# =============================================================================
+
+
+def test_ac49_regex_filters_rows_and_reports_in_header(temp_telemetry: Path) -> None:
+    # FR-32/EC-29: only matching rows are kept, and the header gains two
+    # lines naming the verbatim pattern and the removed-row count; with no
+    # --regex, neither line appears.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            make_log(base, body="boom error here"),
+            make_log(base + timedelta(seconds=1), body="all good"),
+        ],
+    )
+    out = _run(temp_telemetry, "--regex", "error", "logs")
+    lines = out.splitlines()
+    assert lines[4] == "Regex filter applied: error"
+    assert lines[5] == "Rows removed by regex: 1"
+    payload = _json.loads(_strip_header(out))
+    assert len(payload) == 1 and payload[0]["body"] == "boom error here"
+
+    out_no_regex = _run(temp_telemetry, "logs")
+    assert "Regex filter applied" not in out_no_regex
+    assert "Rows removed by regex" not in out_no_regex
+
+
+def test_ac50_regex_matches_any_cell(temp_telemetry: Path) -> None:
+    # FR-32: a row is kept if the pattern matches ANY cell, not just a
+    # designated "message" column.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            make_log(base, service="special-svc", body="normal text"),
+            make_log(
+                base + timedelta(seconds=1), service="other-svc", body="normal text"
+            ),
+        ],
+    )
+    out = _run(temp_telemetry, "--regex", "special-svc", "logs")
+    payload = _json.loads(_strip_header(out))
+    assert len(payload) == 1
+    assert payload[0]["service_name"] == "special-svc"
+
+
+def test_ac51_malformed_regex_is_a_real_error(temp_telemetry: Path) -> None:
+    # FR-32/EC-30: a malformed pattern is a real error, not a raw traceback.
+    with pytest.raises(SystemExit) as exc:
+        otelq.main(["--dir", str(temp_telemetry), "--regex", "(", "logs"])
+    assert "invalid --regex pattern" in str(exc.value)
+
+
+def test_ac52_regex_rejected_outside_supported_commands(temp_telemetry: Path) -> None:
+    # FR-32/EC-31: --regex is rejected as a real error for sql/doctor/
+    # collector-config/troubleshoot, not silently ignored.
+    for argv in (
+        ["sql", "SELECT 1"],
+        ["doctor"],
+        ["collector-config"],
+        ["troubleshoot"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            otelq.main(["--dir", str(temp_telemetry), "--regex", "x", *argv])
+        assert "not supported for" in str(exc.value)
+
+
+def test_ac53_regex_matches_pre_render_raw_value(temp_telemetry: Path) -> None:
+    # FR-32: filtering happens against the raw cell value, before --format
+    # json's escaping — a pattern matching only the unescaped quote form
+    # still keeps the row (it would NOT match the JSON-escaped \"hi\" form).
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body='say "hi" now')])
+    out = _run_fmt(temp_telemetry, "json", "--regex", '"hi"', "logs")
+    payload = _json.loads(_strip_header(out))
+    assert len(payload) == 1
+    assert payload[0]["body"] == 'say "hi" now'
+
+
+def test_ac54_regex_case_sensitive_and_skips_none_cells(temp_telemetry: Path) -> None:
+    # FR-32: case-sensitive by default (inline (?i) opts in to insensitive);
+    # None cells are excluded from matching, not stringified into "None".
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [make_log(base, severity="INFO", sevnum=9, body="UPPER CASE")],
+    )
+    out = _run(temp_telemetry, "--regex", "upper case", "logs")
+    assert _json.loads(_strip_header(out)) == []
+    out_ci = _run(temp_telemetry, "--regex", "(?i)upper case", "logs")
+    assert len(_json.loads(_strip_header(out_ci))) == 1
+
+    # summary's zero-count skeleton rows (e.g. WARN/ERROR/...) have
+    # earliest/latest = None; "None" must not match those rows.
+    out_none = _run(temp_telemetry, "--regex", "None", "summary")
+    assert _json.loads(_strip_header(out_none)) == []
+
+
+def test_ac55_regex_operates_on_already_capped_result(temp_telemetry: Path) -> None:
+    # FR-32/FR-23: the filter runs on the already --top-capped, fully-ordered
+    # result — a match beyond the cap is not found unless --top is raised.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            make_log(base, body="the target needle"),  # oldest
+            make_log(base + timedelta(seconds=1), body="filler 1"),
+            make_log(base + timedelta(seconds=2), body="filler 2"),
+        ],
+    )
+    # newest-first order excludes the oldest ("needle") row once capped to 2.
+    out = _run(temp_telemetry, "--regex", "needle", "logs", "--top", "2")
+    assert _json.loads(_strip_header(out)) == []
+    # Raising --top recovers the match.
+    out2 = _run(temp_telemetry, "--regex", "needle", "logs", "--top", "3")
+    assert len(_json.loads(_strip_header(out2))) == 1

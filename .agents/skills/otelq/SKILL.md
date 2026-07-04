@@ -5,8 +5,8 @@ description: "Query logs, metrics, and traces captured from the OpenTelemetry fe
 
 # Query Telemetry
 
-Inspect real OpenTelemetry signals to close the loop after a change: run the
-code, then confirm from telemetry that it behaved as intended.
+Inspect real OpenTelemetry signals to close the loop after a change or for troubleshooting: run the
+code, then confirm from telemetry that it behaved as intended. If infrastructure is feeding into OpenTelemetry, you can also query that data to understand its behavior.
 
 ## Run
 
@@ -14,11 +14,7 @@ code, then confirm from telemetry that it behaved as intended.
 uvx otelq --dir .telemetry --format compact summary
 ```
 
-`--dir .telemetry` is **required** — `uvx` runs otelq from an isolated build, so
-the default path won't resolve to your project. Point it at the Collector's
-output folder (the bind-mounted `.telemetry/` at the project root). Start with
-`summary` when you don't yet know what to query. Pin a version with
-`uvx otelq@<version> …`.
+/
 
 ## Timestamps are UTC
 
@@ -48,13 +44,31 @@ typically ~40–60% fewer tokens on the same rows, identical data.
 | `csv` | spreadsheet / interchange |
 | `table` | only when showing output to a human |
 
-`--format` is a **global** flag: it (and `--all`, `--no-cache`, `--since`) goes
-**before** the subcommand; per-command flags (`--top`, `--service`, `--level`,
-`--grep`) go **after**:
+`--format` is a **global** flag: it (and `--all`, `--no-cache`, `--since`,
+`--regex`) goes **before** the subcommand; per-command flags (`--top`,
+`--service`, `--level`, `--grep`) go **after**:
 
 ```
 uvx otelq --dir .telemetry --since 10m --format compact errors --top 20
 ```
+
+## Filter with --regex, not `| grep`
+
+Piping otelq's output through `grep` is blind to what got filtered away.
+`--regex PATTERN` filters instead — applied to raw cell values before
+rendering (so JSON escaping/CSV quoting never affects match precision), and
+the response header reports the verbatim pattern plus how many rows it
+removed, so you always know what was excluded:
+
+```
+uvx otelq --dir .telemetry --regex "timeout|ECONNRESET" errors
+```
+
+Case-sensitive by default (use inline `(?i)` for case-insensitive). Only
+`summary`/`errors`/`slow`/`trace`/`logs`/`metric` support it — not `sql`
+(use `WHERE col ~ 'pattern'` instead) or `doctor`/`collector-config`/
+`troubleshoot`. It filters the same already-`--top`-capped result; raise
+`--top` if you need to search further back.
 
 ## Commands
 

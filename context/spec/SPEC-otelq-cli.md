@@ -83,9 +83,10 @@ configuration that produces the raw files.
 - **Subcommand / command** — one of the seven verbs otelq accepts
   (`summary`, `errors`, `slow`, `trace`, `logs`, `metric`, `sql`).
 - **Global flag** — a flag accepted before the subcommand (`--format`, `--dir`,
-  `--all`, `--no-cache`, `--since`, `--verbose`, `--version`); contrast
-  subcommand-specific flags (`--top`, `--service`, `--level`, `--grep`, the
-  `trace_id`/`name`/`query` positionals), which follow the subcommand.
+  `--all`, `--no-cache`, `--since`, `--regex`, `--verbose`, `--version`);
+  contrast subcommand-specific flags (`--top`, `--service`, `--level`,
+  `--grep`, the `trace_id`/`name`/`query` positionals), which follow the
+  subcommand.
 - **Default telemetry dir** — the `.telemetry/` directory under the current
   working directory (`<cwd>/.telemetry`, per
   [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md)),
@@ -264,11 +265,11 @@ configuration that produces the raw files.
   is the **payload** that follows the response header of FR-29 on stdout; FR-10
   governs that payload, not the header itself.
 - **FR-11 — Global flags precede the subcommand.** `--format`, `--dir`,
-  `--all`, `--no-cache`, and `--since` are global flags and **must** be accepted
-  *before* the subcommand. Supplying a global flag *after* the subcommand
-  **must** be rejected as an unrecognized argument (a hard parse error), not
-  silently accepted. Subcommand-specific flags and positionals continue to follow
-  the subcommand.
+  `--all`, `--no-cache`, `--since`, and `--regex` are global flags and **must**
+  be accepted *before* the subcommand. Supplying a global flag *after* the
+  subcommand **must** be rejected as an unrecognized argument (a hard parse
+  error), not silently accepted. Subcommand-specific flags and positionals
+  continue to follow the subcommand.
 - **FR-12 — `--dir`.** A `--dir <path>` global flag **must** select the
   telemetry directory to read; when omitted, otelq **must** read the default
   telemetry dir (see Definitions).
@@ -383,6 +384,29 @@ configuration that produces the raw files.
   **stderr** (never stdout, so `json`/`jsonl`/`csv` stay machine-parseable). The
   cap is applied after the command's own ordering, so the retained rows are the
   first `N` of the fully-ordered result.
+- **FR-32 — `--regex` result filtering.** A `--regex <pattern>` global flag
+  **must** filter the result of `summary`, `errors`, `slow`, `trace`, `logs`,
+  and `metric` (the FR-29 header-bearing commands; **not** `sql` — already
+  supports regex natively via DuckDB's `~`/`regexp_matches` — nor
+  `collector-config`/`doctor`/`troubleshoot`, which are not telemetry query
+  results) to only the rows where `pattern` matches at least one of the row's
+  own cell values, applied **before** the FR-10 rendering so formatting
+  artifacts (JSON escaping, CSV quoting, table padding) **must not** affect
+  match precision. `pattern` **must** be a standard Python `re` pattern,
+  matched case-sensitively via `re.search` against each cell's string form
+  (`None` cells excluded) — a caller wanting case-insensitive matching uses the
+  inline `(?i)` flag. A malformed pattern **must** be rejected as a real error
+  (FR-17) naming the underlying `re` error, not a raw traceback. Supplying
+  `--regex` with a command outside its supported set **must** be rejected as a
+  real error naming the unsupported command, not silently ignored. The filter
+  **must** apply to the same fully-ordered, already `--top`-capped result the
+  command would otherwise return (FR-23) — i.e. the same rows a caller piping
+  otelq's rendered output through `grep` would see today — not a wider,
+  unbounded scan; a caller needing to search beyond the cap raises `--top`
+  themselves. When `--regex` is supplied, the FR-29 response header **must**
+  additionally report the verbatim pattern and how many rows it removed, so a
+  caller is never blind to what was filtered away (unlike post-hoc `grep` on
+  rendered output).
 - **FR-24 — `--version`.** A `--version` global flag **must** print otelq's own
   version and exit `0`. The reported version **must** match the packaged
   distribution version (so an agent can name the exact build it drives, relevant
@@ -462,6 +486,13 @@ configuration that produces the raw files.
     needs the bare payload skips past the line of ten `-` characters.
   - The header **must not** change which rows are returned, their order, or the
     FR-10 rendering rules applied to the payload that follows it (INV-6).
+  - When `--regex <pattern>` (FR-32) is supplied, the header **must** insert
+    two additional lines after `Time range` and before the `IMPORTANT` line:
+    `Regex filter applied: <pattern>` (the verbatim pattern) and `Rows removed
+    by regex: <count>` (how many rows the filter excluded). These lines
+    **must not** appear when `--regex` is not supplied — the header's line
+    count is otherwise fixed, but this pair is the one deliberate exception,
+    mirroring the `compact`-only format-line suffix.
 
 ## Edge Cases & Failure Modes
 
@@ -578,6 +609,17 @@ configuration that produces the raw files.
   `otelq sql "DESCRIBE traces"` returns more columns than `--help`'s `sql
   views` cheat-sheet documents for `traces` — including a `span_attributes`
   column — demonstrating the FR-31 escape hatch actually works. (FR-31)
+- **EC-29 — `--regex` filters and reports.** `otelq --regex ERROR logs` returns
+  only rows where `ERROR` matches some cell, and the header gains `Regex
+  filter applied: ERROR` and `Rows removed by regex: <N>` lines; `otelq logs`
+  (no `--regex`) shows neither line. (FR-32)
+- **EC-30 — Malformed `--regex` pattern.** `otelq --regex "(" logs` exits
+  non-zero with a message naming the underlying `re` error, not a raw
+  traceback. (FR-32, FR-17)
+- **EC-31 — `--regex` rejected outside its supported commands.** `otelq
+  --regex ERROR sql "SELECT 1"` (and likewise `doctor`/`collector-config`/
+  `troubleshoot`) exits non-zero naming the command as unsupported for
+  `--regex`, rather than silently ignoring the flag. (FR-32, FR-17)
 
 ## Acceptance Criteria
 
@@ -872,6 +914,45 @@ configuration that produces the raw files.
   assert the help text mentions `DESCRIBE`/`PRAGMA`, and that a live
   `DESCRIBE traces` result's column set is a strict superset of the
   documented one and contains `span_attributes`.*
+- **AC-49** (Verifies FR-32, EC-29): Given a corpus where the pattern matches
+  some but not all rows of a command's result, when `--regex <pattern>` runs,
+  then only the matching rows are returned, the header gains `Regex filter
+  applied: <pattern>` and `Rows removed by regex: <N>` lines (`<N>` equal to
+  the non-matching row count), and the payload is otherwise rendered exactly
+  as FR-10 specifies; given no `--regex`, neither header line appears.
+  *Verification hint: `test_ac49_regex_filters_rows_and_reports_in_header`.*
+- **AC-50** (Verifies FR-32): Given a pattern that matches a value in one cell
+  of a row but not others, when `--regex` runs, then the row is kept (matching
+  *any* cell is sufficient) — not just a designated "message" column.
+  *Verification hint: `test_ac50_regex_matches_any_cell`.*
+- **AC-51** (Verifies FR-32, EC-30): Given a malformed pattern (e.g. `(`), when
+  `--regex` runs, then otelq exits non-zero with a message naming the
+  underlying `re` error, not a Python traceback.
+  *Verification hint: `test_ac51_malformed_regex_is_a_real_error`.*
+- **AC-52** (Verifies FR-32, EC-31): Given `--regex` with `sql`, `doctor`,
+  `collector-config`, or `troubleshoot`, when the command runs, then otelq
+  exits non-zero naming the command as unsupported for `--regex`.
+  *Verification hint: `test_ac52_regex_rejected_outside_supported_commands`.*
+- **AC-53** (Verifies FR-32): Given a `body` value containing a literal
+  double-quote (a character `--format json` would escape), when a pattern
+  matching only the unescaped form runs, then the row is still kept —
+  proving the match happens against the raw cell value before FR-10
+  rendering, not against the already-escaped/quoted rendered text.
+  *Verification hint: `test_ac53_regex_matches_pre_render_raw_value`.*
+- **AC-54** (Verifies FR-32): Given a row containing an uppercase value, when
+  a lowercase pattern runs with no `(?i)` flag, then the row is excluded
+  (case-sensitive by default); given the same pattern with a leading `(?i)`,
+  the row is kept. Given a row with a `None` cell (e.g. a root span's
+  `parent_span_id`), when a pattern matching the literal text `None` runs,
+  then that row is **not** kept solely because of the `None` cell — `None`
+  values are excluded from matching, not stringified into `"None"`.
+  *Verification hint: `test_ac54_regex_case_sensitive_and_skips_none_cells`.*
+- **AC-55** (Verifies FR-32, FR-23): Given a corpus where a matching row exists
+  only beyond the `--top` cap's ordinal position, when `--regex` and a small
+  `--top` both apply, then the result is empty (or omits that row) — the
+  filter operates on the already-capped result, not a wider scan; raising
+  `--top` recovers the match.
+  *Verification hint: `test_ac55_regex_operates_on_already_capped_result`.*
 
 ### Examples
 

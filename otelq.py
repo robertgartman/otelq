@@ -45,6 +45,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -1615,29 +1616,87 @@ _FORMAT_SHAPE_HINT = {
 
 
 def _format_response_header(
-    command: str, fmt: str, rows: list[Row], time_range: TimeRange
+    command: str,
+    fmt: str,
+    rows: list[Row],
+    time_range: TimeRange,
+    regex: str | None = None,
+    regex_removed: int | None = None,
 ) -> str:
     """Render the FR-29 response header: a fixed plain-text block naming the
     command, format, OpenTelemetry signal(s), and UTC time range, so an LLM
-    consumer cannot mistake a rendered `timestamp` for local time."""
+    consumer cannot mistake a rendered `timestamp` for local time. When
+    `--regex` (FR-32) was supplied, two extra lines report the verbatim
+    pattern and how many rows it removed, so a caller is never blind to what
+    was filtered away — unlike post-hoc `grep` on rendered output."""
     lo, hi = time_range
     from_str = _iso_utc(lo) if lo is not None else "n/a"
     to_str = _iso_utc(hi) if hi is not None else "n/a"
     shape_hint = _FORMAT_SHAPE_HINT.get(fmt, "")
-    return "\n".join(
-        [
-            "==========",
-            f"otelq {command} response, format {fmt}{shape_hint}",
-            f"OpenTelemetry signal: {_result_signal(command, rows)}",
-            f"Time range: {from_str} - {to_str}",
-            "IMPORTANT: all timestamps are UTC",
-            "----------",
-        ]
-    )
+    lines = [
+        "==========",
+        f"otelq {command} response, format {fmt}{shape_hint}",
+        f"OpenTelemetry signal: {_result_signal(command, rows)}",
+        f"Time range: {from_str} - {to_str}",
+    ]
+    if regex is not None:
+        lines.append(f"Regex filter applied: {regex}")
+        lines.append(f"Rows removed by regex: {regex_removed}")
+    lines.append("IMPORTANT: all timestamps are UTC")
+    lines.append("----------")
+    return "\n".join(lines)
 
 
-def run_command(args: argparse.Namespace) -> tuple[list[str], list[Row], TimeRange]:
-    """Plan, build the connection, dispatch, and apply trace/metric cold-fallback."""
+def _regex_cell_str(value: Any) -> str:
+    """Render a cell the same way `format_output` eventually will (FR-16), so
+    a `--regex` pattern matches what the caller will actually see rendered —
+    not a naive `str(datetime)` form the output never shows."""
+    return _iso_utc(value) if isinstance(value, datetime) else str(value)
+
+
+def _apply_regex_filter(
+    pattern: re.Pattern[str], rows: list[Row]
+) -> tuple[list[Row], int]:
+    """Keep only rows where `pattern` matches at least one cell's string form
+    (FR-32). `None` cells are excluded from matching entirely — otherwise a
+    stray `None` would stringify to the literal text "None" and could
+    accidentally match a pattern that has nothing to do with a null value."""
+    kept = [
+        r
+        for r in rows
+        if any(pattern.search(_regex_cell_str(v)) for v in r if v is not None)
+    ]
+    return kept, len(rows) - len(kept)
+
+
+def _resolve_regex_arg(args: argparse.Namespace) -> re.Pattern[str] | None:
+    """Validate and compile `--regex` (FR-32): a real error for an unsupported
+    command or a malformed pattern, never a silent no-op or a raw traceback."""
+    pattern_text = getattr(args, "regex", None)
+    if pattern_text is None:
+        return None
+    if args.command not in _HEADER_COMMANDS:
+        supported = ", ".join(sorted(_HEADER_COMMANDS))
+        raise SystemExit(
+            f"otelq: --regex is not supported for '{args.command}' "
+            f"(only: {supported})"
+        )
+    try:
+        return re.compile(pattern_text)
+    except re.error as exc:
+        raise SystemExit(f"otelq: invalid --regex pattern: {exc}")
+
+
+def run_command(
+    args: argparse.Namespace, regex: re.Pattern[str] | None
+) -> tuple[list[str], list[Row], TimeRange, int | None]:
+    """Plan, build the connection, dispatch, and apply trace/metric cold-fallback.
+
+    `regex` (already compiled and scope-validated by the caller, FR-32) is
+    applied to each candidate result before the time range is computed, so
+    `Time range` in the header reflects the rows actually returned. The
+    fourth return value is the regex-removed row count, or `None` when no
+    `--regex` was supplied."""
     # A --dir that exists but is not a directory (e.g. a regular file) would
     # crash deep in the cache layer: _acquire_lock does mkdir('<file>/.otelq-cache')
     # and raises NotADirectoryError. Reject it up front with a friendly message
@@ -1660,8 +1719,11 @@ def run_command(args: argparse.Namespace) -> tuple[list[str], list[Row], TimeRan
                 raise
         else:
             if not (fallback and not rows):
+                regex_removed = None
+                if regex is not None:
+                    rows, regex_removed = _apply_regex_filter(regex, rows)
                 time_range = _result_time_range(conn, args.command, columns, rows)
-                return columns, rows, time_range
+                return columns, rows, time_range, regex_removed
     # Fell through: the hot window held no answer and this command may widen to a
     # full-history cold scan (only `trace` today). closing() has already released
     # the hot connection before we open the cold one (D-3).
@@ -1673,8 +1735,11 @@ def run_command(args: argparse.Namespace) -> tuple[list[str], list[Row], TimeRan
     with closing(build_connection(args.dir, Plan("COLD", None, True))) as conn:
         _seal_external_access(conn, args.command)
         columns, rows = command(conn, args)
+        regex_removed = None
+        if regex is not None:
+            rows, regex_removed = _apply_regex_filter(regex, rows)
         time_range = _result_time_range(conn, args.command, columns, rows)
-        return columns, rows, time_range
+        return columns, rows, time_range, regex_removed
 
 
 def format_output(columns: list[str], rows: list[tuple[Any, ...]], fmt: str) -> str:
@@ -2367,8 +2432,8 @@ def build_parser() -> argparse.ArgumentParser:
               of converting, so the comparison would be silently wrong.
 
             argument order:
-              --dir / --format / --all / --no-cache / --since / --verbose are
-              GLOBAL flags and must come BEFORE the subcommand:
+              --dir / --format / --all / --no-cache / --since / --regex /
+              --verbose are GLOBAL flags and must come BEFORE the subcommand:
                 otelq --since 10m --format compact errors
               (not: otelq errors --since 10m). Per-command flags (--top, --service,
               --level, --grep) go AFTER the subcommand.
@@ -2394,6 +2459,22 @@ def build_parser() -> argparse.ArgumentParser:
             row limits:
               errors / slow / logs / metric cap output with --top N and print a
               one-line notice to stderr when the result was truncated.
+
+            regex filtering (summary/errors/slow/trace/logs/metric only):
+              --regex PATTERN  keep only rows matching PATTERN in some cell.
+                               Applied BEFORE rendering, so JSON escaping/CSV
+                               quoting/table padding never affect precision —
+                               precise field-level matching, not `| grep` on
+                               already-rendered text. The response header
+                               reports the verbatim pattern and how many rows
+                               it removed, so you're never blind to what was
+                               filtered (unlike piping through grep). Standard
+                               Python re syntax, case-sensitive by default —
+                               use inline (?i) for case-insensitive. Applies to
+                               the same already --top-capped result; raise
+                               --top to search further. Not supported for sql
+                               (use WHERE col ~ 'pattern' — DuckDB has native
+                               regex) or collector-config/doctor/troubleshoot.
 
             sql views (for `otelq sql "<query>"`):
               data model: below is a curated subset. Explore the full live
@@ -2467,6 +2548,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--since",
         help="restrict to a trailing time window: Ns/Nm/Nh/Nd (e.g. 30s, 10m, 2h, 1d)",
     )
+    # --regex is a GLOBAL flag: like --format, it applies to the result of
+    # whichever query command runs. See SPEC-otelq-cli FR-11/FR-32.
+    parser.add_argument(
+        "--regex",
+        help="keep only rows matching this pattern in some cell (summary/errors/"
+        "slow/trace/logs/metric only); reported in the response header",
+    )
 
     # Not required: a bare `otelq` (command is None) prints full help in main().
     sub = parser.add_subparsers(dest="command", required=False)
@@ -2521,6 +2609,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _dispatch(args: argparse.Namespace) -> int:
+    regex = _resolve_regex_arg(args)
     if args.command == "collector-config":
         print(render_collector_config())
         return 0
@@ -2532,12 +2621,16 @@ def _dispatch(args: argparse.Namespace) -> int:
         print(format_output(["check", "status", "detail"], rows, args.format))
         return 0 if ok else 1
     try:
-        columns, rows, time_range = run_command(args)
+        columns, rows, time_range, regex_removed = run_command(args, regex)
     except NoTelemetryError as exc:
         print(exc, file=sys.stderr)
         return 0
     if args.command in _HEADER_COMMANDS:
-        print(_format_response_header(args.command, args.format, rows, time_range))
+        print(
+            _format_response_header(
+                args.command, args.format, rows, time_range, args.regex, regex_removed
+            )
+        )
     print(format_output(columns, rows, args.format))
     return 0
 

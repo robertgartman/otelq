@@ -177,7 +177,7 @@ This is a dump from running `uv run otelq.py --help` within the project root:
 
 usage: otelq [-h] [--version] [--dir DIR]
              [--format {table,json,jsonl,csv,compact}] [--all] [--no-cache]
-             [--verbose] [--since SINCE]
+             [--verbose] [--since SINCE] [--regex REGEX]
              {summary,sql,errors,slow,trace,logs,metric,collector-config,doctor,troubleshoot,help}
              ...
 
@@ -211,6 +211,9 @@ options:
   --verbose             print the resolved time window and route to stderr
   --since SINCE         restrict to a trailing time window: Ns/Nm/Nh/Nd (e.g.
                         30s, 10m, 2h, 1d)
+  --regex REGEX         keep only rows matching this pattern in some cell
+                        (summary/errors/slow/trace/logs/metric only); reported
+                        in the response header
 
 timestamps: ALL timestamps — printed by otelq and written into a
   `sql` query — are UTC. Write `sql` timestamp literals bare
@@ -219,8 +222,8 @@ timestamps: ALL timestamps — printed by otelq and written into a
   of converting, so the comparison would be silently wrong.
 
 argument order:
-  --dir / --format / --all / --no-cache / --since / --verbose are
-  GLOBAL flags and must come BEFORE the subcommand:
+  --dir / --format / --all / --no-cache / --since / --regex /
+  --verbose are GLOBAL flags and must come BEFORE the subcommand:
     otelq --since 10m --format compact errors
   (not: otelq errors --since 10m). Per-command flags (--top, --service,
   --level, --grep) go AFTER the subcommand.
@@ -246,6 +249,22 @@ time window (filters by each record's own event-time):
 row limits:
   errors / slow / logs / metric cap output with --top N and print a
   one-line notice to stderr when the result was truncated.
+
+regex filtering (summary/errors/slow/trace/logs/metric only):
+  --regex PATTERN  keep only rows matching PATTERN in some cell.
+                   Applied BEFORE rendering, so JSON escaping/CSV
+                   quoting/table padding never affect precision —
+                   precise field-level matching, not `| grep` on
+                   already-rendered text. The response header
+                   reports the verbatim pattern and how many rows
+                   it removed, so you're never blind to what was
+                   filtered (unlike piping through grep). Standard
+                   Python re syntax, case-sensitive by default —
+                   use inline (?i) for case-insensitive. Applies to
+                   the same already --top-capped result; raise
+                   --top to search further. Not supported for sql
+                   (use WHERE col ~ 'pattern' — DuckDB has native
+                   regex) or collector-config/doctor/troubleshoot.
 
 sql views (for `otelq sql "<query>"`):
   data model: below is a curated subset. Explore the full live
