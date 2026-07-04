@@ -71,8 +71,9 @@ if TYPE_CHECKING:
 # otelq's own version, reported by `otelq --version` (F-3). Kept in lockstep with
 # the packaged version in pyproject.toml (a test asserts they match), so an
 # agent driving otelq — and the DuckDB/extension pin governance of ADR-003 — can
-# report exactly which build it is talking to.
-__version__ = "0.3.0"
+# report exactly which build it is talking to. The trailing marker lets
+# release-please bump this line alongside pyproject.toml (see release-please.yml).
+__version__ = "0.3.0"  # x-release-please-version
 
 # Public surface of this single-file module. The CLI entry is `main`; the rest
 # is the API the test suite pins. The trailing group is deliberately exported
