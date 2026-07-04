@@ -1,0 +1,34 @@
+# Lefthook v2 inverts verbosity control: `output` is a positive allow-list
+# of categories to print. Omitted categories (meta banner, "(skip) no files
+# for inspection" lines, timing summary, success ticks) stay silent.
+# Override at runtime with LEFTHOOK_OUTPUT=meta,summary,failure,... or pass
+# --verbose for full debug logs.
+output:
+  - failure
+  - execution
+  - execution_out
+
+pre-commit:
+  parallel: false
+
+  commands:
+    # otelq is a single-file CLI plus one test module (no per-language/per-app
+    # split), so these run the exact whole-repo commands documented in
+    # .agents/skills/implement/SKILL.md Step 8 and in CI
+    # (.github/workflows/ci.yml) — sequential, cheapest/fastest check first,
+    # so a local pre-commit failure mirrors what CI would report.
+
+    ruff-check:
+      priority: 1
+      glob: "*.py"
+      run: uvx ruff check .
+
+    pyright:
+      priority: 2
+      glob: "*.py"
+      run: uvx pyright
+
+    pytest:
+      priority: 3
+      glob: "*.py"
+      run: uv run --with pytest --with "duckdb==1.5.3" pytest tests/ -q

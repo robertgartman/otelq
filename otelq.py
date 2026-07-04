@@ -1838,17 +1838,27 @@ def cmd_summary(
     return columns, rows
 
 
+def _execute_sql(
+    conn: duckdb.DuckDBPyConnection, query: str
+) -> duckdb.DuckDBPyConnection | None:
+    """`execute()` really can return `None` for an empty / whitespace /
+    comment-only query at runtime, even though the installed duckdb stub
+    declares a non-Optional return type — this wrapper's own signature
+    reflects the observed behavior instead of the stub's (EC-4, test_bug5)."""
+    return conn.execute(query)
+
+
 def cmd_sql(
     conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
 ) -> CommandResult:
     import duckdb  # lazy; see TYPE_CHECKING note above
 
     try:
-        result = conn.execute(args.query)
+        result = _execute_sql(conn, args.query)
         # An empty / whitespace / comment-only query has no statement to run, so
-        # DuckDB's execute() returns None and result.description below would raise
-        # AttributeError (not a duckdb.Error). Route it to the same friendly
-        # SQL-error path as any other bad SQL instead of a raw traceback (EC-4).
+        # result is None here, and result.description below would otherwise
+        # raise AttributeError (not a duckdb.Error). Route it to the same
+        # friendly SQL-error path as any other bad SQL (EC-4).
         if result is None:
             raise SystemExit("otelq: SQL error: empty query")
         columns = [d[0] for d in result.description] if result.description else []

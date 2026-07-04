@@ -82,3 +82,11 @@ otelq-test:
 # Lint the project
 lint:
     uvx ruff check .
+
+# Install the git pre-commit hooks (run once after cloning; see lefthook.yml)
+hooks-install:
+    uvx lefthook install
+
+# Run the pre-commit hooks on demand, without making a commit
+hooks-run:
+    uvx lefthook run pre-commit --all-files
