@@ -1960,13 +1960,17 @@ def cmd_errors(
             _no_signal_msg(conn, "traces or logs", ("traces", "logs"))
         )
     # The time window is applied by the relation builder (SPEC INV-7), so the
-    # command queries the already-scoped relations.
-    columns = ["kind", "timestamp", "service_name", "label", "detail"]
+    # command queries the already-scoped relations. trace_id travels with every
+    # row (FR-4): errors is the triage entry of an investigation and the trace
+    # tree its localization step, so the pivot key to `trace <id>` (FR-6) must
+    # not require a second sql lookup. A log with no trace context carries its
+    # raw (empty) value.
+    columns = ["kind", "timestamp", "service_name", "label", "detail", "trace_id"]
     arms: list[str] = []
     if _has_rows(conn, "traces"):
         arms.append(
             "SELECT 'span' AS kind, timestamp, service_name, "
-            "span_name AS label, status_message AS detail "
+            "span_name AS label, status_message AS detail, trace_id "
             "FROM traces WHERE status_code = 2"
         )
     if _has_rows(conn, "logs"):
@@ -1974,7 +1978,7 @@ def cmd_errors(
         # casing in practice (e.g. "Error"), so fold before comparing (cf. FR-2).
         arms.append(
             "SELECT 'log' AS kind, timestamp, service_name, "
-            "severity_text AS label, body AS detail "
+            "severity_text AS label, body AS detail, trace_id "
             "FROM logs WHERE upper(severity_text) IN ('ERROR', 'FATAL')"
         )
     if not arms:
@@ -1985,7 +1989,7 @@ def cmd_errors(
     # SQL (not a Python sort) also tolerates null label/detail without raising.
     query = (
         " UNION ALL ".join(arms)
-        + " ORDER BY timestamp DESC, kind, service_name, label, detail"
+        + " ORDER BY timestamp DESC, kind, service_name, label, detail, trace_id"
     )
     rows = _limited(conn, query, [], getattr(args, "top", _DEFAULT_TOP))
     return columns, rows

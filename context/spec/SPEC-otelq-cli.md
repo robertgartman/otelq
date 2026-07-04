@@ -206,7 +206,12 @@ configuration that produces the raw files.
   `severity_text` in `{ERROR, FATAL}`, matched **case-insensitively** since
   `severity_text` carries inconsistent casing in practice — see FR-2), combined
   into one result and ordered newest-first by `timestamp`. Each row **must**
-  identify whether it is a span or a log.
+  identify whether it is a span or a log, and **must** carry its record's
+  `trace_id`, so a caller pivots straight to `trace <trace_id>` (FR-6) without
+  a second lookup — `errors` is the triage entry point of an investigation and
+  the trace tree is its localization step, so the pivot key travels with the
+  row (as it already does for `slow` and `logs`). A log record with no trace
+  context carries its raw (empty) `trace_id` value.
 - **FR-5 — `slow`.** `slow` **must** return spans ordered by `duration`
   descending, limited to the top `N` where `N` is the value of `--top`
   (default **20**). The presented duration **must** be expressed in milliseconds.
@@ -953,6 +958,11 @@ configuration that produces the raw files.
   filter operates on the already-capped result, not a wider scan; raising
   `--top` recovers the match.
   *Verification hint: `test_ac55_regex_operates_on_already_capped_result`.*
+- **AC-56** (Verifies FR-4, FR-6): Given an error span and a trace-correlated
+  error log, when `errors` runs, then every row carries a `trace_id` column,
+  and feeding the span row's `trace_id` to `trace` returns that span's tree —
+  the triage→localization pivot needs no intermediate `sql` lookup.
+  *Verification hint: `test_ac56_errors_rows_carry_trace_id_for_pivot`.*
 
 ### Examples
 

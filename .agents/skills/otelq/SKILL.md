@@ -60,8 +60,7 @@ Nothing in the window? Widen once (`--all`); still nothing means the
 telemetry never captured it — say so instead of exploring sideways.
 
 **3 · LOCALIZE with `trace <trace_id>`** (a unique id prefix is enough;
-`slow` and `logs` rows carry trace_id — for `errors` span rows fetch it with
-`sql "SELECT trace_id, span_name FROM traces WHERE status_code = 2"`).
+`errors`, `slow`, and `logs` rows all carry trace_id — pivot directly).
 One full tree beats ten partial fetches. Read it with two heuristics:
 
 - **Latency origin** = the span with the largest **self** time (its

@@ -2520,3 +2520,25 @@ def test_ac55_regex_operates_on_already_capped_result(temp_telemetry: Path) -> N
     # Raising --top recovers the match.
     out2 = _run(temp_telemetry, "--regex", "needle", "logs", "--top", "3")
     assert len(_json.loads(_strip_header(out2))) == 1
+
+
+def test_ac56_errors_rows_carry_trace_id_for_pivot(temp_telemetry: Path) -> None:
+    # FR-4/FR-6: every errors row carries trace_id, so the triage→localization
+    # pivot to `trace <id>` needs no intermediate sql lookup.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "traces.jsonl",
+        [make_span(base, trace_id="t-err", span_id="s-err", status_code=2, status_msg="boom")],
+    )
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [make_log(base, severity="ERROR", sevnum=17, trace_id=trace_hex("t-err"))],
+    )
+    rows = _json.loads(_strip_header(_run(temp_telemetry, "errors")))
+    assert len(rows) == 2
+    assert all("trace_id" in r for r in rows)
+    span_row = next(r for r in rows if r["kind"] == "span")
+    assert span_row["trace_id"] == trace_hex("t-err")
+    # The carried id pivots straight into the trace tree (FR-6).
+    tree = _json.loads(_strip_header(_run(temp_telemetry, "trace", span_row["trace_id"])))
+    assert [s["span_name"].strip() for s in tree] == ["GET /x"]
