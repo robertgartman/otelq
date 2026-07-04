@@ -1793,7 +1793,13 @@ def test_readme_help_dump_matches_live_help() -> None:
             _os.environ.pop("COLUMNS", None)
         else:
             _os.environ["COLUMNS"] = original_columns
-    assert dumped.strip("\n") == live.strip("\n")
+    # Compare word sequences, not exact line breaks: argparse's usage-line
+    # wrapping of the subparsers "..." token has changed across Python
+    # versions (observed: ubuntu-latest and macos-latest CI runners resolve
+    # different Python patch versions via uv and wrap it differently even at
+    # the same pinned COLUMNS), which is incidental formatting, not content
+    # drift. Word-order still catches a real flag/help-text change.
+    assert dumped.split() == live.split()
 
 
 def test_bare_otelq_prints_full_help() -> None:
