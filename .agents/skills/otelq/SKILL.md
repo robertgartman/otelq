@@ -67,6 +67,15 @@ columns):
 uvx otelq --dir .telemetry --help
 ```
 
+`--help`'s `sql` column list is a curated subset. For the full live schema —
+including `*_attributes` columns carrying whatever custom OTel tags an app
+actually emits — use standard DuckDB introspection:
+
+```
+uvx otelq --dir .telemetry sql "DESCRIBE traces"
+uvx otelq --dir .telemetry sql "PRAGMA table_info('logs')"
+```
+
 ## Not seeing data?
 
 ```

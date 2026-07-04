@@ -2373,3 +2373,30 @@ def test_ac47_compact_header_names_its_shape(temp_telemetry: Path) -> None:
         line = _run_fmt(temp_telemetry, fmt, "logs").splitlines()[1]
         assert line == f"otelq logs response, format {fmt}"
         assert shape_hint not in line
+
+
+def test_ac48_sql_schema_discovery_documented_and_works(temp_telemetry: Path) -> None:
+    # FR-31/EC-28: --help documents that the sql views cheat-sheet is a
+    # curated subset and points at DESCRIBE/PRAGMA for the full live schema;
+    # a live DESCRIBE actually returns more columns than the cheat-sheet lists.
+    help_text = otelq.build_parser().format_help()
+    assert "DESCRIBE" in help_text and "PRAGMA" in help_text
+
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base)])
+    out = _run(temp_telemetry, "sql", "DESCRIBE traces")
+    described_columns = {r["column_name"] for r in _json.loads(out)}
+    documented_columns = {
+        "timestamp",
+        "duration",
+        "trace_id",
+        "span_id",
+        "parent_span_id",
+        "service_name",
+        "span_name",
+        "span_kind",
+        "status_code",
+        "status_message",
+    }
+    assert documented_columns <= described_columns  # cheat-sheet is a subset
+    assert "span_attributes" in described_columns  # the undocumented escape hatch

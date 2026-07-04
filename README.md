@@ -248,6 +248,12 @@ row limits:
   one-line notice to stderr when the result was truncated.
 
 sql views (for `otelq sql "<query>"`):
+  data model: below is a curated subset. Explore the full live
+  schema with standard DuckDB introspection, e.g.
+  sql "DESCRIBE traces" or sql "PRAGMA table_info('logs')" — it
+  reveals extra columns (span_attributes/log_attributes/
+  metric_attributes, resource_attributes, scope_attributes, ...)
+  carrying whatever custom OTel tags an app actually emits.
   traces   timestamp, duration (ms), trace_id, span_id, parent_span_id,
            service_name, span_name, span_kind,
            status_code (0=unset,1=ok,2=error), status_message

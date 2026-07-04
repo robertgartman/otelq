@@ -230,6 +230,18 @@ configuration that produces the raw files.
   argument, execute it against the exposed relations (FR-1), and return its
   columns and rows. A SQL execution error **must** be reported as a real error
   (FR-17), not swallowed.
+- **FR-31 — `sql` schema discoverability.** The FR-2 column list is a curated
+  subset — the built-in-command contract, not the full raw schema each
+  relation actually carries (e.g. `*_attributes` columns holding whatever
+  custom OTel resource/scope/span/log/metric attributes an app emits, and
+  `events_json`/`links_json`/`exemplars_json`). Since `sql` runs arbitrary
+  DuckDB SQL (FR-9), standard introspection (`DESCRIBE <relation>`, `PRAGMA
+  table_info('<relation>')`, `information_schema.columns`) already works and
+  reveals this full schema without any otelq-specific support. otelq's
+  `--help` and its accompanying agent skill **must** document this escape
+  hatch (e.g. `sql "DESCRIBE traces"`) rather than statically enumerate every
+  possible attribute — a live introspection query stays accurate as an app's
+  emitted attributes change; a static list would drift.
 
 ### Global flags and argument order
 
@@ -562,6 +574,10 @@ configuration that produces the raw files.
   format compact, a {"columns":[...],"rows":[[...]]} object — column names
   once, each row a positional array`; `otelq --format json logs` prints
   `otelq logs response, format json` with no such suffix. (FR-29)
+- **EC-28 — Live schema introspection reveals more than the cheat-sheet.**
+  `otelq sql "DESCRIBE traces"` returns more columns than `--help`'s `sql
+  views` cheat-sheet documents for `traces` — including a `span_attributes`
+  column — demonstrating the FR-31 escape hatch actually works. (FR-31)
 
 ## Acceptance Criteria
 
@@ -846,6 +862,16 @@ configuration that produces the raw files.
   no such suffix.
   *Verification hint: `test_ac47_compact_header_names_its_shape`; assert the
   suffix's presence for `compact` and absence for `json`/`jsonl`/`csv`/`table`.*
+- **AC-48** (Verifies FR-31, EC-28): Given `otelq --help`, when its text is
+  rendered, then the `sql views` section documents that its column list is a
+  curated subset and names `DESCRIBE`/`PRAGMA table_info` as the way to
+  explore the full live schema; given `sql "DESCRIBE traces"`, when it runs,
+  then it returns more columns than the cheat-sheet lists for `traces`,
+  including `span_attributes`.
+  *Verification hint: `test_ac48_sql_schema_discovery_documented_and_works`;
+  assert the help text mentions `DESCRIBE`/`PRAGMA`, and that a live
+  `DESCRIBE traces` result's column set is a strict superset of the
+  documented one and contains `span_attributes`.*
 
 ### Examples
 
