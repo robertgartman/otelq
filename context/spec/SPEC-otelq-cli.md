@@ -12,7 +12,7 @@ must_not_contain:
   - architectural_rationale
   - external_data_schemas
 created: 2026-06-23
-last_updated: 2026-07-03
+last_updated: 2026-07-04
 related_documents:
   - PRD-otelq
   - SPEC-otelq-incremental-cache
@@ -425,7 +425,12 @@ configuration that produces the raw files.
   ```
   - `<command>` **must** be the literal invoked subcommand name.
   - `<format>` **must** be the resolved `--format` value (`table`, `json`,
-    `jsonl`, `csv`, or `compact`).
+    `jsonl`, `csv`, or `compact`). `json`, `jsonl`, `csv`, and `table` are
+    self-describing shapes an LLM consumer already recognizes; `compact` is
+    otelq-specific, so when `<format>` is `compact` the format line **must**
+    append a literal shape hint: `, a {"columns":[...],"rows":[[...]]} object —
+    column names once, each row a positional array`. No other format gets a
+    hint appended.
   - `<signal>` **must** use the plural signal names already defined in
     Definitions (`traces`, `logs`, `metrics`): `traces` for `slow` and `trace`;
     `logs` for `logs`; `metrics` for `metric`. For `summary` and `errors`, whose
@@ -439,8 +444,9 @@ configuration that produces the raw files.
     `n/a` when the result has zero rows.
   - The header **must** precede the FR-10 rendering of the result and **must
     not** itself be rendered as `json`/`jsonl`/`csv`/`compact` — it is always
-    this fixed plain-text block, byte-identical in structure regardless of
-    `--format` (only the `<format>` value inside it varies). A consumer that
+    this fixed plain-text block, identical in structure (line count and
+    labels) regardless of `--format` (only the `<format>` value, and the
+    `compact`-only shape hint, vary within the format line). A consumer that
     needs the bare payload skips past the line of ten `-` characters.
   - The header **must not** change which rows are returned, their order, or the
     FR-10 rendering rules applied to the payload that follows it (INV-6).
@@ -551,6 +557,11 @@ configuration that produces the raw files.
   `--format` given) prints the same `{"columns":[...],"rows":[[...]]}` rendering
   as `otelq --format compact summary`; `otelq --format table summary` remains
   available as the explicit human-reading opt-in. (FR-10)
+- **EC-27 — Header format line names `compact`'s shape.** `otelq --format
+  compact logs` prints a header format line reading `otelq logs response,
+  format compact, a {"columns":[...],"rows":[[...]]} object — column names
+  once, each row a positional array`; `otelq --format json logs` prints
+  `otelq logs response, format json` with no such suffix. (FR-29)
 
 ## Acceptance Criteria
 
@@ -828,6 +839,13 @@ configuration that produces the raw files.
   `--format compact`; `--format table` still renders the human table.
   *Verification hint: `test_ac46_compact_is_the_default_format`; compare stdout
   with and without an explicit `--format compact`.*
+- **AC-47** (Verifies FR-29, EC-27): Given `--format compact`, when a header is
+  printed, then its format line reads `otelq <command> response, format
+  compact, a {"columns":[...],"rows":[[...]]} object — column names once, each
+  row a positional array`; given any other `--format`, the format line carries
+  no such suffix.
+  *Verification hint: `test_ac47_compact_header_names_its_shape`; assert the
+  suffix's presence for `compact` and absence for `json`/`jsonl`/`csv`/`table`.*
 
 ### Examples
 

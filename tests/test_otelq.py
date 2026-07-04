@@ -2172,7 +2172,7 @@ def test_ac38_response_header_shape_and_placement(temp_telemetry: Path) -> None:
         out = _run_fmt(temp_telemetry, fmt, "logs")
         lines = out.splitlines()
         assert lines[0] == "=" * 10
-        assert lines[1] == f"otelq logs response, format {fmt}"
+        assert lines[1].startswith(f"otelq logs response, format {fmt}")
         assert lines[2] == "OpenTelemetry signal: logs"
         assert lines[3].startswith("Time range: ") and " - " in lines[3]
         assert lines[4] == "IMPORTANT: all timestamps are UTC"
@@ -2353,3 +2353,23 @@ def test_ac46_compact_is_the_default_format(temp_telemetry: Path) -> None:
 
     table_out = _run_fmt(temp_telemetry, "table", "logs")
     assert table_out != default_out  # table remains an explicit opt-in
+
+
+def test_ac47_compact_header_names_its_shape(temp_telemetry: Path) -> None:
+    # FR-29/EC-27: json/jsonl/csv/table are self-describing shapes an LLM
+    # already recognizes; compact is otelq-specific, so its header format line
+    # spells out the shape inline. No other format gets the suffix.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
+
+    shape_hint = (
+        'a {"columns":[...],"rows":[[...]]} object — column names once, '
+        "each row a positional array"
+    )
+    compact_line = _run_fmt(temp_telemetry, "compact", "logs").splitlines()[1]
+    assert compact_line == f"otelq logs response, format compact, {shape_hint}"
+
+    for fmt in ("table", "json", "jsonl", "csv"):
+        line = _run_fmt(temp_telemetry, fmt, "logs").splitlines()[1]
+        assert line == f"otelq logs response, format {fmt}"
+        assert shape_hint not in line

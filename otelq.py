@@ -1600,6 +1600,20 @@ def _result_signal(command: str, rows: list[Row]) -> str:
     return ", ".join(ordered) if ordered else "n/a"
 
 
+# json/jsonl/csv/table are self-describing shapes an LLM already recognizes;
+# `compact` is otelq-specific, so its header line spells out the shape inline
+# rather than relying on the reader already knowing the convention. No single
+# de facto standard name matches exactly (pandas' `orient="split"` is the
+# closest analog but also carries an `index` array and calls it `data`), so
+# this stays a literal description rather than a borrowed, imprecise label.
+_FORMAT_SHAPE_HINT = {
+    "compact": (
+        ', a {"columns":[...],"rows":[[...]]} object — column names once, '
+        "each row a positional array"
+    ),
+}
+
+
 def _format_response_header(
     command: str, fmt: str, rows: list[Row], time_range: TimeRange
 ) -> str:
@@ -1609,10 +1623,11 @@ def _format_response_header(
     lo, hi = time_range
     from_str = _iso_utc(lo) if lo is not None else "n/a"
     to_str = _iso_utc(hi) if hi is not None else "n/a"
+    shape_hint = _FORMAT_SHAPE_HINT.get(fmt, "")
     return "\n".join(
         [
             "==========",
-            f"otelq {command} response, format {fmt}",
+            f"otelq {command} response, format {fmt}{shape_hint}",
             f"OpenTelemetry signal: {_result_signal(command, rows)}",
             f"Time range: {from_str} - {to_str}",
             "IMPORTANT: all timestamps are UTC",
