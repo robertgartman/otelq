@@ -12,13 +12,14 @@ must_not_contain:
   - architectural_rationale
   - external_data_schemas
 created: 2026-06-23
-last_updated: 2026-07-02
+last_updated: 2026-07-04
 related_documents:
   - PRD-otelq
   - SPEC-otelq-incremental-cache
   - CONTRACT-telemetry-directory
   - ADR-006-read-otlp-extension-quirks
-ai_summary: "otelq CLI base behavior: the query relations/columns it exposes, its seven subcommands, global flags and argument order, and its friendly read-only failure handling."
+  - ADR-009-query-history-triage-store
+ai_summary: "otelq CLI base behavior: the query relations/columns it exposes, its subcommands (incl. history/triage over the query-history store), global flags and argument order, and its friendly read-only failure handling."
 semantic_tags:
   - otelq
   - cli
@@ -60,8 +61,11 @@ seven subcommands (`summary`, `errors`, `slow`, `trace`, `logs`, `metric`,
 the per-command output row bound (`--top`); the five output formats and their
 format-independence; the `sql` filesystem-access boundary and the external-access
 lockdown for built-in commands; timestamp correction (and far-future clamping) in
-the presented output; and otelq's exit-code and stderr behavior when telemetry is
-absent, partial, or malformed.
+the presented output; the response header printed before the six signal-bearing
+commands' results, naming the command, format, signal, and UTC time range; the
+UTC convention for `timestamp` literals a caller writes into `sql`; and
+otelq's exit-code and stderr behavior when telemetry is absent, partial, or
+malformed.
 
 **Not covered:** the raw telemetry directory and OTLP JSONL schema (an external
 input — see [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md));
@@ -80,9 +84,10 @@ configuration that produces the raw files.
 - **Subcommand / command** — one of the seven verbs otelq accepts
   (`summary`, `errors`, `slow`, `trace`, `logs`, `metric`, `sql`).
 - **Global flag** — a flag accepted before the subcommand (`--format`, `--dir`,
-  `--all`, `--no-cache`, `--since`, `--verbose`, `--version`); contrast
-  subcommand-specific flags (`--top`, `--service`, `--level`, `--grep`, the
-  `trace_id`/`name`/`query` positionals), which follow the subcommand.
+  `--all`, `--no-cache`, `--since`, `--regex`, `--verbose`, `--version`);
+  contrast subcommand-specific flags (`--top`, `--service`, `--level`,
+  `--grep`, the `trace_id`/`name`/`query` positionals), which follow the
+  subcommand.
 - **Default telemetry dir** — the `.telemetry/` directory under the current
   working directory (`<cwd>/.telemetry`, per
   [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md)),
@@ -94,6 +99,18 @@ configuration that produces the raw files.
   `timestamp` column (see FR-16).
 - **Result** — the `(columns, rows)` pair a command produces, rendered by the
   selected output format.
+- **Response header** — a fixed-format plain-text preamble that otelq prints to
+  stdout before the rendered result of the six signal-bearing commands (see
+  FR-29), naming the invoked command, the resolved format, the OpenTelemetry
+  signal(s) involved, the returned rows' time range, and the session id, so an
+  LLM consumer cannot mistake a rendered `timestamp` for local time.
+- **Session id** — an id (see FR-33) that tags the consecutive invocations of
+  one investigation so they can be correlated: a caller-supplied `--session-id`,
+  or, when omitted, a freshly generated UUIDv7. Echoed verbatim in the response
+  header's `Session:` line and in the stderr session footer.
+- **Session footer** — a one-line stderr guidance notice (see FR-33) printed
+  after every command's answer, naming the resolved session id and reminding the
+  caller to reuse it via `--session-id` on related follow-up invocations.
 
 ## Functional Requirements
 
@@ -192,12 +209,37 @@ configuration that produces the raw files.
   behavior applies (FR-18). The zero-count rule thus governs *sub-rows within a
   signal that has data* (e.g. an `ERROR` level with no records), not signals
   without data.
+
+  **Service list (second block).** `summary`'s output **must** consist of two
+  blocks. The first is the per-signal breakdown above, rendered as the single
+  FR-10 object/array (unchanged — the per-signal `services` column keeps its
+  per-row distinct-service count). After it, `summary` **must** print, in
+  **every** `--format`, a second block: a plain-text delimiter line
+  `** List of services in telemetry data **` followed by a `service`/`count`
+  table rendered in the same `--format`, one row per distinct `service_name`
+  with `count` being that service's total record count across **all** signals
+  (`traces` ∪ `logs` ∪ `metrics`), ordered by `count` descending (then
+  `service_name` ascending for determinism), so a caller sees which services
+  dominate the window and are worth zooming in on. The delimiter line makes the
+  two blocks unambiguous: a machine consumer parses the first object/array
+  (before the delimiter) and, if it wants the service list, the second
+  (after it) — this is the one command whose stdout carries two format-rendered
+  blocks, so each block individually honors the FR-10 shape rather than the
+  whole stdout being one object. The second block is derived from the same
+  windowed relations and is **independent** of any `--regex` filter applied to
+  the first block's rows (FR-32); a record with no `service_name` contributes
+  its raw (null) value as its own group.
 - **FR-4 — `errors`.** `errors` **must** return error-status spans
   (`traces` rows with `status_code == 2`) and error/fatal logs (`logs` rows with
   `severity_text` in `{ERROR, FATAL}`, matched **case-insensitively** since
   `severity_text` carries inconsistent casing in practice — see FR-2), combined
   into one result and ordered newest-first by `timestamp`. Each row **must**
-  identify whether it is a span or a log.
+  identify whether it is a span or a log, and **must** carry its record's
+  `trace_id`, so a caller pivots straight to `trace <trace_id>` (FR-6) without
+  a second lookup — `errors` is the triage entry point of an investigation and
+  the trace tree is its localization step, so the pivot key travels with the
+  row (as it already does for `slow` and `logs`). A log record with no trace
+  context carries its raw (empty) `trace_id` value.
 - **FR-5 — `slow`.** `slow` **must** return spans ordered by `duration`
   descending, limited to the top `N` where `N` is the value of `--top`
   (default **20**). The presented duration **must** be expressed in milliseconds.
@@ -222,12 +264,26 @@ configuration that produces the raw files.
   argument, execute it against the exposed relations (FR-1), and return its
   columns and rows. A SQL execution error **must** be reported as a real error
   (FR-17), not swallowed.
+- **FR-31 — `sql` schema discoverability.** The FR-2 column list is a curated
+  subset — the built-in-command contract, not the full raw schema each
+  relation actually carries (e.g. `*_attributes` columns holding whatever
+  custom OTel resource/scope/span/log/metric attributes an app emits, and
+  `events_json`/`links_json`/`exemplars_json`). Since `sql` runs arbitrary
+  DuckDB SQL (FR-9), standard introspection (`DESCRIBE <relation>`, `PRAGMA
+  table_info('<relation>')`, `information_schema.columns`) already works and
+  reveals this full schema without any otelq-specific support. otelq's
+  `--help` and its accompanying agent skill **must** document this escape
+  hatch (e.g. `sql "DESCRIBE traces"`) rather than statically enumerate every
+  possible attribute — a live introspection query stays accurate as an app's
+  emitted attributes change; a static list would drift.
 
 ### Global flags and argument order
 
 - **FR-10 — `--format`.** A `--format` global flag **must** accept exactly
-  `table`, `json`, `jsonl`, `csv`, or `compact`, defaulting to `table`, and
-  **must** select the rendering of the result. `table` is for human reading;
+  `table`, `json`, `jsonl`, `csv`, or `compact`, defaulting to `compact` (otelq's
+  primary consumer is an AI agent, per [PRD-otelq](../prd/PRD-otelq.md); a human
+  reading the terminal opts in with `--format table`), and **must** select the
+  rendering of the result. `table` is for human reading;
   `json` is a single compact JSON array for programmatic consumption (compact
   separators, no insignificant whitespace, to minimize tokens for the AI-agent
   consumer per [PRD-otelq](../prd/PRD-otelq.md)); `jsonl` emits one compact JSON
@@ -238,12 +294,15 @@ configuration that produces the raw files.
   but without repeating the column keys on every row, further reducing tokens for
   the AI-agent consumer. A `compact` result **must** be reconstructible to the
   exact records `json` would emit by zipping each `rows` entry with `columns`.
+  For `summary`, `errors`, `slow`, `trace`, `logs`, and `metric`, this rendering
+  is the **payload** that follows the response header of FR-29 on stdout; FR-10
+  governs that payload, not the header itself.
 - **FR-11 — Global flags precede the subcommand.** `--format`, `--dir`,
-  `--all`, `--no-cache`, and `--since` are global flags and **must** be accepted
-  *before* the subcommand. Supplying a global flag *after* the subcommand
-  **must** be rejected as an unrecognized argument (a hard parse error), not
-  silently accepted. Subcommand-specific flags and positionals continue to follow
-  the subcommand.
+  `--all`, `--no-cache`, `--since`, `--regex`, and `--session-id` are global
+  flags and **must** be accepted *before* the subcommand. Supplying a global flag *after* the
+  subcommand **must** be rejected as an unrecognized argument (a hard parse
+  error), not silently accepted. Subcommand-specific flags and positionals
+  continue to follow the subcommand.
 - **FR-12 — `--dir`.** A `--dir <path>` global flag **must** select the
   telemetry directory to read; when omitted, otelq **must** read the default
   telemetry dir (see Definitions).
@@ -274,7 +333,36 @@ configuration that produces the raw files.
   rather than pushing the window past all real data. The clamp is defined once, as
   the window/watermark anchor, in
   [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md) (INV-7, EC-12);
-  `doctor` surfaces the condition as a non-fatal warning (FR-26).
+  `doctor` surfaces the condition as a non-fatal warning (FR-26). Every rendered
+  timestamp value — every relation's `timestamp` column, `summary`'s `earliest`/
+  `latest` columns, and the FR-29 response header's `Time range` — **must** be an
+  explicit-UTC ISO-8601/RFC-3339 string carrying a trailing `Z`, at fixed
+  millisecond precision (`YYYY-MM-DDTHH:MM:SS.fffZ`, exactly 3 fractional
+  digits, matching `duration`'s own millisecond granularity, FR-2), in every
+  `--format`, so the value itself asserts UTC. A naive `str(datetime)`
+  rendering (a space separator and no offset/designator) **must not** be used:
+  it is visually indistinguishable from any other timezone, which would leave
+  FR-29's "all timestamps are UTC" notice unverifiable from the data itself.
+- **FR-30 — `sql` timestamp-literal input convention.** `timestamp` columns
+  (FR-2) are naive (timezone-free) and always represent corrected UTC
+  wall-clock (FR-16); this is the counterpart requirement for the one place a
+  caller writes a timestamp back **into** otelq, `sql`'s free-form `WHERE`
+  clauses (FR-9). A caller **must** write a `timestamp` literal either bare
+  (`'YYYY-MM-DD HH:MM:SS[.ffffff]'`) or as an ISO-8601 string with a trailing
+  `Z` (e.g. `'2026-07-01T10:00:00Z'`) — both **must** be treated as UTC and
+  compare correctly against the column. A literal carrying an explicit non-`Z`
+  offset (e.g. `'2026-07-01T12:00:00+02:00'`) **must not** be used: the
+  underlying DuckDB TIMESTAMP cast silently **discards** the offset rather than
+  converting it, so the literal is compared as if its wall-clock digits were
+  already UTC — a wrong comparison with no error, not a rejection. otelq
+  **cannot** correct this by rewriting the caller's SQL text (`sql` is
+  arbitrary, unparsed free-form SQL, FR-9/FR-27) — the convention is enforced
+  only by documentation. otelq's `--help` **must** state it in an early,
+  prominent block (ahead of the "argument order" section), not only inside the
+  `sql views` cheat-sheet, since an agent may act on a truncated read of long
+  help text. The convention is pinned by a test against otelq's actual
+  relations, so a future DuckDB upgrade that changes
+  this literal-parsing behavior is caught rather than silently masked.
 - **FR-17 — Exit codes.** otelq **must** exit `0` on success, including when a
   command produces zero result rows, prints a friendly "no telemetry" message
   (FR-18, FR-19), or prints help (a bare `otelq` or `otelq help`, FR-22). A
@@ -329,6 +417,48 @@ configuration that produces the raw files.
   **stderr** (never stdout, so `json`/`jsonl`/`csv` stay machine-parseable). The
   cap is applied after the command's own ordering, so the retained rows are the
   first `N` of the fully-ordered result.
+- **FR-32 — `--regex` result filtering.** A `--regex <pattern>` global flag
+  **must** filter the result of `summary`, `errors`, `slow`, `trace`, `logs`,
+  and `metric` (the FR-29 header-bearing commands; **not** `sql` — already
+  supports regex natively via DuckDB's `~`/`regexp_matches` — nor
+  `collector-config`/`doctor`/`troubleshoot`, which are not telemetry query
+  results) to only the rows where `pattern` matches at least one of the row's
+  own cell values, applied **before** the FR-10 rendering so formatting
+  artifacts (JSON escaping, CSV quoting, table padding) **must not** affect
+  match precision. `pattern` **must** be a standard Python `re` pattern,
+  matched case-sensitively via `re.search` against each cell's string form
+  (`None` cells excluded) — a caller wanting case-insensitive matching uses the
+  inline `(?i)` flag. A malformed pattern **must** be rejected as a real error
+  (FR-17) naming the underlying `re` error, not a raw traceback. Supplying
+  `--regex` with a command outside its supported set **must** be rejected as a
+  real error naming the unsupported command, not silently ignored. The filter
+  **must** apply to the same fully-ordered, already `--top`-capped result the
+  command would otherwise return (FR-23) — i.e. the same rows a caller piping
+  otelq's rendered output through `grep` would see today — not a wider,
+  unbounded scan; a caller needing to search beyond the cap raises `--top`
+  themselves. When `--regex` is supplied, the FR-29 response header **must**
+  additionally report the verbatim pattern and how many rows it removed, so a
+  caller is never blind to what was filtered away (unlike post-hoc `grep` on
+  rendered output).
+- **FR-33 — Session id.** A `--session-id <string>` global flag **must** tag an
+  invocation with a caller-chosen id that groups the consecutive invocations of
+  one investigation. When supplied, the id **must** be reported **verbatim** in
+  the FR-29 response header's `Session:` line (for the six header-bearing
+  commands). When **not** supplied, otelq **must** generate a fresh id per
+  invocation using **UUIDv7** (RFC 9562 — a time-ordered, collision-resistant
+  id), with **no** third-party dependency added (otelq's runtime dependency set
+  stays `duckdb` alone). The resolved id (supplied or generated) **must** be
+  identical everywhere it appears within a single invocation — the header
+  `Session:` line and the session footer below. Additionally, on **every**
+  command invocation (including the header-less `sql`/`doctor`/`history`/
+  `collector-config`/`troubleshoot`), otelq **must** print a **session footer**
+  to **stderr** — preceded by a blank line — that names the resolved id and
+  instructs the caller to pass `--session-id <id>` on consecutive related
+  invocations to keep the analysis correlated. The footer **must** be on stderr,
+  never stdout, so it never corrupts the machine-parseable payload (mirroring
+  otelq's other stderr guidance notices, and preserving `sql`'s pure-data
+  stdout contract per INV-6). The footer does not alter the result rows, their
+  order, or their rendering (INV-3).
 - **FR-24 — `--version`.** A `--version` global flag **must** print otelq's own
   version and exit `0`. The reported version **must** match the packaged
   distribution version (so an agent can name the exact build it drives, relevant
@@ -369,6 +499,126 @@ configuration that produces the raw files.
   e.g. `Robert's Mac`). Such a path **must not** cause a SQL syntax error or
   permit injection; every filesystem path spliced into SQL **must** be escaped or
   bound. This holds identically on the cache and `--no-cache` paths.
+- **FR-29 — Response header.** For `summary`, `errors`, `slow`, `trace`, `logs`,
+  and `metric` — **not** `sql`, `collector-config`, `troubleshoot`, or `doctor` —
+  otelq **must** print a fixed-format response header to **stdout**, immediately
+  before the command's rendered result, for **every** `--format` value:
+  ```
+  ==========
+  otelq <command> response, format <format>
+  OpenTelemetry signal: <signal>
+  Time range: <from> - <to>
+  IMPORTANT: all timestamps are UTC
+  Session: <session-id>
+  ----------
+  ```
+  - `<command>` **must** be the literal invoked subcommand name.
+  - `<format>` **must** be the resolved `--format` value (`table`, `json`,
+    `jsonl`, `csv`, or `compact`). `json`, `jsonl`, `csv`, and `table` are
+    self-describing shapes an LLM consumer already recognizes; `compact` is
+    otelq-specific, so when `<format>` is `compact` the format line **must**
+    append a literal shape hint: `, a {"columns":[...],"rows":[[...]]} object —
+    column names once, each row a positional array`. No other format gets a
+    hint appended.
+  - `<signal>` **must** use the plural signal names already defined in
+    Definitions (`traces`, `logs`, `metrics`): `traces` for `slow` and `trace`;
+    `logs` for `logs`; `metrics` for `metric`. For `summary` and `errors`, whose
+    rows can span more than one OpenTelemetry signal (FR-3, FR-4), `<signal>`
+    **must** be the set of signals actually represented among the returned rows,
+    comma-joined in the fixed order `traces, logs, metrics` (only the present
+    ones listed), or `n/a` when the result has zero rows.
+  - `<from>` and `<to>` **must** be the minimum and maximum `timestamp` value
+    among the command's returned rows, rendered with the same corrected-UTC
+    formatting used elsewhere in the output (FR-16); both **must** render as
+    `n/a` when the result has zero rows.
+  - The header **must** precede the FR-10 rendering of the result and **must
+    not** itself be rendered as `json`/`jsonl`/`csv`/`compact` — it is always
+    this fixed plain-text block, identical in structure (line count and
+    labels) regardless of `--format` (only the `<format>` value, and the
+    `compact`-only shape hint, vary within the format line). A consumer that
+    needs the bare payload skips past the line of ten `-` characters.
+  - The header **must** include a `Session: <session-id>` line (immediately
+    after the `IMPORTANT` line, before the closing `----------`) carrying the
+    verbatim session id resolved for the invocation (FR-33).
+  - The header **must not** change which rows are returned, their order, or the
+    FR-10 rendering rules applied to the payload that follows it (INV-6).
+  - When `--regex <pattern>` (FR-32) is supplied, the header **must** insert
+    two additional lines after `Time range` and before the `IMPORTANT` line:
+    `Regex filter applied: <pattern>` (the verbatim pattern) and `Rows removed
+    by regex: <count>` (how many rows the filter excluded). These lines
+    **must not** appear when `--regex` is not supplied — the header's line
+    count is otherwise fixed, but this pair is the one deliberate exception,
+    mirroring the `compact`-only format-line suffix.
+
+### Query history and triage
+
+> The on-disk query-history store (`.otelq-history/`) is governed by
+> [ADR-009](../adr/ADR-009-query-history-triage-store.md); these requirements
+> pin the CLI behaviour over it.
+
+- **FR-34 — `history` command.** A `history` subcommand **must** report the
+  stored past-query templates ranked most-promising-first, capped by `--top`
+  (default `10`). Output columns **must** be `rank`, `score`, `terminal_pct`,
+  `uses`, `last_used`, `command`, `query` (the template's latest concrete
+  invocation). `score` **must** equal `rf × (wf + 1) / (rf + 2)`, where
+  `rf = Σ 0.5^(age / half-life)` over the template's invocations and `wf` is
+  the same decayed sum restricted to invocations that **ended their session**
+  with a *usable* row count (`1..max-rows` — neither zero nor a flood).
+  `half-life` (default 7 days) and `max-rows` **must** be
+  environment-configurable with these defaults. `last_used` **must** render as
+  an explicit-UTC `Z`-suffixed string (FR-16). Over a store that does not yet
+  exist, `history` **must** print a friendly stderr notice and exit `0`
+  (FR-18's fail-friendly rule); over a torn/unreadable store it **must**
+  return an empty report, never a traceback. Neither `history` nor `triage`
+  is ever itself recorded into the store.
+- **FR-35 — `triage` command.** A `triage` subcommand **must** decide, from
+  the store alone, whether the caller is mid-investigation or starting fresh,
+  and act:
+  - **Anchor detection.** With `--session-id` supplied, the anchor is the
+    latest stored invocation carrying that id (any age — the caller asserted
+    continuity). Without it, triage **must** treat the call as fresh-start:
+    recency **must never** anchor a chain, because concurrent agent sessions
+    interleave in one store and the latest row can belong to a different
+    investigation entirely.
+  - **Candidates.** Mid-chain: the decay-weighted **first-order successors**
+    (adjacent within a session) of the anchor's template, each weighted by its
+    own FR-34 score. Fresh-start: session-**opening** templates weighted by
+    the decayed weight of the successful sessions they opened.
+  - **Auto-run.** The best candidate **must** be executed as a real otelq
+    invocation — banner line first, then the command's normal output — **only
+    when** its evidence (decayed observation weight) and share (fraction of
+    observations from that anchor) clear the configured thresholds (defaults
+    `2.0` / `0.5`) **and** the template is *concrete* (normalisation
+    introduced no `?` placeholder). The run **must** execute under the
+    anchor's session id, and **must** be recorded into history so the chain
+    advances; the `triage` wrapper itself **must not** be recorded.
+  - **Suggestion.** After an auto-run — or instead of one, when the winning
+    candidate is confident but not concrete — triage **must** print, as the
+    **last stdout line**, the full next invocation to copy
+    (`otelq --dir <dir> --session-id <id> <template's latest raw form>`),
+    gated by the softer suggest thresholds (defaults `1.0` / `0.4`).
+  - **Grounded fallback.** With no candidate clearing any threshold: when the
+    current session has **not** yet run `summary`, triage **must** auto-run
+    `summary` itself — the RCA guide's grounding step — with a banner naming
+    why, recorded and suggestion-checked like any auto-run (a fresh session
+    trivially qualifies). Only when the session **already** contains a
+    `summary` may triage refuse: it **must** say it has no strong candidate
+    (stderr) and print the FR-34 ranked list (`--top` default `20`) instead of
+    guessing. With no store at all it **must** print a friendly stderr notice
+    directing the caller to the RCA guide and exit `0`.
+  - All four thresholds **must** be environment-configurable.
+- **FR-36 — Sessions are explicit session ids, and nothing else.** Only an
+  **explicitly supplied** `--session-id` may be stored on a history row; a
+  generated (FR-33 default) id **must** be stored as NULL — it is an offer in
+  the footer, not an asserted correlation. When sessionising (FR-34/FR-35), a
+  session **is** the set of rows sharing one non-null session id, ordered by
+  event time (an investigation resumed hours later stays one session; two ids
+  interleaved seconds apart stay two sessions). Timestamps **must never** be
+  used to infer session membership — concurrent agent sessions writing to one
+  store interleave in time, and a gap heuristic would chain unrelated
+  investigations. A row with **no** session id belongs to **no** session: it
+  **must** still count toward frequency/recency ranking evidence, and **must
+  not** contribute terminal, transition, or session-opening evidence.
 
 ## Edge Cases & Failure Modes
 
@@ -452,6 +702,68 @@ configuration that produces the raw files.
   array per row — carrying the same logical rows in the same order as `table` and
   `json`. Zipping each `rows` entry with `columns` reconstructs exactly the
   objects `--format json` would emit. (FR-10, INV-2, INV-3)
+- **EC-23 — Response header present/absent.** `otelq --format json summary` (and
+  likewise `errors`/`slow`/`trace`/`logs`/`metric`) prints the fixed FR-29 header
+  to stdout before the JSON payload; `otelq sql "..."`, `doctor`,
+  `collector-config`, and `troubleshoot` print no such header. A zero-row result
+  (e.g. `metric <unknown-name>`) still prints the header, with
+  `Time range: n/a - n/a`. A corpus with both traces and logs makes `summary`'s
+  and `errors`'s header signal field read `traces, logs`; a traces-only corpus
+  makes `errors`'s read `traces` alone. (FR-29)
+- **EC-24 — `sql` timestamp-literal offset is silently discarded.** Given a
+  `timestamp` value known to be `2026-07-01 10:00:00` UTC, `sql "SELECT * FROM
+  logs WHERE timestamp = '2026-07-01 10:00:00'"` and `sql "SELECT * FROM logs
+  WHERE timestamp = '2026-07-01T10:00:00Z'"` both match the row; `sql "SELECT *
+  FROM logs WHERE timestamp = '2026-07-01T12:00:00+02:00'"` — the same instant,
+  correctly converted — does **not** match, because the offset is discarded
+  rather than applied. (FR-30)
+- **EC-25 — Explicit-UTC timestamp rendering.** A presented `timestamp` (or
+  `summary`'s `earliest`/`latest`, or the FR-29 header's `Time range`) matches
+  `YYYY-MM-DDTHH:MM:SS\.\d{3}Z` (exactly 3 fractional digits) in every
+  `--format` — never a bare `YYYY-MM-DD HH:MM:SS` with no trailing `Z`/offset,
+  and never 6-digit microseconds. (FR-16)
+- **EC-26 — `compact` is the default with no `--format`.** `otelq summary` (no
+  `--format` given) prints the same `{"columns":[...],"rows":[[...]]}` rendering
+  as `otelq --format compact summary`; `otelq --format table summary` remains
+  available as the explicit human-reading opt-in. (FR-10)
+- **EC-27 — Header format line names `compact`'s shape.** `otelq --format
+  compact logs` prints a header format line reading `otelq logs response,
+  format compact, a {"columns":[...],"rows":[[...]]} object — column names
+  once, each row a positional array`; `otelq --format json logs` prints
+  `otelq logs response, format json` with no such suffix. (FR-29)
+- **EC-28 — Live schema introspection reveals more than the cheat-sheet.**
+  `otelq sql "DESCRIBE traces"` returns more columns than `--help`'s `sql
+  views` cheat-sheet documents for `traces` — including a `span_attributes`
+  column — demonstrating the FR-31 escape hatch actually works. (FR-31)
+- **EC-29 — `--regex` filters and reports.** `otelq --regex ERROR logs` returns
+  only rows where `ERROR` matches some cell, and the header gains `Regex
+  filter applied: ERROR` and `Rows removed by regex: <N>` lines; `otelq logs`
+  (no `--regex`) shows neither line. (FR-32)
+- **EC-30 — Malformed `--regex` pattern.** `otelq --regex "(" logs` exits
+  non-zero with a message naming the underlying `re` error, not a raw
+  traceback. (FR-32, FR-17)
+- **EC-31 — `--regex` rejected outside its supported commands.** `otelq
+  --regex ERROR sql "SELECT 1"` (and likewise `doctor`/`collector-config`/
+  `troubleshoot`) exits non-zero naming the command as unsupported for
+  `--regex`, rather than silently ignoring the flag. (FR-32, FR-17)
+- **EC-32 — `summary` emits a labeled service second block.** `otelq --format
+  compact summary` prints the per-signal object, then a
+  `** List of services in telemetry data **` delimiter line, then a second
+  compact object `{"columns":["service","count"],"rows":[...]}` ordered by
+  count descending; the same two-block structure appears in every `--format`
+  (the second block rendered in that format), and the first block is
+  byte-identical to what `summary` emitted before the second block existed.
+  (FR-3, FR-10)
+- **EC-33 — Stored template no longer runs.** A `triage` auto-run candidate
+  whose stored invocation no longer parses (flag renamed since it was
+  recorded) or fails at runtime (stale SQL against a changed schema) is
+  **suggested or reported** instead of crashing triage: the parse failure
+  downgrades the candidate to the printed suggestion, the runtime failure is
+  named on stderr, and triage exits `0` either way. (FR-35, FR-17)
+- **EC-34 — Torn or foreign history store.** An unreadable/corrupt
+  `.otelq-history/` parquet yields an **empty** `history` report and routes
+  `triage` to its honest-refusal path — never a traceback, and never any
+  effect on the telemetry query commands themselves. (FR-34, FR-35, FR-17)
 
 ## Acceptance Criteria
 
@@ -512,7 +824,7 @@ configuration that produces the raw files.
 - **AC-10** (Verifies FR-10, INV-2): Given any result, when `--format json` is
   selected, then the output is a JSON array of objects keyed by the result
   columns; `--format csv` emits a header row plus CSV rows; `--format table` is
-  the default human layout.
+  the human-facing layout, opted into explicitly (not the default).
   *Verification hint: `test_format_output_json`, `test_format_output_csv`,
   `test_format_output_table_empty`.*
 - **AC-11** (Verifies FR-11, EC-5): Given a subcommand, when a global flag such as
@@ -667,6 +979,208 @@ configuration that produces the raw files.
   order.
   *Verification hint: `test_p5_format_compact_columns_rows`,
   `test_p5_format_compact_via_cli`.*
+- **AC-38** (Verifies FR-29): Given any of `summary`/`errors`/`slow`/`trace`/
+  `logs`/`metric`, when the command runs with any `--format`, then stdout begins
+  with the fixed header (a `==========` line; `otelq <command> response, format
+  <format>`; `OpenTelemetry signal: <signal>`; `Time range: <from> - <to>`; the
+  UTC notice; a `----------` line) naming the invoked command and resolved
+  format, followed by the FR-10 rendering of the result; the header's `<from>`/
+  `<to>` equal the min/max `timestamp` among the returned rows.
+  *Verification hint: run each of the six commands with `--format table` and
+  `--format json`; assert the header's exact five content lines and that the
+  payload following it is unchanged from the pre-header rendering.*
+- **AC-39** (Verifies FR-29, INV-6): Given `sql`, `doctor`, `collector-config`, or
+  `troubleshoot`, when the command runs, then stdout contains no response header.
+  *Verification hint: run each via `main`; assert stdout does not start with
+  `==========`.*
+- **AC-40** (Verifies FR-29): Given a command whose result has zero rows (e.g.
+  `metric` with an unknown name), when it runs, then the header is still printed
+  with `Time range: n/a - n/a` rather than failing or omitting the header.
+  *Verification hint: `metric <unknown-name>`; assert the header's time-range
+  line reads `n/a - n/a`.*
+- **AC-41** (Verifies FR-29): Given a corpus with both traces and logs, when
+  `summary` or `errors` runs, then the header's signal field reads
+  `traces, logs` (both present, comma-joined in the fixed order
+  `traces, logs, metrics`); given a traces-only corpus, `errors`'s header signal
+  field reads `traces` alone.
+  *Verification hint: vary the fixture's captured signals; assert the header's
+  `OpenTelemetry signal:` line for `summary` and `errors`.*
+- **AC-42** (Verifies FR-29): Given a corpus with no error-status spans and no
+  error/fatal logs, when `errors` runs, then its result has zero rows and the
+  header's signal field — not just the time range — reads `n/a`, since
+  `errors`'s signal (unlike `slow`/`trace`/`logs`/`metric`'s fixed mapping) is
+  derived from the returned rows.
+  *Verification hint: a fixture with only healthy (non-error) traces/logs; run
+  `errors`; assert `OpenTelemetry signal: n/a` and `Time range: n/a - n/a`.*
+- **AC-43** (Verifies FR-30, EC-24): Given a record with a known UTC
+  `timestamp`, when `sql` filters on that value as a bare literal or as a
+  `Z`-suffixed ISO-8601 literal, then both match the record; when it filters on
+  the same instant written with an explicit non-`Z` offset, then it does
+  **not** match, pinning that the offset is silently discarded rather than
+  converted.
+  *Verification hint: `test_ac43_sql_timestamp_literal_utc_convention` against
+  otelq's own `traces`/`logs`/`metrics` relations (not an isolated DuckDB
+  sanity check), so a DuckDB upgrade that changes this parsing behavior is
+  caught.*
+- **AC-44** (Verifies FR-30): Given `otelq --help`, when its text is rendered,
+  then a "timestamps" block stating the UTC convention appears before the
+  "argument order" section, not only inside the `sql views` cheat-sheet.
+  *Verification hint:
+  `test_help_epilog_documents_argument_order_and_sql_schema`; assert the
+  "timestamps:" block's index precedes "argument order:"'s.*
+- **AC-45** (Verifies FR-16, EC-25): Given any command that returns rows with a
+  `timestamp` (or `summary`'s `earliest`/`latest`), when it is rendered in
+  **each** of `table`, `json`, `jsonl`, `csv`, and `compact`, then every such
+  value in every one of those five renderings matches
+  `YYYY-MM-DDTHH:MM:SS\.\d{3}Z` (exactly 3 fractional digits); the FR-29
+  response header's `Time range` values do too.
+  *Verification hint: `test_ac45_timestamps_render_explicit_utc`; regex-match
+  the rendered value in each format plus the header's `Time range` line.*
+- **AC-46** (Verifies FR-10, EC-26): Given a command with no `--format` flag,
+  when it runs, then its stdout equals the same command run with an explicit
+  `--format compact`; `--format table` still renders the human table.
+  *Verification hint: `test_ac46_compact_is_the_default_format`; compare stdout
+  with and without an explicit `--format compact`.*
+- **AC-47** (Verifies FR-29, EC-27): Given `--format compact`, when a header is
+  printed, then its format line reads `otelq <command> response, format
+  compact, a {"columns":[...],"rows":[[...]]} object — column names once, each
+  row a positional array`; given any other `--format`, the format line carries
+  no such suffix.
+  *Verification hint: `test_ac47_compact_header_names_its_shape`; assert the
+  suffix's presence for `compact` and absence for `json`/`jsonl`/`csv`/`table`.*
+- **AC-48** (Verifies FR-31, EC-28): Given `otelq --help`, when its text is
+  rendered, then the `sql views` section documents that its column list is a
+  curated subset and names `DESCRIBE`/`PRAGMA table_info` as the way to
+  explore the full live schema; given `sql "DESCRIBE traces"`, when it runs,
+  then it returns more columns than the cheat-sheet lists for `traces`,
+  including `span_attributes`.
+  *Verification hint: `test_ac48_sql_schema_discovery_documented_and_works`;
+  assert the help text mentions `DESCRIBE`/`PRAGMA`, and that a live
+  `DESCRIBE traces` result's column set is a strict superset of the
+  documented one and contains `span_attributes`.*
+- **AC-49** (Verifies FR-32, EC-29): Given a corpus where the pattern matches
+  some but not all rows of a command's result, when `--regex <pattern>` runs,
+  then only the matching rows are returned, the header gains `Regex filter
+  applied: <pattern>` and `Rows removed by regex: <N>` lines (`<N>` equal to
+  the non-matching row count), and the payload is otherwise rendered exactly
+  as FR-10 specifies; given no `--regex`, neither header line appears.
+  *Verification hint: `test_ac49_regex_filters_rows_and_reports_in_header`.*
+- **AC-50** (Verifies FR-32): Given a pattern that matches a value in one cell
+  of a row but not others, when `--regex` runs, then the row is kept (matching
+  *any* cell is sufficient) — not just a designated "message" column.
+  *Verification hint: `test_ac50_regex_matches_any_cell`.*
+- **AC-51** (Verifies FR-32, EC-30): Given a malformed pattern (e.g. `(`), when
+  `--regex` runs, then otelq exits non-zero with a message naming the
+  underlying `re` error, not a Python traceback.
+  *Verification hint: `test_ac51_malformed_regex_is_a_real_error`.*
+- **AC-52** (Verifies FR-32, EC-31): Given `--regex` with `sql`, `doctor`,
+  `collector-config`, or `troubleshoot`, when the command runs, then otelq
+  exits non-zero naming the command as unsupported for `--regex`.
+  *Verification hint: `test_ac52_regex_rejected_outside_supported_commands`.*
+- **AC-53** (Verifies FR-32): Given a `body` value containing a literal
+  double-quote (a character `--format json` would escape), when a pattern
+  matching only the unescaped form runs, then the row is still kept —
+  proving the match happens against the raw cell value before FR-10
+  rendering, not against the already-escaped/quoted rendered text.
+  *Verification hint: `test_ac53_regex_matches_pre_render_raw_value`.*
+- **AC-54** (Verifies FR-32): Given a row containing an uppercase value, when
+  a lowercase pattern runs with no `(?i)` flag, then the row is excluded
+  (case-sensitive by default); given the same pattern with a leading `(?i)`,
+  the row is kept. Given a row with a `None` cell (e.g. a root span's
+  `parent_span_id`), when a pattern matching the literal text `None` runs,
+  then that row is **not** kept solely because of the `None` cell — `None`
+  values are excluded from matching, not stringified into `"None"`.
+  *Verification hint: `test_ac54_regex_case_sensitive_and_skips_none_cells`.*
+- **AC-55** (Verifies FR-32, FR-23): Given a corpus where a matching row exists
+  only beyond the `--top` cap's ordinal position, when `--regex` and a small
+  `--top` both apply, then the result is empty (or omits that row) — the
+  filter operates on the already-capped result, not a wider scan; raising
+  `--top` recovers the match.
+  *Verification hint: `test_ac55_regex_operates_on_already_capped_result`.*
+- **AC-56** (Verifies FR-4, FR-6): Given an error span and a trace-correlated
+  error log, when `errors` runs, then every row carries a `trace_id` column,
+  and feeding the span row's `trace_id` to `trace` returns that span's tree —
+  the triage→localization pivot needs no intermediate `sql` lookup.
+  *Verification hint: `test_ac56_errors_rows_carry_trace_id_for_pivot`.*
+- **AC-57** (Verifies FR-3, EC-32): Given a corpus with several services of
+  differing total volume, when `summary` runs in any `--format`, then stdout
+  carries two blocks — the unchanged per-signal breakdown, then a
+  `** List of services in telemetry data **` delimiter and a `service`/`count`
+  block listing each distinct service with its total record count across all
+  signals, ordered by count descending; the second block is rendered in the
+  selected format and the first block is byte-identical to summary's output
+  without the second block.
+  *Verification hint: `test_ac57_summary_service_list_second_block`.*
+- **AC-58** (Verifies FR-33): Given `--session-id rca-42` on a header-bearing
+  command, when it runs, then the response header's `Session:` line reads the
+  supplied id verbatim, and the stderr session footer names `--session-id rca-42`.
+  *Verification hint: `test_ac58_supplied_session_id_echoed_verbatim`.*
+- **AC-59** (Verifies FR-33): Given no `--session-id`, when a header-bearing
+  command runs, then the header's `Session:` id is a valid UUIDv7 (version 7),
+  and the stderr footer advertises that same id.
+  *Verification hint: `test_ac59_default_session_id_is_uuid7`.*
+- **AC-60** (Verifies FR-33, INV-6): Given any command — including the
+  header-less `sql`/`doctor`/`collector-config`/`troubleshoot` — when it runs,
+  then the session footer is printed to **stderr** (never stdout, so `sql`'s
+  stdout stays pure machine-parseable data) and no header appears on the
+  header-less commands' stdout.
+  *Verification hint: `test_ac60_footer_on_every_command_including_headerless`.*
+- **AC-61** (Verifies FR-33): Given two consecutive invocations with no
+  `--session-id`, when each runs, then they are stamped with **different**
+  generated ids, so unrelated one-off calls are not conflated.
+  *Verification hint: `test_ac61_generated_session_ids_are_unique_per_invocation`.*
+- **AC-62** (Verifies FR-34): Given a template used 6 times 10 days ago and a
+  template used twice within the last hour (both always terminal-successful)
+  and a 1-day half-life, when `history` runs, then the recent template ranks
+  **first** despite the lower raw use count — decayed frequency beats lifetime
+  volume.
+  *Verification hint: `test_history_scoring_prefers_recent_over_stale_heavy_use`.*
+- **AC-63** (Verifies FR-34): Given a telemetry dir with no history store,
+  when `history` runs, then a friendly notice goes to stderr, stdout carries
+  no table, and the exit code is `0`.
+  *Verification hint: `test_history_command_fresh_store_friendly`.*
+- **AC-64** (Verifies FR-36): Given one invocation with
+  `--session-id sess-explicit` and one without, when both are recorded, then
+  the stored `session_id` values are exactly `sess-explicit` and NULL — a
+  generated id is never stored.
+  *Verification hint: `test_history_stores_only_supplied_session_ids`.*
+- **AC-65** (Verifies FR-36): Given two rows 3 hours apart sharing one
+  explicit session id and a third row 1 minute later under a different id,
+  when sessionised, then the first two form **one** session and the third a
+  **separate** one — elapsed time plays no part in either direction.
+  *Verification hint: `test_sessionization_explicit_ids_bridge_and_split`.*
+- **AC-70** (Verifies FR-36): Given two explicit sessions whose rows
+  interleave seconds apart (concurrent agents) plus one id-less row between
+  them, when `history` computes terminal rates, then each session's own last
+  query scores terminal for **its** session only, and the id-less row scores
+  terminal for nothing.
+  *Verification hint:
+  `test_sessionization_survives_interleaved_concurrent_agents`.*
+- **AC-66** (Verifies FR-35): Given past sessions `summary → errors → logs`
+  observed twice and an anchor session ending at `summary`, when
+  `triage --session-id <anchor>` runs with thresholds met, then the concrete
+  successor (`errors …`) is auto-run under the **anchor's** session id, the
+  run is recorded into history under that id, and the **last stdout line** is
+  the full suggested follow-up (`… --session-id <anchor> logs …`).
+  *Verification hint: `test_triage_markov_autoruns_and_suggests_next`.*
+- **AC-67** (Verifies FR-35): Given a confident successor whose template
+  contains a `?` placeholder (a normalised SQL literal), when triage runs,
+  then **no** auto-run happens and the suggestion line carrying the stored raw
+  form (and the session id) is printed instead.
+  *Verification hint: `test_triage_nonconcrete_candidate_suggests_instead_of_running`.*
+- **AC-68** (Verifies FR-35): Given no history store, when `triage` runs, then
+  a friendly stderr notice appears and stdout is empty (exit `0`); given a
+  store whose evidence clears no threshold AND an anchor session that already
+  ran `summary`, then the honest-refusal notice appears on stderr and stdout
+  carries the FR-34 ranked list — no second grounding run.
+  *Verification hints: `test_triage_no_history_is_friendly`,
+  `test_triage_refuses_and_dumps_once_session_is_grounded`.*
+- **AC-69** (Verifies FR-35): Given a store whose evidence clears no threshold
+  and a session with **no** prior `summary`, when `triage` runs, then it
+  auto-runs `summary` (banner naming the grounding, followed by summary's real
+  response), records that run into history, and does **not** print the
+  refusal notice.
+  *Verification hint: `test_triage_grounds_with_summary_when_session_unseeded`.*
 
 ### Examples
 
@@ -699,11 +1213,12 @@ configuration that produces the raw files.
 - **INV-1** — Read-only over telemetry: otelq never modifies, creates, or deletes
   the raw telemetry files it reads. Its output is a pure function of (the
   telemetry it reads, the command, and the flags).
-- **INV-2** — Output-format roles are fixed: `table` is the human-facing default;
-  `json` (a single compact array), `jsonl` (one compact object per line), and
-  `compact` (a single object with a `columns` header and positional `rows`
-  arrays) are the machine/automation formats; `csv` is the spreadsheet/interchange
-  format. Choosing a format never changes which command runs.
+- **INV-2** — Output-format roles are fixed: `compact` (a single object with a
+  `columns` header and positional `rows` arrays) is the default, lowest-token
+  machine/automation format, alongside `json` (a single compact array) and
+  `jsonl` (one compact object per line); `table` is the human-facing format, an
+  explicit `--format table` opt-in; `csv` is the spreadsheet/interchange format.
+  Choosing a format never changes which command runs.
 - **INV-3** — Format independence: the rows a command returns, and their order,
   do not depend on which `--format` is chosen; only the rendering differs.
 - **INV-4** — Friendly failure: absent telemetry yields a human-readable stderr
@@ -712,3 +1227,8 @@ configuration that produces the raw files.
 - **INV-5** — Exit-code discipline: exit `0` covers every success including empty
   results and the friendly "no telemetry" path; a non-zero exit is reserved for
   real errors (malformed SQL, malformed `--since`, argument-order parse failure).
+- **INV-6** — Header is additive, not substitutive: the FR-29 response header is
+  prepended to stdout for its six governed commands but never changes the
+  columns/rows a command returns (INV-3) nor the FR-10 rendering of the payload
+  that follows it. For `sql`, `collector-config`, `troubleshoot`, and `doctor`,
+  stdout is unchanged from FR-10's payload rendering — no header is printed.

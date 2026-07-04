@@ -175,15 +175,17 @@ This is a dump from running `uv run otelq.py --help` within the project root:
 
 ```text
 
-usage: otelq [-h] [--version] [--dir DIR] [--format {table,json,jsonl,csv}] [--all] [--no-cache]
-             [--verbose] [--since SINCE]
-             {summary,sql,errors,slow,trace,logs,metric,collector-config,doctor,troubleshoot,help}
+usage: otelq [-h] [--version] [--dir DIR]
+             [--format {table,json,jsonl,csv,compact}] [--all] [--no-cache]
+             [--verbose] [--since SINCE] [--regex REGEX]
+             [--session-id SESSION_ID]
+             {summary,sql,errors,slow,trace,logs,metric,history,triage,collector-config,doctor,troubleshoot,help}
              ...
 
 Query OTLP telemetry captured by the dev OTel Collector.
 
 positional arguments:
-  {summary,sql,errors,slow,trace,logs,metric,collector-config,doctor,troubleshoot,help}
+  {summary,sql,errors,slow,trace,logs,metric,history,triage,collector-config,doctor,troubleshoot,help}
     summary             counts and time span per signal
     sql                 run an ad-hoc SQL query
     errors              error spans and ERROR/FATAL logs
@@ -191,7 +193,16 @@ positional arguments:
     trace               all spans of one trace as a tree
     logs                filtered log records
     metric              time series for one metric
-    collector-config    print the file-export fragment to add to an existing Collector
+    history             ranked past-query history — the templates most likely
+                        to crack an investigation (triage assistant; also as
+                        sql views history_queries/history_invocations)
+    triage              start or continue an investigation from history: auto-
+                        runs the most likely next query when the evidence is
+                        strong (Markov step over past sessions), suggests the
+                        follow-up invocation, or admits it doesn't know and
+                        lists the top templates
+    collector-config    print the file-export fragment to add to an existing
+                        Collector
     doctor              check that --dir satisfies the telemetry contract
     troubleshoot        print the capture → query loop and common fixes
     help                show help for otelq or a command
@@ -200,20 +211,46 @@ options:
   -h, --help            show this help message and exit
   --version             print otelq's version and exit
   --dir DIR             telemetry folder (default: <cwd>/.telemetry)
-  --format {table,json,jsonl,csv}
-                        output format (default: table; json/jsonl are compact for agents)
+  --format {table,json,jsonl,csv,compact}
+                        output format (default: compact, the fewest-token
+                        format for agents; pass --format table for a human-
+                        readable view)
   --all                 widen the query to the full raw history (cold scan)
   --no-cache            bypass the parquet cache entirely (pure cold scan)
   --verbose             print the resolved time window and route to stderr
-  --since SINCE         restrict to a trailing time window: Ns/Nm/Nh/Nd (e.g. 30s, 10m, 2h, 1d)
+  --since SINCE         restrict to a trailing time window: Ns/Nm/Nh/Nd (e.g.
+                        30s, 10m, 2h, 1d)
+  --regex REGEX         keep only rows matching this pattern in some cell
+                        (summary/errors/slow/trace/logs/metric only); reported
+                        in the response header
+  --session-id SESSION_ID
+                        tag this and consecutive related invocations with a
+                        shared id (default: a generated UUIDv7); echoed in the
+                        header and session footer
+
+timestamps: ALL timestamps — printed by otelq and written into a
+  `sql` query — are UTC. Write `sql` timestamp literals bare
+  ('YYYY-MM-DD HH:MM:SS') or 'Z'-suffixed ('...T10:00:00Z'); never
+  a non-Z offset (e.g. +02:00) — DuckDB silently drops it instead
+  of converting, so the comparison would be silently wrong.
 
 argument order:
-  --dir / --format / --all / --no-cache / --since / --verbose are
-  GLOBAL flags and must come BEFORE the subcommand:
-    otelq --since 10m --format json errors
+  --dir / --format / --all / --no-cache / --since / --regex /
+  --verbose are GLOBAL flags and must come BEFORE the subcommand:
+    otelq --since 10m --format compact errors
   (not: otelq errors --since 10m). Per-command flags (--top, --service,
-  --level, --grep) go AFTER the subcommand. Prefer --format json (or
-  jsonl, one compact object per line) so output is parsed, not scraped.
+  --level, --grep) go AFTER the subcommand.
+
+output format (pick the fewest tokens the consumer can parse):
+  --format compact  DEFAULT. BEST for agents/LLMs: a single
+                    {"columns":[...],"rows":[[...]]} object — column
+                    names once, each row a positional array. Lossless
+                    and the smallest machine format (no repeated keys).
+                    Reconstruct rows with zip(columns, row).
+  --format json     a JSON array of per-row objects; use only when a
+  --format jsonl    consumer needs self-describing rows / streaming.
+  --format csv      spreadsheet/interchange.
+  --format table    for a human reading the terminal, not for parsing.
 
 time window (filters by each record's own event-time):
   (default)            a recent window (the cache's hot window)
@@ -226,7 +263,29 @@ row limits:
   errors / slow / logs / metric cap output with --top N and print a
   one-line notice to stderr when the result was truncated.
 
+regex filtering (summary/errors/slow/trace/logs/metric only):
+  --regex PATTERN  keep only rows matching PATTERN in some cell.
+                   Applied BEFORE rendering, so JSON escaping/CSV
+                   quoting/table padding never affect precision —
+                   precise field-level matching, not `| grep` on
+                   already-rendered text. The response header
+                   reports the verbatim pattern and how many rows
+                   it removed, so you're never blind to what was
+                   filtered (unlike piping through grep). Standard
+                   Python re syntax, case-sensitive by default —
+                   use inline (?i) for case-insensitive. Applies to
+                   the same already --top-capped result; raise
+                   --top to search further. Not supported for sql
+                   (use WHERE col ~ 'pattern' — DuckDB has native
+                   regex) or collector-config/doctor/troubleshoot.
+
 sql views (for `otelq sql "<query>"`):
+  data model: below is a curated subset. Explore the full live
+  schema with standard DuckDB introspection, e.g.
+  sql "DESCRIBE traces" or sql "PRAGMA table_info('logs')" — it
+  reveals extra columns (span_attributes/log_attributes/
+  metric_attributes, resource_attributes, scope_attributes, ...)
+  carrying whatever custom OTel tags an app actually emits.
   traces   timestamp, duration (ms), trace_id, span_id, parent_span_id,
            service_name, span_name, span_kind,
            status_code (0=unset,1=ok,2=error), status_message
@@ -240,6 +299,8 @@ sql views (for `otelq sql "<query>"`):
     metrics_histogram, metrics_exp_histogram  count, sum, min, max
            (+ bucket_counts/explicit_bounds, or scale/zero_count/…)
   (the OTel Summary metric type is unsupported by the reader extension)
+  timestamp columns are naive UTC — see "timestamps" above for the
+  literal convention when filtering on them.
   the built-in commands read only the telemetry under --dir. `sql`
   is an escape hatch that runs with YOUR user's file access (it can
   read/write local files via read_csv/COPY), so treat untrusted

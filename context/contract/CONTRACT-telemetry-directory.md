@@ -11,11 +11,12 @@ must_not_contain:
   - business_context
   - behavioral_explanations
   - decision_rationale
-version: "1.0"
+version: "1.1"
 created: 2026-06-23
-last_updated: 2026-06-23
+last_updated: 2026-07-04
 related_documents:
   - ADR-004-collector-in-docker-bind-mount
+  - ADR-009-query-history-triage-store
   - SPEC-otelq-cli
   - SPEC-otelq-incremental-cache
 ---
@@ -51,6 +52,7 @@ All paths below are relative to the telemetry root.
 | `metrics.jsonl` | writes | producer | Active metric stream |
 | `<signal>-<timestamp>.jsonl` | writes | producer | Size-rotated backups of a signal's active file |
 | `.otelq-cache/` | must not write | consumer | Consumer-owned cache (see below) |
+| `.otelq-history/` | must not write | consumer | Consumer-owned query-history store (see below) |
 
 - `<signal>` is exactly one of `traces`, `logs`, `metrics`.
 - `<timestamp>` is a producer-assigned rotation suffix that makes each backup
@@ -58,20 +60,27 @@ All paths below are relative to the telemetry root.
 - A signal's complete file set is the glob `<signal>*.jsonl` (the active file
   plus its rotated backups).
 
-### Consumer-owned cache subtree
+### Consumer-owned subtrees
 
-The `.otelq-cache/` subtree is **owned and managed exclusively by the consumer**.
-The producer **must not** create, write, read, or delete anything inside it.
+The subtrees named with the `.otelq-` prefix — currently `.otelq-cache/` and
+`.otelq-history/` (v1.1) — are **owned and managed exclusively by the
+consumer**. The producer **must not** create, write, read, or delete anything
+inside them.
 
 | Path | Owner | Description |
 |------|-------|-------------|
 | `.otelq-cache/cursor.json` | consumer | Cursor / state file |
 | `.otelq-cache/<signal>/<minute>.parquet` | consumer | Per-signal sealed partitions |
+| `.otelq-history/` | consumer | Query-history store (journal + Parquet tables + audit) |
 
 The internal structure of `.otelq-cache/` is governed by
-[SPEC-otelq-incremental-cache](../spec/SPEC-otelq-incremental-cache.md) and is
-**not** part of this interface; only its location and consumer ownership are
-contractual here.
+[SPEC-otelq-incremental-cache](../spec/SPEC-otelq-incremental-cache.md); the
+internal structure of `.otelq-history/` is governed by
+[ADR-009](../adr/ADR-009-query-history-triage-store.md) and its implementation.
+Neither internal structure is part of this interface; only their locations and
+consumer ownership are contractual here. Files inside consumer-owned subtrees
+are **not** part of the parent root's signal set regardless of extension (the
+signal globs are non-recursive).
 
 ### File format
 
@@ -127,12 +136,14 @@ The producer rotates each active file by size:
 
 ## Compatibility Guarantees
 
-- **Consumer read-only guarantee.** The consumer treats every `*.jsonl` file
-  under the telemetry root as **READ-ONLY**: it never modifies, renames, or
-  deletes any `*.jsonl` file. The consumer's only writes under the telemetry
-  root are within `.otelq-cache/`.
-- **Producer cache exclusion.** The producer **must not** write to, read from, or
-  delete `.otelq-cache/` or any path beneath it.
+- **Consumer read-only guarantee.** The consumer treats every producer-owned
+  `*.jsonl` file under the telemetry root as **READ-ONLY**: it never modifies,
+  renames, or deletes any of the producer's files. The consumer's only writes
+  under the telemetry root are within the consumer-owned subtrees
+  (`.otelq-cache/`, `.otelq-history/`).
+- **Producer subtree exclusion.** The producer **must not** write to, read
+  from, or delete any consumer-owned subtree (`.otelq-cache/`,
+  `.otelq-history/`) or any path beneath them.
 - **Stable contract elements.** The following are fixed by this interface:
   - the active filenames `traces.jsonl`, `logs.jsonl`, `metrics.jsonl`;
   - the backup filename pattern `<signal>-<timestamp>.jsonl`;
@@ -141,14 +152,21 @@ The producer rotates each active file by size:
     UTF-8, uncompressed;
   - the file-to-reader signal mapping (including `metrics*.jsonl` → both gauge
     and sum readers);
-  - the consumer-owned location `.otelq-cache/`.
+  - the consumer-owned locations `.otelq-cache/` and `.otelq-history/`.
 - **Independent producers/consumers.** Any producer that writes files matching
   this layout and any consumer that reads them interoperate without further
   coordination; the directory is the sole point of agreement.
 
 ## Versioning
 
-This is interface **version 1.0**.
+This is interface **version 1.1**.
+
+**v1.1 (additive, backward-compatible).** Adds the consumer-owned
+`.otelq-history/` subtree (see
+[ADR-009](../adr/ADR-009-query-history-triage-store.md)) and groups the
+consumer-owned locations under one clause. No existing filename, extension,
+framing, mapping, or ownership rule changed; v1.0 producers and consumers
+remain fully compatible.
 
 A change to any of the following is **breaking** and **requires a major version
 bump** of this contract:

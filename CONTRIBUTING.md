@@ -71,11 +71,18 @@ You need [Docker](https://www.docker.com/) (for the dev Collector) and
 
 ```sh
 uv sync --extra dev        # populate .venv (duckdb + stubs, pytest, ruff, editable otelq)
+just hooks-install         # wire up the pre-commit checks below (once per clone)
 ```
+
+`just hooks-install` runs [lefthook](https://lefthook.dev/) (see `lefthook.yml`),
+which gates every commit on `pyright` / `ruff check` / the test suite locally —
+the same checks CI runs, so a failure surfaces before you push, not after. Run
+`just hooks-run` to trigger the same checks on demand without committing.
 
 ## Before you open a pull request
 
-Run the full local check. All three must be clean:
+Run the full local check. All three must be clean (the pre-commit hook runs
+them for you automatically if you ran `just hooks-install`):
 
 ```sh
 uvx pyright                              # strict mode: 0 errors / 0 warnings / 0 informations

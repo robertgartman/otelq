@@ -757,6 +757,42 @@ def temp_telemetry(tmp_path: Path) -> Path:
     return d
 
 
+import re as _re  # noqa: E402
+
+# The FR-29 response header (====== ... ------) that precedes the FR-10 payload
+# for summary/errors/slow/trace/logs/metric, in every --format. A no-op on
+# output that carries no header (sql/doctor/help/etc.), so tests that just need
+# the bare payload can apply this unconditionally.
+_HEADER_RE = _re.compile(r"\A==========\n.*?\n----------\n", _re.DOTALL)
+
+
+def _strip_header(out: str) -> str:
+    """Strip the FR-29 response header from otelq stdout, leaving the bare
+    FR-10 payload for tests that parse or compare it directly."""
+    return _HEADER_RE.sub("", out, count=1)
+
+
+def _summary_first_block(out: str) -> str:
+    """summary emits a labeled service second block (FR-3); return only the
+    first (per-signal) block's payload for tests that parse it as one object."""
+    return _strip_header(out).split("\n\n" + otelq._SUMMARY_SERVICE_LABEL, 1)[0]
+
+
+# A fixed session id the shared runners inject when a test doesn't supply its
+# own --session-id (FR-33). Without it, every invocation would stamp a fresh
+# UUIDv7 into the header, so cached-vs-no-cache byte comparisons and exact-header
+# assertions would spuriously differ run to run. Tests that specifically exercise
+# the GENERATED default (AC-57/AC-59) bypass these runners and call otelq.main.
+_TEST_SESSION_ID = "test-session"
+
+
+def _sid(argv: tuple[str, ...]) -> list[str]:
+    """Prepend a deterministic --session-id unless the caller passed one."""
+    if "--session-id" in argv:
+        return list(argv)
+    return ["--session-id", _TEST_SESSION_ID, *argv]
+
+
 def _run(dirpath: Path, *argv: str) -> str:
     """Run the CLI in-process; return its stdout string."""
     import io as _io
@@ -764,7 +800,7 @@ def _run(dirpath: Path, *argv: str) -> str:
 
     buf = _io.StringIO()
     with redirect_stdout(buf):
-        otelq.main(["--dir", str(dirpath), "--format", "json", *argv])
+        otelq.main(["--dir", str(dirpath), "--format", "json", *_sid(argv)])
     return buf.getvalue()
 
 
@@ -845,7 +881,7 @@ def test_absent_signals_resolve_empty_metrics_only(temp_telemetry: Path) -> None
         nocache = _run(temp_telemetry, "--no-cache", "sql", f"SELECT count(*) AS n FROM {rel}")
         assert _json.loads(cached) == [{"n": 0}]  # resolves empty, not an error
         assert cached == nocache, f"cached != --no-cache for {rel}"
-    rows = _json.loads(_run(temp_telemetry, "summary"))
+    rows = _json.loads(_summary_first_block(_run(temp_telemetry, "summary")))
     assert {r["signal"] for r in rows} == {"metrics"}  # no trace/log skeleton
     for argv in (["slow"], ["trace", "deadbeef"], ["errors"]):
         out, err = _run_both(temp_telemetry, *argv)
@@ -927,7 +963,8 @@ def test_bug3_logs_grep_is_literal_substring(temp_telemetry: Path) -> None:
     )
 
     def bodies(*flags: str) -> list[str]:
-        return [r["body"] for r in _json.loads(_run(temp_telemetry, "logs", *flags))]
+        out = _strip_header(_run(temp_telemetry, "logs", *flags))
+        return [r["body"] for r in _json.loads(out)]
 
     # '_' is literal: matches "user_id matched" only, not "userXid mismatch"
     assert bodies("--grep", "user_id") == ["user_id matched"]
@@ -976,7 +1013,7 @@ def test_bug6_logs_order_deterministic_across_cache_paths(temp_telemetry: Path) 
     cached = _run(temp_telemetry, "logs")
     nocache = _run(temp_telemetry, "--no-cache", "logs")
     assert cached == nocache  # tie-breaker makes equal-timestamp order deterministic
-    assert len(_json.loads(cached)) == 4
+    assert len(_json.loads(_strip_header(cached))) == 4
 
 
 # --- AC-1 / FR-1, FR-5: sealing produces per-minute partitions ----------------
@@ -1141,7 +1178,7 @@ def _run_both(dirpath: Path, *argv: str) -> tuple[str, str]:
 
     out, err = _io.StringIO(), _io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
-        otelq.main(["--dir", str(dirpath), "--format", "json", *argv])
+        otelq.main(["--dir", str(dirpath), "--format", "json", *_sid(argv)])
     return out.getvalue(), err.getvalue()
 
 
@@ -1153,7 +1190,8 @@ def _signal_count(dirpath: Path, signal: str, *argv: str) -> int:
 
 def _sum_signal(out: str, signal: str = "traces") -> int:
     """Total count for a signal across summary's per-row breakdown."""
-    return sum(r["count"] for r in _json.loads(out) if r["signal"] == signal)
+    rows = _json.loads(_summary_first_block(out))
+    return sum(r["count"] for r in rows if r["signal"] == signal)
 
 
 def _minutes_per_minute(base: datetime, n: int) -> list[dict[str, Any]]:
@@ -1269,7 +1307,7 @@ def test_ac10_trace_cold_fallback(temp_telemetry: Path) -> None:
     write_jsonl(temp_telemetry / "traces.jsonl", _minutes_per_minute(base, 90))
     # t5 is ~85 minutes old: absent from the hot cache, found via cold fallback
     out = _run(temp_telemetry, "trace", trace_hex("t5"))
-    assert len(_json.loads(out)) == 1
+    assert len(_json.loads(_strip_header(out))) == 1
     assert out == _run(temp_telemetry, "--no-cache", "trace", trace_hex("t5"))
 
 
@@ -1729,6 +1767,10 @@ def test_help_epilog_documents_argument_order_and_sql_schema() -> None:
     help_text = otelq.build_parser().format_help()
     assert "GLOBAL flags" in help_text
     assert "BEFORE the subcommand" in help_text
+    # FR-30: the UTC timestamp convention must be stated early/prominently, not
+    # buried only in the sql cheat-sheet — it precedes "argument order:".
+    assert help_text.index("timestamps:") < help_text.index("argument order:")
+    assert "UTC" in help_text and "non-Z offset" in help_text
     # The help must steer agents to the token-efficient machine format (AC-37).
     assert "compact" in help_text
     for view in (
@@ -1741,6 +1783,44 @@ def test_help_epilog_documents_argument_order_and_sql_schema() -> None:
         "metrics_exp_histogram",
     ):
         assert view in help_text
+
+
+def test_readme_help_dump_matches_live_help() -> None:
+    # Drift guard: the README's `otelq --help` dump (## Commands) must match
+    # the real output, so a future flag/epilog change is caught here instead
+    # of the README silently rotting — as it had, before this test existed.
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    marker = "```text\n"
+    start = readme.index(marker, readme.index("## Commands")) + len(marker)
+    end = readme.index("\n```", start)
+    dumped = readme[start:end]
+
+    # The README shows a generic <cwd>/.telemetry placeholder for --dir's
+    # default; the real absolute path is a different length and wraps the
+    # help text differently, so patch it before rendering rather than after.
+    # argparse also wraps "usage:"/options text to the terminal width (via
+    # shutil.get_terminal_size(), which honors COLUMNS) — pin it to the width
+    # the README was dumped at (80) so this test is deterministic regardless
+    # of the width of whatever terminal/CI runner actually executes it.
+    original_default = otelq.DEFAULT_DIR
+    original_columns = _os.environ.get("COLUMNS")
+    otelq.DEFAULT_DIR = Path("<cwd>/.telemetry")
+    _os.environ["COLUMNS"] = "80"
+    try:
+        live = otelq.build_parser().format_help()
+    finally:
+        otelq.DEFAULT_DIR = original_default
+        if original_columns is None:
+            _os.environ.pop("COLUMNS", None)
+        else:
+            _os.environ["COLUMNS"] = original_columns
+    # Compare word sequences, not exact line breaks: argparse's usage-line
+    # wrapping of the subparsers "..." token has changed across Python
+    # versions (observed: ubuntu-latest and macos-latest CI runners resolve
+    # different Python patch versions via uv and wrap it differently even at
+    # the same pinned COLUMNS), which is incidental formatting, not content
+    # drift. Word-order still catches a real flag/help-text change.
+    assert dumped.split() == live.split()
 
 
 def test_bare_otelq_prints_full_help() -> None:
@@ -1826,7 +1906,7 @@ def _run_err(dirpath: Path, *argv: str) -> tuple[str, str]:
 
     out, err = _io.StringIO(), _io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
-        otelq.main(["--dir", str(dirpath), "--format", "json", *argv])
+        otelq.main(["--dir", str(dirpath), "--format", "json", *_sid(argv)])
     return out.getvalue(), err.getvalue()
 
 
@@ -1860,11 +1940,11 @@ def test_f1_top_caps_rows_and_warns_on_stderr(temp_telemetry: Path) -> None:
         [make_log(base + timedelta(seconds=i), body=f"m{i}") for i in range(6)],
     )
     out, err = _run_err(temp_telemetry, "logs", "--top", "2")
-    assert len(_json.loads(out)) == 2
+    assert len(_json.loads(_strip_header(out))) == 2
     assert "truncated to 2 rows" in err
     # Under the cap: full result, no notice on stderr.
     out2, err2 = _run_err(temp_telemetry, "logs", "--top", "50")
-    assert len(_json.loads(out2)) == 6
+    assert len(_json.loads(_strip_header(out2))) == 6
     assert "truncated" not in err2
 
 
@@ -1887,7 +1967,8 @@ def test_f2_since_seconds_windows_end_to_end(temp_telemetry: Path) -> None:
         ],
     )
     # Anchor is the max event-time (base+40s); a 30s window keeps mid+newest.
-    bodies = [r["body"] for r in _json.loads(_run(temp_telemetry, "--since", "30s", "logs"))]
+    out = _strip_header(_run(temp_telemetry, "--since", "30s", "logs"))
+    bodies = [r["body"] for r in _json.loads(out)]
     assert "oldest" not in bodies
     assert set(bodies) == {"mid", "newest"}
     assert _run(temp_telemetry, "--since", "30s", "logs") == _run(
@@ -1935,10 +2016,10 @@ def test_f4_trace_prefix_resolves_and_flags_ambiguity(temp_telemetry: Path) -> N
         ],
     )
     # A unique prefix resolves to the one trace (its single span).
-    rows = _json.loads(_run(temp_telemetry, "--all", "trace", "bbbb"))
+    rows = _json.loads(_strip_header(_run(temp_telemetry, "--all", "trace", "bbbb")))
     assert [r["span_name"].strip() for r in rows] == ["span-b"]
     # An exact id still works.
-    exact = _json.loads(_run(temp_telemetry, "--all", "trace", tid_a1))
+    exact = _json.loads(_strip_header(_run(temp_telemetry, "--all", "trace", tid_a1)))
     assert [r["span_name"].strip() for r in exact] == ["span-a1"]
     # An ambiguous prefix is a friendly SystemExit, not a silent pick.
     with pytest.raises(SystemExit) as exc:
@@ -1963,7 +2044,7 @@ def test_p5_format_jsonl_via_cli(temp_telemetry: Path) -> None:
     buf = _io.StringIO()
     with redirect_stdout(buf):
         otelq.main(["--dir", str(temp_telemetry), "--format", "jsonl", "logs"])
-    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    lines = [ln for ln in _strip_header(buf.getvalue()).splitlines() if ln.strip()]
     assert len(lines) == 2
     for ln in lines:
         assert isinstance(_json.loads(ln), dict)  # each line is a standalone object
@@ -1990,7 +2071,7 @@ def test_p5_format_compact_via_cli(temp_telemetry: Path) -> None:
     buf = _io.StringIO()
     with redirect_stdout(buf):
         otelq.main(["--dir", str(temp_telemetry), "--format", "compact", "logs"])
-    obj: dict[str, Any] = _json.loads(buf.getvalue())
+    obj: dict[str, Any] = _json.loads(_strip_header(buf.getvalue()))
     assert set(obj) == {"columns", "rows"}
     columns: list[str] = obj["columns"]
     rows: list[list[Any]] = obj["rows"]
@@ -2082,3 +2163,1110 @@ def test_b5_single_quote_in_dir_path_is_sql_safe(tmp_path: Path) -> None:
     nocache = _run(d, "--all", "--no-cache", "sql", "SELECT count(*) AS n FROM logs")
     assert _json.loads(cached) == [{"n": 2}]  # no SQL breakage on the quoted path
     assert cached == nocache
+
+
+# =============================================================================
+# FR-29 / AC-38..AC-42: the response header
+# =============================================================================
+
+
+def _run_fmt(dirpath: Path, fmt: str, *argv: str) -> str:
+    """Run the CLI in-process with an explicit --format; return stdout."""
+    import io as _io
+    from contextlib import redirect_stdout
+
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        otelq.main(["--dir", str(dirpath), "--format", fmt, *_sid(argv)])
+    return buf.getvalue()
+
+
+def test_ac38_response_header_shape_and_placement(temp_telemetry: Path) -> None:
+    # AC-38: summary/errors/slow/trace/logs/metric print a fixed header before
+    # the FR-10 rendering, for every --format; the payload after it is
+    # unchanged from the header-less rendering of the same rows.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
+    conn = otelq.connect(temp_telemetry)
+    columns, rows = otelq.cmd_logs(conn, Namespace(service=None, level=None, grep=None))
+    for fmt in ("table", "json", "jsonl", "csv", "compact"):
+        out = _run_fmt(temp_telemetry, fmt, "logs")
+        lines = out.splitlines()
+        assert lines[0] == "=" * 10
+        assert lines[1].startswith(f"otelq logs response, format {fmt}")
+        assert lines[2] == "OpenTelemetry signal: logs"
+        assert lines[3].startswith("Time range: ") and " - " in lines[3]
+        assert lines[4] == "IMPORTANT: all timestamps are UTC"
+        assert lines[5].startswith("Session: ")  # FR-33 session id line
+        assert lines[6] == "-" * 10
+        assert _strip_header(out) == otelq.format_output(columns, rows, fmt) + "\n"
+
+
+def test_ac39_no_header_on_non_governed_commands(temp_telemetry: Path) -> None:
+    # AC-39: sql (no fixed signal) and the non-query commands print no header.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base)])
+    sql_out = _run(temp_telemetry, "sql", "SELECT count(*) AS n FROM logs")
+    assert not sql_out.startswith("==========")
+
+    import io as _io
+    from contextlib import redirect_stdout
+
+    for argv in (
+        ["--dir", str(temp_telemetry), "doctor"],
+        ["collector-config"],
+        ["troubleshoot"],
+    ):
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            otelq.main(argv)
+        assert not buf.getvalue().startswith("==========")
+
+
+def test_ac40_zero_row_time_range_is_na(temp_telemetry: Path) -> None:
+    # AC-40: a zero-row result (an unknown metric name) still prints the
+    # header, with Time range: n/a - n/a rather than failing or omitting it.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "metrics.jsonl", [make_gauge(base, name="db.pool")])
+    out = _run(temp_telemetry, "metric", "does.not.exist")
+    lines = out.splitlines()
+    assert lines[2] == "OpenTelemetry signal: metrics"
+    assert lines[3] == "Time range: n/a - n/a"
+    assert _json.loads(_strip_header(out)) == []
+
+
+def test_ac41_summary_and_errors_signal_lists_present_signals(
+    temp_telemetry: Path,
+) -> None:
+    # AC-41: summary/errors rows can span more than one signal; the header
+    # lists whichever of traces/logs/metrics are actually present, comma-joined
+    # in that fixed order.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base, status_code=2)])
+    write_jsonl(
+        temp_telemetry / "logs.jsonl", [make_log(base, severity="ERROR", sevnum=17)]
+    )
+    summary_out = _run(temp_telemetry, "summary")
+    assert summary_out.splitlines()[2] == "OpenTelemetry signal: traces, logs"
+    errors_out = _run(temp_telemetry, "errors")
+    assert errors_out.splitlines()[2] == "OpenTelemetry signal: traces, logs"
+
+
+def test_ac41_errors_signal_is_traces_only_when_no_error_logs(
+    temp_telemetry: Path,
+) -> None:
+    # AC-41 (single-signal case): a traces-only-error corpus (no error/fatal
+    # logs) makes errors's header signal field read "traces" alone.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base, status_code=2)])
+    write_jsonl(
+        temp_telemetry / "logs.jsonl", [make_log(base, severity="INFO", sevnum=9)]
+    )
+    out = _run(temp_telemetry, "errors")
+    assert out.splitlines()[2] == "OpenTelemetry signal: traces"
+
+
+def test_ac42_errors_zero_rows_signal_is_na(temp_telemetry: Path) -> None:
+    # AC-42: errors's signal is derived from the returned rows (unlike the
+    # fixed single-signal commands), so a zero-row result reads n/a for the
+    # signal too, not just the time range.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base, status_code=0)])
+    write_jsonl(
+        temp_telemetry / "logs.jsonl", [make_log(base, severity="INFO", sevnum=9)]
+    )
+    out = _run(temp_telemetry, "errors")
+    lines = out.splitlines()
+    assert lines[2] == "OpenTelemetry signal: n/a"
+    assert lines[3] == "Time range: n/a - n/a"
+    assert _json.loads(_strip_header(out)) == []
+
+
+# =============================================================================
+# FR-33 / AC-58..AC-61: session id (header line + stderr footer)
+# =============================================================================
+
+
+def _header_session_id(out: str) -> str:
+    """The value of the FR-33 `Session:` line in a response header."""
+    for line in _HEADER_RE.search(out).group(0).splitlines():  # type: ignore[union-attr]
+        if line.startswith("Session: "):
+            return line[len("Session: ") :]
+    raise AssertionError("no Session line in header")
+
+
+def _run_no_sid(dirpath: Path, *argv: str) -> tuple[str, str]:
+    """Run the CLI with NO injected --session-id, so the generated UUIDv7 default
+    (FR-33) is exercised; return (stdout, stderr)."""
+    import io as _io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    out, err = _io.StringIO(), _io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        otelq.main(["--dir", str(dirpath), "--format", "json", *argv])
+    return out.getvalue(), err.getvalue()
+
+
+def test_ac58_supplied_session_id_echoed_verbatim(temp_telemetry: Path) -> None:
+    # AC-58: a --session-id is reported VERBATIM in the header's Session line and
+    # named in the stderr footer, so consecutive related calls can be correlated.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base)])
+    out, err = _run_both(temp_telemetry, "--session-id", "rca-42", "summary")
+    assert _header_session_id(out) == "rca-42"
+    assert "--session-id rca-42" in err  # footer tells the caller how to reuse it
+
+
+def test_ac59_default_session_id_is_uuid7(temp_telemetry: Path) -> None:
+    # AC-59: with no --session-id, otelq stamps the answer with a generated
+    # UUIDv7 (time-ordered, version 7), and the header id matches the footer id.
+    import uuid as _uuid
+
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base)])
+    out, err = _run_no_sid(temp_telemetry, "summary")
+    sid = _header_session_id(out)
+    assert _uuid.UUID(sid).version == 7  # a real UUIDv7, not a placeholder
+    assert f"--session-id {sid}" in err  # footer advertises the SAME id
+
+
+def test_ac60_footer_on_every_command_including_headerless(
+    temp_telemetry: Path,
+) -> None:
+    # AC-60: the session footer is printed on EVERY invocation — including the
+    # header-less commands (sql/doctor/collector-config/troubleshoot) — and never
+    # leaks onto stdout, so sql's machine payload stays pure JSON.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base)])
+    sql_out, sql_err = _run_both(
+        temp_telemetry, "--session-id", "s1", "sql", "SELECT count(*) AS n FROM logs"
+    )
+    assert _json.loads(sql_out) == [{"n": 1}]  # stdout stays clean, no footer/header
+    assert "--session-id s1" in sql_err
+    for argv in (["doctor"], ["collector-config"], ["troubleshoot"]):
+        out, err = _run_both(temp_telemetry, "--session-id", "s2", *argv)
+        assert not out.startswith("==========")  # still no stdout header (AC-39)
+        assert "--session-id s2" in err  # but the footer still fires
+
+
+def test_ac61_generated_session_ids_are_unique_per_invocation(
+    temp_telemetry: Path,
+) -> None:
+    # AC-61: absent an explicit id, each invocation gets its own fresh id (a new
+    # UUIDv7 per run), so unrelated one-off calls are not conflated.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base)])
+    first = _header_session_id(_run_no_sid(temp_telemetry, "summary")[0])
+    second = _header_session_id(_run_no_sid(temp_telemetry, "summary")[0])
+    assert first != second
+
+
+# =============================================================================
+# FR-30 / AC-43, AC-44: sql timestamp-literal UTC convention
+# =============================================================================
+
+
+def test_ac43_sql_timestamp_literal_utc_convention(temp_telemetry: Path) -> None:
+    # FR-30/EC-24: timestamp columns are naive UTC. A bare or Z-suffixed
+    # literal must match a known-UTC record; a literal carrying an explicit
+    # non-Z offset for the SAME instant must NOT match, because DuckDB
+    # silently discards the offset instead of converting it — pinning the
+    # documented footgun against otelq's own relations (not an isolated
+    # DuckDB sanity check), so a future DuckDB upgrade that changes this
+    # parsing behavior is caught rather than silently masked.
+    base = datetime(2026, 7, 1, 10, 0, 0, tzinfo=timezone.utc)  # == 12:00 at +02:00
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
+
+    def count(literal: str) -> int:
+        out = _run(
+            temp_telemetry,
+            "sql",
+            f"SELECT count(*) AS n FROM logs WHERE timestamp = '{literal}'",
+        )
+        return _json.loads(out)[0]["n"]
+
+    assert count("2026-07-01 10:00:00") == 1  # bare UTC literal matches
+    assert count("2026-07-01T10:00:00Z") == 1  # Z-suffixed literal matches
+    # Same instant, correctly converted, written with an explicit +02:00
+    # offset: DuckDB discards the offset instead of applying it, so this must
+    # NOT match — the silently-wrong result the convention warns against.
+    assert count("2026-07-01T12:00:00+02:00") == 0
+
+
+_UTC_TS_RE = _re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+
+
+def test_ac45_timestamps_render_explicit_utc(temp_telemetry: Path) -> None:
+    # FR-16/EC-25: every rendered timestamp — in every format, plus summary's
+    # earliest/latest and the FR-29 header's Time range — is an explicit-UTC
+    # ISO-8601 string (a trailing Z), never a naive str(datetime) that looks
+    # identical for any timezone.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
+
+    for fmt in ("table", "json", "jsonl", "csv", "compact"):
+        out = _run_fmt(temp_telemetry, fmt, "logs")
+        lines = out.splitlines()
+        from_str, to_str = lines[3].removeprefix("Time range: ").split(" - ")
+        assert _UTC_TS_RE.match(from_str) and _UTC_TS_RE.match(to_str)
+        payload = _strip_header(out)
+        if fmt == "json":
+            ts = _json.loads(payload)[0]["timestamp"]
+        elif fmt == "jsonl":
+            ts = _json.loads(payload.splitlines()[0])["timestamp"]
+        elif fmt == "compact":
+            obj = _json.loads(payload)
+            ts = obj["rows"][0][obj["columns"].index("timestamp")]
+        elif fmt == "csv":
+            ts = payload.splitlines()[1].split(",")[0]
+        else:  # table
+            ts = payload.splitlines()[2].split()[0]
+        assert _UTC_TS_RE.match(ts), f"{fmt}: {ts!r} is not explicit-UTC ISO-8601"
+
+    # summary's earliest/latest columns too
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base, status_code=0)])
+    rows = _json.loads(_summary_first_block(_run(temp_telemetry, "summary")))
+    for r in rows:
+        if r["count"] > 0:
+            assert _UTC_TS_RE.match(r["earliest"])
+            assert _UTC_TS_RE.match(r["latest"])
+
+
+def test_ac46_compact_is_the_default_format(temp_telemetry: Path) -> None:
+    # FR-10/EC-26: omitting --format defaults to compact (the fewest-token
+    # format) — otelq's primary consumer is an AI agent; --format table
+    # remains available as the explicit human-reading opt-in.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
+
+    import io as _io
+    from contextlib import redirect_stdout
+
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        # fixed --session-id so the Session line matches the compact run below;
+        # the assertion here is about the default FORMAT, not the session id.
+        otelq.main(
+            ["--dir", str(temp_telemetry), "--session-id", _TEST_SESSION_ID, "logs"]
+        )  # no --format
+    default_out = buf.getvalue()
+
+    assert default_out == _run_fmt(temp_telemetry, "compact", "logs")
+    payload = _strip_header(default_out)
+    obj = _json.loads(payload)
+    assert set(obj) == {"columns", "rows"}  # the compact shape, not a table
+
+    table_out = _run_fmt(temp_telemetry, "table", "logs")
+    assert table_out != default_out  # table remains an explicit opt-in
+
+
+def test_ac47_compact_header_names_its_shape(temp_telemetry: Path) -> None:
+    # FR-29/EC-27: json/jsonl/csv/table are self-describing shapes an LLM
+    # already recognizes; compact is otelq-specific, so its header format line
+    # spells out the shape inline. No other format gets the suffix.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
+
+    shape_hint = (
+        'a {"columns":[...],"rows":[[...]]} object — column names once, '
+        "each row a positional array"
+    )
+    compact_line = _run_fmt(temp_telemetry, "compact", "logs").splitlines()[1]
+    assert compact_line == f"otelq logs response, format compact, {shape_hint}"
+
+    for fmt in ("table", "json", "jsonl", "csv"):
+        line = _run_fmt(temp_telemetry, fmt, "logs").splitlines()[1]
+        assert line == f"otelq logs response, format {fmt}"
+        assert shape_hint not in line
+
+
+def test_ac48_sql_schema_discovery_documented_and_works(temp_telemetry: Path) -> None:
+    # FR-31/EC-28: --help documents that the sql views cheat-sheet is a
+    # curated subset and points at DESCRIBE/PRAGMA for the full live schema;
+    # a live DESCRIBE actually returns more columns than the cheat-sheet lists.
+    help_text = otelq.build_parser().format_help()
+    assert "DESCRIBE" in help_text and "PRAGMA" in help_text
+
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base)])
+    out = _run(temp_telemetry, "sql", "DESCRIBE traces")
+    described_columns = {r["column_name"] for r in _json.loads(out)}
+    documented_columns = {
+        "timestamp",
+        "duration",
+        "trace_id",
+        "span_id",
+        "parent_span_id",
+        "service_name",
+        "span_name",
+        "span_kind",
+        "status_code",
+        "status_message",
+    }
+    assert documented_columns <= described_columns  # cheat-sheet is a subset
+    assert "span_attributes" in described_columns  # the undocumented escape hatch
+
+
+# =============================================================================
+# FR-32 / AC-49..AC-55: --regex result filtering
+# =============================================================================
+
+
+def test_ac49_regex_filters_rows_and_reports_in_header(temp_telemetry: Path) -> None:
+    # FR-32/EC-29: only matching rows are kept, and the header gains two
+    # lines naming the verbatim pattern and the removed-row count; with no
+    # --regex, neither line appears.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            make_log(base, body="boom error here"),
+            make_log(base + timedelta(seconds=1), body="all good"),
+        ],
+    )
+    out = _run(temp_telemetry, "--regex", "error", "logs")
+    lines = out.splitlines()
+    assert lines[4] == "Regex filter applied: error"
+    assert lines[5] == "Rows removed by regex: 1"
+    payload = _json.loads(_strip_header(out))
+    assert len(payload) == 1 and payload[0]["body"] == "boom error here"
+
+    out_no_regex = _run(temp_telemetry, "logs")
+    assert "Regex filter applied" not in out_no_regex
+    assert "Rows removed by regex" not in out_no_regex
+
+
+def test_ac50_regex_matches_any_cell(temp_telemetry: Path) -> None:
+    # FR-32: a row is kept if the pattern matches ANY cell, not just a
+    # designated "message" column.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            make_log(base, service="special-svc", body="normal text"),
+            make_log(
+                base + timedelta(seconds=1), service="other-svc", body="normal text"
+            ),
+        ],
+    )
+    out = _run(temp_telemetry, "--regex", "special-svc", "logs")
+    payload = _json.loads(_strip_header(out))
+    assert len(payload) == 1
+    assert payload[0]["service_name"] == "special-svc"
+
+
+def test_ac51_malformed_regex_is_a_real_error(temp_telemetry: Path) -> None:
+    # FR-32/EC-30: a malformed pattern is a real error, not a raw traceback.
+    with pytest.raises(SystemExit) as exc:
+        otelq.main(["--dir", str(temp_telemetry), "--regex", "(", "logs"])
+    assert "invalid --regex pattern" in str(exc.value)
+
+
+def test_ac52_regex_rejected_outside_supported_commands(temp_telemetry: Path) -> None:
+    # FR-32/EC-31: --regex is rejected as a real error for sql/doctor/
+    # collector-config/troubleshoot, not silently ignored.
+    for argv in (
+        ["sql", "SELECT 1"],
+        ["doctor"],
+        ["collector-config"],
+        ["troubleshoot"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            otelq.main(["--dir", str(temp_telemetry), "--regex", "x", *argv])
+        assert "not supported for" in str(exc.value)
+
+
+def test_ac53_regex_matches_pre_render_raw_value(temp_telemetry: Path) -> None:
+    # FR-32: filtering happens against the raw cell value, before --format
+    # json's escaping — a pattern matching only the unescaped quote form
+    # still keeps the row (it would NOT match the JSON-escaped \"hi\" form).
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body='say "hi" now')])
+    out = _run_fmt(temp_telemetry, "json", "--regex", '"hi"', "logs")
+    payload = _json.loads(_strip_header(out))
+    assert len(payload) == 1
+    assert payload[0]["body"] == 'say "hi" now'
+
+
+def test_ac54_regex_case_sensitive_and_skips_none_cells(temp_telemetry: Path) -> None:
+    # FR-32: case-sensitive by default (inline (?i) opts in to insensitive);
+    # None cells are excluded from matching, not stringified into "None".
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [make_log(base, severity="INFO", sevnum=9, body="UPPER CASE")],
+    )
+    out = _run(temp_telemetry, "--regex", "upper case", "logs")
+    assert _json.loads(_strip_header(out)) == []
+    out_ci = _run(temp_telemetry, "--regex", "(?i)upper case", "logs")
+    assert len(_json.loads(_strip_header(out_ci))) == 1
+
+    # summary's zero-count skeleton rows (e.g. WARN/ERROR/...) have
+    # earliest/latest = None; "None" must not match those rows. (First block
+    # only — the service second block is independent of --regex, FR-3.)
+    out_none = _run(temp_telemetry, "--regex", "None", "summary")
+    assert _json.loads(_summary_first_block(out_none)) == []
+
+
+def test_ac55_regex_operates_on_already_capped_result(temp_telemetry: Path) -> None:
+    # FR-32/FR-23: the filter runs on the already --top-capped, fully-ordered
+    # result — a match beyond the cap is not found unless --top is raised.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            make_log(base, body="the target needle"),  # oldest
+            make_log(base + timedelta(seconds=1), body="filler 1"),
+            make_log(base + timedelta(seconds=2), body="filler 2"),
+        ],
+    )
+    # newest-first order excludes the oldest ("needle") row once capped to 2.
+    out = _run(temp_telemetry, "--regex", "needle", "logs", "--top", "2")
+    assert _json.loads(_strip_header(out)) == []
+    # Raising --top recovers the match.
+    out2 = _run(temp_telemetry, "--regex", "needle", "logs", "--top", "3")
+    assert len(_json.loads(_strip_header(out2))) == 1
+
+
+def test_ac56_errors_rows_carry_trace_id_for_pivot(temp_telemetry: Path) -> None:
+    # FR-4/FR-6: every errors row carries trace_id, so the triage→localization
+    # pivot to `trace <id>` needs no intermediate sql lookup.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "traces.jsonl",
+        [make_span(base, trace_id="t-err", span_id="s-err", status_code=2, status_msg="boom")],
+    )
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [make_log(base, severity="ERROR", sevnum=17, trace_id=trace_hex("t-err"))],
+    )
+    rows = _json.loads(_strip_header(_run(temp_telemetry, "errors")))
+    assert len(rows) == 2
+    assert all("trace_id" in r for r in rows)
+    span_row = next(r for r in rows if r["kind"] == "span")
+    assert span_row["trace_id"] == trace_hex("t-err")
+    # The carried id pivots straight into the trace tree (FR-6).
+    tree = _json.loads(_strip_header(_run(temp_telemetry, "trace", span_row["trace_id"])))
+    assert [s["span_name"].strip() for s in tree] == ["GET /x"]
+
+
+def test_ac57_summary_service_list_second_block(temp_telemetry: Path) -> None:
+    # FR-3/EC-32: summary emits a labeled service second block in every format,
+    # with per-service totals across all signals ordered by count desc; the
+    # first block is byte-identical to summary without the second block.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "traces.jsonl",
+        [make_span(base + timedelta(seconds=i), service="busy-svc") for i in range(3)],
+    )
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            make_log(base, service="busy-svc", body="a"),
+            make_log(base + timedelta(seconds=1), service="quiet-svc", body="b"),
+        ],
+    )
+    label = otelq._SUMMARY_SERVICE_LABEL
+
+    # --format json: block 2 is rendered in the same format (an array of objects).
+    out = _run(temp_telemetry, "summary")
+    assert label in out
+    first, second = _strip_header(out).split("\n\n" + label + "\n", 1)
+    assert {r["signal"] for r in _json.loads(first)} == {"traces", "logs"}
+    svc = _json.loads(second)  # per-service totals across ALL signals, count desc
+    assert svc == [
+        {"service": "busy-svc", "count": 4},  # 3 spans + 1 log
+        {"service": "quiet-svc", "count": 1},  # 1 log
+    ]
+
+    # --format compact: block 2 is a compact object in the same shape as block 1.
+    cout = _run_fmt(temp_telemetry, "compact", "summary")
+    csecond = _strip_header(cout).split("\n\n" + label + "\n", 1)[1]
+    assert _json.loads(csecond) == {
+        "columns": ["service", "count"],
+        "rows": [["busy-svc", 4], ["quiet-svc", 1]],
+    }
+
+    # Present in every format; the first block matches the second-block-free render.
+    for fmt in ("table", "json", "jsonl", "csv", "compact"):
+        assert label in _run_fmt(temp_telemetry, fmt, "summary")
+
+    # errors (a non-summary command) never emits the service block.
+    assert label not in _run(temp_telemetry, "errors")
+
+
+# --- query-history triage store (ADR-009) --------------------------------------
+# otelq records telemetry-interrogating invocations in .otelq-history/ (journal
+# appended per invocation, janitor-compacted into two parquet tables) as the
+# triage assistant's corpus. These tests pin: recording + compaction, the
+# canonical/normalised template forms, the meta-command and feedback-loop
+# exclusions, the opt-out, every janitor business rule (each env-configurable),
+# rule precedence and the keep-floor, idempotent re-merge, the ranked `history`
+# command with its terminal-success proxy, the sql views, and failure isolation.
+
+
+
+def _hist_dir(d: Path) -> Path:
+    return d / otelq.HISTORY_DIRNAME
+
+
+def _hist_entry(
+    ts: datetime,
+    norm: str,
+    rows: int,
+    command: str = "errors",
+    raw: str | None = None,
+    session_id: str | None = None,
+) -> str:
+    """One journal line, in exactly the shape _history_record writes."""
+    entry = {
+        "ts": ts.strftime("%Y-%m-%d %H:%M:%S.%f"),
+        "qid": otelq._history_qid(norm),  # type: ignore[attr-defined]
+        "session_id": session_id,
+        "command": command,
+        "raw": raw or norm,
+        "norm": norm,
+        "rows_returned": rows,
+        "duration_ms": 12.5,
+        "exit_code": 0,
+    }
+    return _json.dumps(entry, separators=(",", ":")) + "\n"
+
+
+def _hist_seed(d: Path, lines: list[str]) -> None:
+    hd = _hist_dir(d)
+    hd.mkdir(parents=True, exist_ok=True)
+    (hd / "journal.jsonl").write_text("".join(lines), encoding="utf-8")
+    otelq._history_janitor(d)  # type: ignore[attr-defined]
+
+
+def _hist_queries(d: Path) -> dict[str, dict[str, Any]]:
+    """queries.parquet as {norm: row-dict}."""
+    conn = duckdb.connect(":memory:")
+    rel = conn.execute(
+        f"SELECT * FROM read_parquet('{(_hist_dir(d) / 'queries.parquet').as_posix()}')"
+    )
+    cols = [c[0] for c in rel.description or []]
+    out = {r[cols.index("norm")]: dict(zip(cols, r)) for r in rel.fetchall()}
+    conn.close()
+    return out
+
+
+def test_history_records_and_compacts(temp_telemetry: Path) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl", [make_log(base, severity="ERROR", sevnum=17)]
+    )
+    _run(temp_telemetry, "errors", "--top", "20")
+
+    hd = _hist_dir(temp_telemetry)
+    assert (hd / "queries.parquet").is_file()
+    assert (hd / "invocations.parquet").is_file()
+    # journal fully consumed by the end-of-invocation janitor
+    assert (hd / "journal.jsonl").stat().st_size == 0
+    q = _hist_queries(temp_telemetry)
+    assert list(q) == ["errors --top 20"]
+    row = q["errors --top 20"]
+    assert row["command"] == "errors"
+    assert row["use_count"] == 1
+    assert row["max_rows_ret"] == 1  # the one ERROR log came back
+    # audit trail wrote at least one action line
+    assert (hd / "audit.jsonl").stat().st_size > 0
+
+
+def test_history_raw_canonical_form() -> None:
+    args = Namespace(
+        command="errors", since="10m", all=False, regex=None, top=20
+    )
+    assert otelq._history_raw(args) == "--since 10m errors --top 20"
+    # a --top equal to the command's parser default is omitted (one template)
+    args.top = 50
+    assert otelq._history_raw(args) == "--since 10m errors"
+    lg = Namespace(
+        command="logs", since=None, all=True, regex="timeout|reset",
+        service=None, level="ERROR", grep=None, top=50,
+    )
+    assert (
+        otelq._history_raw(lg)
+        == "--all --regex timeout|reset logs --level ERROR"
+    )
+
+
+def test_history_normalization() -> None:
+    n = otelq._history_normalize
+    # quoted SQL literals (incl. '' escapes) and long hex ids collapse to ?
+    assert (
+        n("sql", "sql SELECT * FROM logs WHERE body = 'it''s here'  AND x=1")
+        == "sql SELECT * FROM logs WHERE body = '?' AND x=1"
+    )
+    assert n("sql", "sql SELECT 1 WHERE trace_id = 'deadbeefdeadbeef'") == (
+        "sql SELECT 1 WHERE trace_id = '?'"
+    )
+    assert n("trace", "trace 2817fd4c5cec6360") == "trace ?"
+    assert n("trace", "trace abc123") == "trace ?"  # short prefixes too
+    # --regex/--grep/--since values are the recipe: kept verbatim
+    assert n("errors", "--since 10m --regex (?i)timeout errors") == (
+        "--since 10m --regex (?i)timeout errors"
+    )
+
+
+def test_history_meta_commands_not_recorded(temp_telemetry: Path) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base)])
+    _run(temp_telemetry, "doctor")
+    assert not _hist_dir(temp_telemetry).exists()
+    # the history read surface itself is excluded (bounds the feedback loop)
+    _run(temp_telemetry, "history")
+    assert not _hist_dir(temp_telemetry).exists()
+
+
+def test_history_opt_out(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OTELQ_HISTORY", "0")
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base)])
+    _run(temp_telemetry, "summary")
+    assert not _hist_dir(temp_telemetry).exists()
+
+
+def test_history_janitor_badness_order_and_floor(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OTELQ_HISTORY_MIN_AGE_HOURS", "0")
+    monkeypatch.setenv("OTELQ_HISTORY_MAX_ROWS", "10")
+    monkeypatch.setenv("OTELQ_HISTORY_STALE_DAYS", "1000")
+    monkeypatch.setenv("OTELQ_HISTORY_KEEP_MIN", "2")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    t = now - timedelta(minutes=5)
+    _hist_seed(
+        temp_telemetry,
+        [
+            _hist_entry(t, "errors zero", 0),  # badness 1: never produced signal
+            _hist_entry(t, "errors flood", 50),  # badness 2: always floods (>10)
+            _hist_entry(t, "errors good", 5),  # not bad
+        ],
+    )
+    # floor 2 allows exactly one removal; badness order picks the 0-row query
+    q = _hist_queries(temp_telemetry)
+    assert set(q) == {"errors flood", "errors good"}
+
+    # floor lifted: the flooder goes too; the good query is never a candidate
+    monkeypatch.setenv("OTELQ_HISTORY_KEEP_MIN", "0")
+    otelq._history_janitor(temp_telemetry)
+    assert set(_hist_queries(temp_telemetry)) == {"errors good"}
+
+
+def test_history_janitor_age_eligibility_protects_recent(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OTELQ_HISTORY_KEEP_MIN", "0")
+    # default 24h eligibility: a recent 0-row query is protected...
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    _hist_seed(temp_telemetry, [_hist_entry(now - timedelta(minutes=5), "errors zero", 0)])
+    assert set(_hist_queries(temp_telemetry)) == {"errors zero"}
+    # ...and removable the moment the eligibility window is configured away
+    monkeypatch.setenv("OTELQ_HISTORY_MIN_AGE_HOURS", "0")
+    otelq._history_janitor(temp_telemetry)
+    conn = duckdb.connect(":memory:")
+    n = conn.execute(
+        f"SELECT count(*) FROM read_parquet('{(_hist_dir(temp_telemetry) / 'queries.parquet').as_posix()}')"
+    ).fetchone()
+    conn.close()
+    assert n == (0,)
+
+
+def test_history_janitor_stale_rule(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OTELQ_HISTORY_MIN_AGE_HOURS", "0")
+    monkeypatch.setenv("OTELQ_HISTORY_KEEP_MIN", "0")
+    monkeypatch.setenv("OTELQ_HISTORY_STALE_DAYS", "30")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    _hist_seed(
+        temp_telemetry,
+        [
+            _hist_entry(now - timedelta(days=40), "errors old", 5),  # stale
+            _hist_entry(now - timedelta(days=2), "errors fresh", 5),  # kept
+        ],
+    )
+    assert set(_hist_queries(temp_telemetry)) == {"errors fresh"}
+
+
+def test_history_merge_is_idempotent(temp_telemetry: Path) -> None:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    lines = [
+        _hist_entry(now - timedelta(minutes=3), "errors a", 5),
+        _hist_entry(now - timedelta(minutes=2), "errors a", 7),
+    ]
+    _hist_seed(temp_telemetry, lines)
+    assert _hist_queries(temp_telemetry)["errors a"]["use_count"] == 2
+    # the same byte-identical lines re-appearing in the journal (skipped
+    # truncate after a lost race) must not double-count: full-row DISTINCT
+    (_hist_dir(temp_telemetry) / "journal.jsonl").write_text(
+        "".join(lines), encoding="utf-8"
+    )
+    otelq._history_janitor(temp_telemetry)
+    assert _hist_queries(temp_telemetry)["errors a"]["use_count"] == 2
+
+
+def test_history_command_ranks_terminal_queries(temp_telemetry: Path) -> None:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    t0 = now - timedelta(hours=2)
+    # two explicit investigation sessions; "logs --grep x" ends both. Sessions
+    # exist ONLY as explicit ids — id-less rows carry no terminal evidence.
+    _hist_seed(
+        temp_telemetry,
+        [
+            _hist_entry(t0, "errors broad", 10, session_id="rank1"),
+            _hist_entry(t0 + timedelta(minutes=1), "logs --grep x", 5,
+                        command="logs", session_id="rank1"),
+            _hist_entry(t0 + timedelta(minutes=30), "errors broad", 10,
+                        session_id="rank2"),
+            _hist_entry(t0 + timedelta(minutes=31), "logs --grep x", 5,
+                        command="logs", session_id="rank2"),
+        ],
+    )
+    out = _run(temp_telemetry, "history", "--top", "5")
+    rows = _json.loads(out)
+    assert rows[0]["query"] == "logs --grep x"
+    assert rows[0]["terminal_pct"] == 100
+    assert rows[0]["uses"] == 2
+    assert rows[1]["query"] == "errors broad"
+    assert rows[1]["terminal_pct"] == 0
+    # last_used renders as an explicit-UTC ISO string
+    assert rows[0]["last_used"].endswith("Z")
+
+
+def test_history_command_fresh_store_friendly(temp_telemetry: Path) -> None:
+    import io as _io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    out, err = _io.StringIO(), _io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = otelq.main(["--dir", str(temp_telemetry), "history"])
+    assert code == 0
+    assert otelq._HISTORY_NO_STORE_MSG in err.getvalue()
+    assert out.getvalue() == ""
+
+
+def test_history_sql_views(temp_telemetry: Path) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base)])
+    # fresh store: the views exist and are empty (stable schema, no error)
+    out = _run(temp_telemetry, "sql", "SELECT count(*) AS n FROM history_queries")
+    assert _json.loads(_strip_header(out))[0]["n"] == 0
+    # that sql invocation was itself recorded; the views now show it
+    out = _run(
+        temp_telemetry,
+        "sql",
+        "SELECT command, use_count FROM history_queries ORDER BY command",
+    )
+    rows = _json.loads(_strip_header(out))
+    assert {"command": "sql", "use_count": 1} in rows
+
+
+def test_history_failure_never_breaks_command(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _boom(path: Path, line: str) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(otelq, "_history_append", _boom)
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
+    out = _run(temp_telemetry, "logs")
+    assert "hi" in out  # the command's own result is untouched
+
+
+def test_history_does_not_fabricate_missing_dir(tmp_path: Path) -> None:
+    missing = tmp_path / "nope"  # never created
+    _run(missing, "--no-cache", "summary")
+    assert not missing.exists()
+
+
+def test_history_env_config_defaults_on_garbage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OTELQ_HISTORY_KEEP_MIN", "not-a-number")
+    monkeypatch.setenv("OTELQ_HISTORY_MAX_ROWS", "-5")
+    cfg = otelq._history_config()
+    assert cfg.keep_min == 500  # default, not a crash
+    assert cfg.max_rows == 500
+
+
+# --- session-aware history + triage (ADR-009 amendment) ------------------------
+# Sessions are explicit --session-id groups ONLY (equal ids chain across any
+# gap, different ids stay separate even seconds apart; timestamps never infer
+# membership — concurrent agents interleave in one store, and id-less rows are
+# frequency evidence only). History ranks by decayed-frequency ×
+# smoothed-success, and `triage` acts on the store: Markov next-step auto-run,
+# next-invocation suggestion, grounding with `summary`, or an honest "don't
+# know" plus the ranked dump.
+
+
+def _hist_invocations(d: Path) -> list[dict[str, Any]]:
+    conn = duckdb.connect(":memory:")
+    rel = conn.execute(
+        "SELECT * FROM read_parquet("
+        f"'{(_hist_dir(d) / 'invocations.parquet').as_posix()}') ORDER BY ts"
+    )
+    cols = [c[0] for c in rel.description or []]
+    out = [dict(zip(cols, r)) for r in rel.fetchall()]
+    conn.close()
+    return out
+
+
+def test_history_stores_only_supplied_session_ids(temp_telemetry: Path) -> None:
+    import io as _io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base)])
+    _run(temp_telemetry, "--session-id", "sess-explicit", "summary")
+    # A truly unflagged call — bypassing _run's deterministic id injection: a
+    # GENERATED id is an offer in the footer, not an asserted correlation, so
+    # it must be stored as NULL (else every casual call would masquerade as
+    # its own asserted single-query investigation and pollute terminal stats).
+    with redirect_stdout(_io.StringIO()), redirect_stderr(_io.StringIO()):
+        otelq.main(["--dir", str(temp_telemetry), "summary"])
+    ids = [r["session_id"] for r in _hist_invocations(temp_telemetry)]
+    assert ids == ["sess-explicit", None]
+
+
+def test_sessionization_explicit_ids_bridge_and_split(temp_telemetry: Path) -> None:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    _hist_seed(
+        temp_telemetry,
+        [
+            # same id 3h apart -> ONE session (elapsed time is irrelevant)
+            _hist_entry(now - timedelta(hours=3), "errors a", 5, session_id="s1"),
+            _hist_entry(now - timedelta(minutes=9), "logs b", 5, command="logs",
+                        session_id="s1"),
+            # different id 1 minute later -> SPLIT despite the tiny gap
+            _hist_entry(now - timedelta(minutes=8), "errors a", 5, session_id="s2"),
+        ],
+    )
+    out = _run(temp_telemetry, "history", "--top", "5")
+    rows = {r["query"]: r for r in _json.loads(out)}
+    # "errors a": terminal in s2 (win) but not in s1 (logs b ended it) -> 50%
+    assert rows["errors a"]["terminal_pct"] == 50
+    assert rows["logs b"]["terminal_pct"] == 100
+
+
+def test_history_scoring_prefers_recent_over_stale_heavy_use(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OTELQ_HISTORY_HALF_LIFE_DAYS", "1")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    lines = [
+        # stale champion: 6 winning singleton sessions, 10 days old
+        _hist_entry(now - timedelta(days=10, minutes=i * 30), "errors stale", 5)
+        for i in range(6)
+    ] + [
+        # recent contender: 2 winning singleton sessions, right now
+        _hist_entry(now - timedelta(minutes=30), "errors fresh", 5),
+        _hist_entry(now - timedelta(minutes=60), "errors fresh", 5),
+    ]
+    _hist_seed(temp_telemetry, lines)
+    rows = _json.loads(_run(temp_telemetry, "history", "--top", "5"))
+    assert rows[0]["query"] == "errors fresh"  # decay beats raw use count
+    assert rows[0]["uses"] < rows[1]["uses"]
+
+
+def test_history_compact_migrates_presession_parquet(temp_telemetry: Path) -> None:
+    # An invocations.parquet written before the session_id column existed must
+    # still merge (BY NAME + ALTER guard), old rows reading as NULL session.
+    hd = _hist_dir(temp_telemetry)
+    hd.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    conn = duckdb.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE inv (qid VARCHAR, ts TIMESTAMP, rows_returned BIGINT, "
+        "duration_ms DOUBLE, exit_code INTEGER); "
+        "CREATE TABLE q (qid VARCHAR, command VARCHAR, norm VARCHAR, "
+        "raw_example VARCHAR, first_seen TIMESTAMP, use_count BIGINT, "
+        "last_used TIMESTAMP, max_rows_ret BIGINT, min_rows_ret BIGINT)"
+    )
+    qid = otelq._history_qid("errors old-school")  # type: ignore[attr-defined]
+    ts = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S.%f")
+    conn.execute(
+        f"INSERT INTO inv VALUES ('{qid}', TIMESTAMP '{ts}', 5, 10.0, 0); "
+        f"INSERT INTO q VALUES ('{qid}', 'errors', 'errors old-school', "
+        f"'errors old-school', TIMESTAMP '{ts}', 1, TIMESTAMP '{ts}', 5, 5)"
+    )
+    conn.execute(
+        f"COPY inv TO '{(hd / 'invocations.parquet').as_posix()}' (FORMAT PARQUET); "
+        f"COPY q TO '{(hd / 'queries.parquet').as_posix()}' (FORMAT PARQUET)"
+    )
+    conn.close()
+    # new-format journal line merges on top of the old-format parquet
+    (hd / "journal.jsonl").write_text(
+        _hist_entry(now, "errors modern", 3, session_id="s9"), encoding="utf-8"
+    )
+    otelq._history_janitor(temp_telemetry)  # type: ignore[attr-defined]
+    invs = _hist_invocations(temp_telemetry)
+    by_null = {r["session_id"] for r in invs}
+    assert by_null == {None, "s9"}
+    assert set(_hist_queries(temp_telemetry)) == {
+        "errors old-school", "errors modern",
+    }
+
+
+def test_triage_no_history_is_friendly(temp_telemetry: Path) -> None:
+    out, err = _run_both(temp_telemetry, "triage")
+    assert otelq._TRIAGE_NO_HISTORY_MSG in err
+    assert out == ""
+
+
+def test_triage_grounds_with_summary_when_session_unseeded(
+    temp_telemetry: Path,
+) -> None:
+    # History exists but is days old (fresh-start mode) and far below the
+    # default evidence bar; the new session has no `summary` yet -> triage
+    # runs the RCA guide's step 1 itself instead of refusing.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base)])
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    _hist_seed(
+        temp_telemetry,
+        [_hist_entry(now - timedelta(days=6), "errors meh", 5)],
+    )
+    out, err = _run_both(temp_telemetry, "triage")
+    assert otelq._TRIAGE_NO_CANDIDATE_MSG not in err
+    assert "grounding with `summary`" in out
+    assert "otelq summary response" in out  # the real grounding output
+    # the grounding run advanced the chain: a summary invocation is recorded
+    cmds = {q["command"] for q in _hist_queries(temp_telemetry).values()}
+    assert "summary" in cmds
+
+
+def test_triage_refuses_and_dumps_once_session_is_grounded(
+    temp_telemetry: Path,
+) -> None:
+    # The anchor session ALREADY ran summary and history has no successor
+    # evidence -> honest refusal + the ranked template dump (grounding twice
+    # would be noise).
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    _hist_seed(
+        temp_telemetry,
+        [
+            _hist_entry(now - timedelta(days=6), "errors meh", 5),
+            _hist_entry(now - timedelta(minutes=2), "summary", 12,
+                        command="summary", session_id="solo"),
+        ],
+    )
+    out, err = _run_both(temp_telemetry, "--session-id", "solo", "triage")
+    assert otelq._TRIAGE_NO_CANDIDATE_MSG in err
+    assert "grounding with `summary`" not in out
+    rows = _json.loads(out)
+    assert {r["query"] for r in rows} >= {"errors meh", "summary"}
+
+
+def test_triage_markov_autoruns_and_suggests_next(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OTELQ_TRIAGE_EVIDENCE", "1")
+    monkeypatch.setenv("OTELQ_TRIAGE_SHARE", "0.4")
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [make_log(base, severity="ERROR", sevnum=17, body="boom")],
+    )
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    # two past sessions: summary -> errors -> logs; anchor session ends at summary
+    lines: list[str] = []
+    for i, sid in enumerate(("h1", "h2")):
+        t = now - timedelta(hours=3 - i)
+        lines += [
+            _hist_entry(t, "summary", 12, command="summary", session_id=sid),
+            _hist_entry(t + timedelta(minutes=1), "errors --top 7", 3,
+                        session_id=sid),
+            _hist_entry(t + timedelta(minutes=2), "logs --grep boom", 1,
+                        command="logs", session_id=sid),
+        ]
+    lines.append(
+        _hist_entry(now - timedelta(hours=1), "summary", 12, command="summary",
+                    session_id="anchor-x")
+    )
+    _hist_seed(temp_telemetry, lines)
+
+    out, _ = _run_both(temp_telemetry, "--session-id", "anchor-x", "triage")
+    # Markov step from `summary` auto-ran the concrete winner...
+    assert "triage: running `errors --top 7` (session anchor-x)" in out
+    assert "otelq errors response" in out  # the inner command's real header
+    # ...the run was recorded into the SAME session so the chain advances...
+    recorded = [
+        r for r in _hist_invocations(temp_telemetry)
+        if r["session_id"] == "anchor-x"
+    ]
+    assert len(recorded) == 2  # the seeded summary + the auto-run errors
+    # ...and the last line suggests the next hop (B -> logs) with full syntax.
+    last = out.rstrip().splitlines()[-1]
+    assert last.startswith("triage next suggestion")
+    assert "--session-id anchor-x" in last
+    assert "logs --grep boom" in last
+
+
+def test_triage_nonconcrete_candidate_suggests_instead_of_running(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OTELQ_TRIAGE_EVIDENCE", "1")
+    monkeypatch.setenv("OTELQ_TRIAGE_SHARE", "0.4")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    sql_norm = "sql SELECT count(*) FROM logs WHERE body = '?'"
+    sql_raw = "sql SELECT count(*) FROM logs WHERE body = 'stale-thing'"
+    lines: list[str] = []
+    for i, sid in enumerate(("n1", "n2")):
+        t = now - timedelta(hours=3 - i)
+        lines += [
+            _hist_entry(t, "summary", 12, command="summary", session_id=sid),
+            _hist_entry(t + timedelta(minutes=1), sql_norm, 4, command="sql",
+                        raw=sql_raw, session_id=sid),
+        ]
+    lines.append(
+        _hist_entry(now - timedelta(hours=1), "summary", 12, command="summary",
+                    session_id="anchor-y")
+    )
+    _hist_seed(temp_telemetry, lines)
+
+    out, _ = _run_both(temp_telemetry, "--session-id", "anchor-y", "triage")
+    # a '?'-template must never be auto-run with someone's stale literal...
+    assert "triage: running" not in out
+    # ...it is suggested for the caller to adapt, session id included.
+    assert out.rstrip().splitlines()[-1].startswith("triage next suggestion")
+    assert sql_raw in out
+    assert "--session-id anchor-y" in out
+
+
+def test_sessionization_survives_interleaved_concurrent_agents(
+    temp_telemetry: Path,
+) -> None:
+    # Two agents' investigations interleave in wall-clock time (seconds
+    # apart). Sessions are explicit-id-only, so each chain stays intact and
+    # an id-less row contributes NO terminal/transition evidence — under the
+    # old time-gap heuristic all five rows would have merged into one bogus
+    # session.
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    t = now - timedelta(minutes=30)
+    _hist_seed(
+        temp_telemetry,
+        [
+            _hist_entry(t, "summary", 12, command="summary", session_id="agentA"),
+            _hist_entry(t + timedelta(seconds=10), "summary", 12,
+                        command="summary", session_id="agentB"),
+            _hist_entry(t + timedelta(seconds=20), "errors a", 5,
+                        session_id="agentA"),
+            _hist_entry(t + timedelta(seconds=25), "logs loose", 5,
+                        command="logs"),  # no session id: casual/manual call
+            _hist_entry(t + timedelta(seconds=30), "logs b", 5, command="logs",
+                        session_id="agentB"),
+        ],
+    )
+    rows = {r["query"]: r for r in _json.loads(_run(temp_telemetry, "history"))}
+    # each agent's own terminal query wins its own session — no cross-talk
+    assert rows["errors a"]["terminal_pct"] == 100  # ends agentA
+    assert rows["logs b"]["terminal_pct"] == 100  # ends agentB
+    assert rows["summary"]["terminal_pct"] == 0
+    # the id-less row is frequency evidence only, never a session terminal
+    assert rows["logs loose"]["terminal_pct"] == 0
