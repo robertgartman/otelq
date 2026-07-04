@@ -14,7 +14,77 @@ code, then confirm from telemetry that it behaved as intended. If infrastructure
 uvx otelq --dir .telemetry --format compact summary
 ```
 
-/
+`--dir .telemetry` is **required** — `uvx` runs otelq from an isolated build, so
+the default path won't resolve to your project. Point it at the Collector's
+output folder (the bind-mounted `.telemetry/` at the project root). Pin a
+version with `uvx otelq@<version> …`.
+
+## How to investigate (RCA guide)
+
+A fixed procedure beats free-form exploration: SOP-guided agents roughly
+double free-form ReAct's accuracy on RCA benchmarks (Flow-of-Action, WWW'25),
+and the documented LLM failure modes are skipping grounding, anchoring on the
+first plausible cause, and stopping at a propagated symptom instead of its
+origin (FORGE'26). Follow the steps in order; each step's output is the next
+step's input. The ordering is adapted to otelq's dev-environment corpus:
+logs here are small, local, and rich — go to them earlier than production
+RCA lore suggests.
+
+**Standing rule — constrain every query.** Default to a tight `--since`
+window (the repro run, not the whole session) and an aggressive `--regex` on
+anything list-shaped; the header's `Rows removed by regex` tells you what the
+filter cost, so over-filtering is visible and correctable. Widening a window
+or dropping a filter is one retry; flooding your context is unrecoverable.
+
+**0 · FRAME.** Before any query, state the symptom and the time window.
+Tighten `--since` to the anomaly (e.g. `30s`/`10m` right after a repro run) —
+never "look at everything."
+
+**1 · GROUND with `summary`.** One cheap call maps the terrain: which signals
+have data at all, per-level log counts (any ERROR/FATAL?), the `>1s` span
+bucket, metric types, and each subset's time span. Skip it only when you
+already hold a trace_id or an exact target. Target signal at 0 rows? Fix
+capture first (`troubleshoot`) — don't query a void.
+
+**2 · TRIAGE — commit to ONE signal per symptom.** Each command below is a
+pre-built aggregate; don't hand-roll `sql` for these:
+
+| Symptom | Command |
+| --- | --- |
+| exception / failure | `errors` — error spans + ERROR/FATAL logs, newest-first |
+| slow / latency | `slow` — spans by duration desc, carries trace_id |
+| wrong or missing behavior | `logs --grep <token>` (or `--regex`) — dev logs are rich, use them early |
+| resource / counter anomaly | `metric <name>` — names come from `summary` |
+
+Nothing in the window? Widen once (`--all`); still nothing means the
+telemetry never captured it — say so instead of exploring sideways.
+
+**3 · LOCALIZE with `trace <trace_id>`** (a unique id prefix is enough;
+`slow` and `logs` rows carry trace_id — for `errors` span rows fetch it with
+`sql "SELECT trace_id, span_name FROM traces WHERE status_code = 2"`).
+One full tree beats ten partial fetches. Read it with two heuristics:
+
+- **Latency origin** = the span with the largest **self** time (its
+  `duration_ms` minus its children's) — *not* the longest span; the root is
+  long because it contains everyone.
+- **Error origin** = the **deepest** error span whose children are *not* all
+  errors. A span whose children all errored is merely propagating — keep
+  descending.
+
+**4 · EXPLAIN with scoped logs** — never a free-text sweep of the window:
+`sql "SELECT timestamp, severity_text, body FROM logs WHERE trace_id = '<id>'"`.
+Custom app attributes live in the `*_attributes` JSON columns — run
+`sql "DESCRIBE logs"` first, then filter on what actually exists.
+
+**5 · STOP** when you hold all three: the origin span, the log/exception that
+explains it, and the service/attribute saying where. State the hypothesis
+with that evidence. Do not keep exploring past this point.
+
+**Token discipline** (why the order above): aggregates before rows — `summary`
+or `sql "SELECT count(*), min(timestamp), max(timestamp) FROM …"` costs a
+fraction of the rows themselves; filter server-side (`--since` / `--regex` /
+`--top` / `--service` / `--level` / `--grep`) rather than fetching broadly and
+post-filtering; carry only {window, signal, trace_id, span_id} between steps.
 
 ## Timestamps are UTC
 
