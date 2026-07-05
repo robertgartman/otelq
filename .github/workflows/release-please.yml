@@ -1,0 +1,36 @@
+# Automates the "bump version -> changelog -> tag -> GitHub Release" chain so the
+# git tag and the packaged version can never drift.
+#
+# Flow:
+#   1. You merge feat/fix PRs to main as usual (Conventional Commits).
+#   2. This workflow keeps a "chore(main): release X.Y.Z" PR open that bumps the
+#      version in BOTH places kept in lockstep (pyproject.toml [project].version
+#      and otelq.py __version__) and regenerates CHANGELOG.md from the commits.
+#   3. Merging that PR creates the git tag vX.Y.Z and a GitHub Release.
+#
+# Publishing to PyPI is a deliberate, SEPARATE manual step (see release.yml):
+# after the release PR is merged, trigger the Release workflow from the GitHub UI
+# (Actions -> Release -> Run workflow, target: pypi) or the CLI
+# (gh workflow run release.yml -f target=pypi). Because publishing is triggered
+# by you and not by the Release event, this needs no Personal Access Token — the
+# default GITHUB_TOKEN is enough to open the PR and cut the tag/Release.
+
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

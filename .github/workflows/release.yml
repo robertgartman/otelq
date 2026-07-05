@@ -1,15 +1,33 @@
-# Publishes otelq through the same release pipeline for both rehearsal and prod:
-#   - workflow_dispatch -> TestPyPI, with a unique .dev timestamp version
-#   - GitHub Release  -> PyPI, with the checked-in pyproject.toml version
+# Builds and publishes otelq through Trusted Publishing (OIDC), never long-lived
+# API tokens. Trigger it MANUALLY — from the GitHub UI (Actions -> Release ->
+# Run workflow) or the CLI (gh workflow run release.yml):
 #
-# Both targets use Trusted Publishing (OIDC), not long-lived API tokens. Configure
-# each index with this repository, workflow filename `release.yml`, and the
-# matching GitHub environment name: TestPyPI -> `pypitest`, PyPI -> `pypi`.
+#   target = testpypi (default) -> REHEARSAL. Publishes a unique .dev timestamp
+#       version to TestPyPI. Nothing is committed or tagged.
+#   target = pypi               -> REAL RELEASE. Run it ON the release tag vX.Y.Z
+#       (UI: pick the tag in the "Run workflow" ref dropdown; CLI:
+#       gh workflow run release.yml --ref vX.Y.Z -f target=pypi). It publishes
+#       exactly that tagged commit to PyPI. The release-please PR (see
+#       release-please.yml) bumps the version and creates that tag on merge, so
+#       we only ever ship a version that was cut through release-please.
+#
+# A GitHub Release being *published* also triggers a real PyPI publish, as a
+# fallback for a hand-made release.
+#
+# Both targets use Trusted Publishing (OIDC). Configure each index with this
+# repository, workflow filename `release.yml`, and the matching GitHub
+# environment name: TestPyPI -> `pypitest`, PyPI -> `pypi`.
 
 name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: "Publish target (pypi = real release of the current tagged version)"
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
   release:
     types: [published]
 
@@ -21,9 +39,14 @@ jobs:
   pypi-publish:
     name: Build, publish, and smoke-test package
     runs-on: ubuntu-latest
+    env:
+      # Real PyPI release when a GitHub Release was published, or when manually
+      # dispatched with target=pypi. Otherwise (dispatch default) a TestPyPI
+      # rehearsal.
+      IS_PROD: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi') }}
     environment:
-      name: ${{ github.event_name == 'release' && 'pypi' || 'pypitest' }}
-      url: ${{ github.event_name == 'release' && 'https://pypi.org/p/otelq' || 'https://test.pypi.org/p/otelq' }}
+      name: ${{ (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')) && 'pypi' || 'pypitest' }}
+      url: ${{ (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')) && 'https://pypi.org/p/otelq' || 'https://test.pypi.org/p/otelq' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -43,7 +66,14 @@ jobs:
         run: |
           BASE_VERSION=$(uv version --short)
 
-          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+          if [[ "${IS_PROD}" == "true" ]]; then
+            # A real release always runs on the tag — whether from the release
+            # event or a manual pypi dispatch on the tag ref — so we build and
+            # ship exactly the tagged commit, and the tag must match pyproject.
+            if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+              echo "A PyPI release must run on a release tag. Re-run this workflow on tag vX.Y.Z (UI: pick the tag in 'Run workflow'; CLI: gh workflow run release.yml --ref vX.Y.Z -f target=pypi). The tag is created when the release-please PR merges." >&2
+              exit 1
+            fi
             TAG_VERSION="${GITHUB_REF_NAME#v}"
             if [[ "${TAG_VERSION}" != "${BASE_VERSION}" ]]; then
               echo "Release tag ${GITHUB_REF_NAME} does not match pyproject version ${BASE_VERSION}" >&2
@@ -68,20 +98,20 @@ jobs:
         run: uvx twine check dist/*
 
       - name: Publish to TestPyPI
-        if: github.event_name != 'release'
+        if: env.IS_PROD != 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
           verbose: true
 
       - name: Publish to PyPI
-        if: github.event_name == 'release'
+        if: env.IS_PROD == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           verbose: true
 
       - name: Smoke-test TestPyPI package with uvx
-        if: github.event_name != 'release'
+        if: env.IS_PROD != 'true'
         run: |
           for attempt in 1 2 3 4 5 6; do
             if uvx \
@@ -101,7 +131,7 @@ jobs:
           exit 1
 
       - name: Smoke-test PyPI package with uvx
-        if: github.event_name == 'release'
+        if: env.IS_PROD == 'true'
         run: |
           for attempt in 1 2 3 4 5 6; do
             if uvx --from "otelq==${PACKAGE_VERSION}" otelq --help; then
