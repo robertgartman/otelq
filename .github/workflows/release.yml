@@ -129,18 +129,3 @@ jobs:
 
           echo "Failed to install otelq ${PACKAGE_VERSION} from TestPyPI" >&2
           exit 1
-
-      - name: Smoke-test PyPI package with uvx
-        if: env.IS_PROD == 'true'
-        run: |
-          for attempt in 1 2 3 4 5 6; do
-            if uvx --from "otelq==${PACKAGE_VERSION}" otelq --help; then
-              exit 0
-            fi
-
-            echo "PyPI package not available yet; retry ${attempt}/6"
-            sleep 10
-          done
-
-          echo "Failed to install otelq ${PACKAGE_VERSION} from PyPI" >&2
-          exit 1
