@@ -103,7 +103,7 @@ pre-built aggregate; don't hand-roll `sql` for these:
 | --- | --- |
 | exception / failure | `errors` — error spans + ERROR/FATAL logs, newest-first |
 | slow / latency | `slow` — spans by duration desc, carries trace_id |
-| wrong or missing behavior | `logs --grep <token>` (or `--regex`) — dev logs are rich, use them early |
+| wrong or missing behavior | `logs --grep <token>` (literal, case-insensitive body contains) or `--regex` (pattern) — dev logs are rich, use them early |
 | resource / counter anomaly | `metric <name>` — names come from `summary` |
 
 Nothing in the window? Widen once (`--all`); still nothing means the
@@ -171,13 +171,25 @@ typically ~40–60% fewer tokens on the same rows, identical data.
 uvx otelq --dir .telemetry --since 10m --format compact errors --top 20
 ```
 
-## Filter with --regex, not `| grep`
+## Filter inside otelq (`--regex` / `--grep`), not shell `| grep`
 
-Piping otelq's output through `grep` is blind to what got filtered away.
-`--regex PATTERN` filters instead — applied to raw cell values before
-rendering (so JSON escaping/CSV quoting never affects match precision), and
-the response header reports the verbatim pattern plus how many rows it
-removed, so you always know what was excluded:
+Piping otelq's output through shell `grep` is blind to what got filtered away.
+Use otelq-native filtering instead:
+
+- `--regex PATTERN` (summary/errors/slow/trace/logs/metric): regex over rendered
+  cell values, reported in the header with rows removed.
+- `logs --grep TOKEN` (logs only): literal, case-insensitive substring match on
+  `body`.
+
+Both avoid shell-postprocessing ambiguity. `--regex` is the general mechanism;
+`--grep` is a logs-only convenience when you want literal substring matching
+without regex escaping.
+
+`--regex` is applied to the already `--top`-capped result, while `logs --grep`
+filters in the SQL query before capping. So for logs, `--grep` can surface the
+latest matching rows without first raising `--top`.
+
+Example:
 
 ```
 uvx otelq --dir .telemetry --regex "timeout|ECONNRESET" errors
@@ -214,4 +226,3 @@ uvx otelq --dir .telemetry sql "PRAGMA table_info('logs')"
 ```
 uvx otelq --dir .telemetry troubleshoot
 ```
-
