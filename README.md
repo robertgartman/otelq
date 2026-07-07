@@ -174,7 +174,6 @@ uv run otelq.py summary
 This is a dump from running `uv run otelq.py --help` within the project root:
 
 ```text
-
 usage: otelq [-h] [--version] [--dir DIR]
              [--format {table,json,jsonl,csv,compact}] [--all] [--no-cache]
              [--verbose] [--since SINCE] [--regex REGEX]
@@ -280,26 +279,32 @@ regex filtering (summary/errors/slow/trace/logs/metric only):
                    regex) or collector-config/doctor/troubleshoot.
 
 sql views (for `otelq sql "<query>"`):
-  data model: below is a curated subset. Explore the full live
+  data model: the duckdb-otlp v0.6.0 reader schema, adopted
+  verbatim (see the duckdb-otlp project docs for full semantics).
+  Below is a curated subset. Explore the full live
   schema with standard DuckDB introspection, e.g.
   sql "DESCRIBE traces" or sql "PRAGMA table_info('logs')" — it
   reveals extra columns (span_attributes/log_attributes/
   metric_attributes, resource_attributes, scope_attributes, ...)
   carrying whatever custom OTel tags an app actually emits.
-  traces   timestamp, duration (ms), trace_id, span_id, parent_span_id,
-           service_name, span_name, span_kind,
-           status_code (0=unset,1=ok,2=error), status_message
-  logs     timestamp, trace_id, service_name, severity_text,
-           severity_number, body
-  metrics  timestamp, service_name, metric_name, metric_type, value,
-           metric_unit  (metric_type: gauge|sum|histogram|exp_histogram;
-           value = the value of gauge/sum, the sum of histogram/exp)
+  traces   start_time_unix_nano (event-time),
+           duration_time_unix_nano (ns), trace_id, span_id,
+           parent_span_id, service_name, name (span name), kind,
+           status_code (0=unset,1=ok,2=error), status_status_message
+  logs     time_unix_nano (event-time), trace_id, service_name,
+           severity_text, severity_number, body
+  metrics  time_unix_nano (event-time), service_name, name,
+           metric_type, value, unit
+           (metric_type: gauge|sum|histogram|exp_histogram;
+           value = gauge/sum's double_value else int_value,
+           the sum of histogram/exp)
   per-type metric relations (metrics unions whichever are present):
-    metrics_gauge, metrics_sum               value
+    metrics_gauge, metrics_sum               int_value, double_value
     metrics_histogram, metrics_exp_histogram  count, sum, min, max
            (+ bucket_counts/explicit_bounds, or scale/zero_count/…)
   (the OTel Summary metric type is unsupported by the reader extension)
-  timestamp columns are naive UTC — see "timestamps" above for the
+  *_unix_nano event-time columns are naive UTC TIMESTAMP_NS — see
+  "timestamps" above for the
   literal convention when filtering on them.
   the built-in commands read only the telemetry under --dir. `sql`
   is an escape hatch that runs with YOUR user's file access (it can

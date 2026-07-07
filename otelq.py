@@ -1,14 +1,15 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["duckdb==1.5.3"]
+# dependencies = ["duckdb==1.5.4"]
 # ///
 # duckdb is pinned exactly because otelq depends on the `otlp` *community*
 # extension (smithclay/duckdb-otlp), which is built per DuckDB version and lags
-# new releases. An open `>=` floats to the newest DuckDB (e.g. 1.5.4), for which
-# the extension is not yet published — `INSTALL otlp FROM community` then 404s
-# and every otelq command fails. 1.5.3 is the latest version with the extension
-# built (community-extensions.duckdb.org/v1.5.3/<platform>/otlp...). Bump this
-# only after confirming the extension exists for the target version.
+# new releases. An open `>=` floats to the newest DuckDB, for which the
+# extension may not yet be published — `INSTALL otlp FROM community` then 404s
+# and every otelq command fails. 1.5.4 carries otlp v0.6.0
+# (community-extensions.duckdb.org/v1.5.4/<platform>/otlp...). Bump this only
+# through the ADR-003 checklist, after confirming the extension exists for the
+# target version.
 """otelq — query OTLP telemetry captured by the dev OTel Collector.
 
 Reads .telemetry/*.jsonl (OTLP JSONL written by the Collector fileexporter)
@@ -25,15 +26,19 @@ fall back to a stateless cold scan of the raw files. Results are identical to a
 full raw re-scan (the cache is a pure accelerator); pass --no-cache to force the
 cold path. See context/spec/SPEC-otelq-incremental-cache.md.
 
-2048-row workaround
--------------------
-The duckdb-otlp extension's read_otlp_* table functions corrupt memory and
-crash when a single call returns more than 2048 rows (DuckDB's
-STANDARD_VECTOR_SIZE): the Rust backend writes the whole result into one
-output vector instead of yielding 2048-row chunks. otelq works around it by
-slicing each signal's JSONL into <=_SAFE_CHUNK-record pieces and giving every
-piece its own read_otlp_* call, then materialising the unioned result into a
-table. No single call ever crosses the boundary.
+Reader schema adoption (ADR-010)
+--------------------------------
+otelq targets duckdb-otlp v0.6.0 (DuckDB 1.5.4) and adopts the extension's
+reader schema natively: the six relations carry the read_otlp_* columns
+verbatim (SELECT * at the read seam) — the upstream duckdb-otlp project docs
+are the reference for otelq's data model. Each relation's event-time is its
+TIMESTAMP_NS column (start_time_unix_nano for traces, time_unix_nano
+otherwise, see EVENT_TIME_COLUMNS); commands present a friendly `timestamp`
+alias in their output. The reader hard-errors on unparsable input (a
+half-written Collector line would fail the whole query), so raw JSONL is
+sanitized line-by-line in Python first — undecodable lines are skipped (SPEC
+FR-15/FR-21) — and the sanitized bytes are staged to temp files split under
+the reader's per-file size cap.
 """
 
 from __future__ import annotations
@@ -162,33 +167,11 @@ OTLP_TOP_LEVEL_KEY = {
     "metrics": "resourceMetrics",
 }
 
-def _rows_upper_bound(line: str) -> int:
-    """A cheap, sound UPPER bound on the read_otlp_* rows a JSONL line yields,
-    computed WITHOUT parsing it (P-2).
-
-    Every span, log record, and metric data point — i.e. every output row —
-    carries at least one `*[Tt]imeUnixNano` key (spans and sum/histogram points
-    carry two), and `"imeUnixNano"` is the shared substring of all of them
-    (timeUnixNano, startTimeUnixNano, endTimeUnixNano, observedTimeUnixNano). So
-    this count is never below the true row count; it can only overcount, which
-    keeps chunk sizing conservative (smaller, never oversized) and is safe as the
-    gate that decides whether a line even needs a real json.loads. A stray
-    occurrence inside a string value only inflates the bound, at worst forcing an
-    exact re-count via _decode_line — never a crash or a dropped row."""
-    return line.count("imeUnixNano")
-
-
-# read_otlp_* corrupts memory above 2048 output rows; _SAFE_CHUNK leaves a
-# margin so a chunk can never reach the boundary. _CRASH_LIMIT is the boundary
-# itself — a single export batch larger than this cannot be chunked (it is one
-# indivisible JSON object) and is skipped with a warning rather than crashing.
-_SAFE_CHUNK = 2000
-_CRASH_LIMIT = 2048
-
-# The duckdb-otlp extension stores timestamps as nanoseconds in a TIMESTAMP_MS
-# column, so DuckDB reads the value 1000x too large (year 58358 instead of 2026).
-# This SELECT-REPLACE corrects the timestamp column by dividing by 1000.
-_TS_FIX = "make_timestamp(epoch_us(timestamp) // 1000) AS timestamp"
+# The duckdb-otlp reader (v0.6.0) refuses any file larger than this; sanitized
+# staging files are split below it, with margin, so one read_otlp_* call per
+# staged file always succeeds.
+_READER_FILE_CAP = 100 * 1024 * 1024
+_STAGE_FILE_BUDGET = 90 * 1024 * 1024
 
 # --- Cache model (SPEC-otelq-incremental-cache) ------------------------------
 # Three raw byte-streams feed six cache signals: the single metrics*.jsonl
@@ -223,11 +206,39 @@ SIGNAL_READERS = {
     "metrics_exp_histogram": "read_otlp_metrics_exp_histogram",
 }
 
+# --- Native reader schema (ADR-010) -------------------------------------------
+# The duckdb-otlp v0.6.0 reader columns ARE otelq's data model: relations carry
+# them verbatim (SELECT * below), so the upstream project's documentation
+# describes otelq's tables and no otelq-side column dictionary can drift.
+# Each relation's event-time is its TIMESTAMP_NS column; generic cache logic
+# (sealing, hot-window filtering, watermarks) keys on this per-signal mapping.
+EVENT_TIME_COLUMNS = {
+    "traces": "start_time_unix_nano",
+    "logs": "time_unix_nano",
+    "metrics_gauge": "time_unix_nano",
+    "metrics_sum": "time_unix_nano",
+    "metrics_histogram": "time_unix_nano",
+    "metrics_exp_histogram": "time_unix_nano",
+}
+
+
+def _read_select(signal: str, staged_path: str) -> str:
+    """The SELECT over one staged file for one signal.
+
+    The single place a read_otlp_* call is written. SELECT * — the reader's
+    schema is adopted verbatim (ADR-010); nothing is renamed or converted.
+    """
+    return f"SELECT * FROM {SIGNAL_READERS[signal]}({_sql_str(staged_path)})"
+
+
 CACHE_DIRNAME = ".otelq-cache"
 PENDING_DIRNAME = ".pending"
 CURSOR_FILENAME = "cursor.json"
 LOCK_FILENAME = ".lock"
-CURSOR_SCHEMA_VERSION = 1
+# v3: ADR-010 — the duckdb-otlp v0.6.0 reader schema is adopted natively;
+# older caches hold rows in the pre-v0.6.0 canonical shape and must self-wipe
+# (FR-14).
+CURSOR_SCHEMA_VERSION = 3
 RETENTION_MINUTES = 30  # hot window
 MARGIN_MINUTES = 2  # watermark lateness allowance before a minute may seal
 # How far ahead of wall-clock an event-time may sit before otelq treats it as an
@@ -261,128 +272,65 @@ def stream_of(signal: str) -> str:
     return "metrics" if signal.startswith("metrics") else signal
 
 
-def _count_rows(signal: str, obj: dict[str, Any]) -> int:
-    """Number of read_otlp_<signal> output rows one OTLP/JSON line yields.
+def _line_is_readable(line: str) -> bool:
+    """True when a JSONL line is safe to hand to a read_otlp_* call.
 
-    `signal` is a byte-stream name (traces/logs/metrics).
-    """
-    if signal == "logs":
-        return sum(
-            len(sl.get("logRecords", []))
-            for rl in obj.get("resourceLogs", [])
-            for sl in rl.get("scopeLogs", [])
-        )
-    if signal == "traces":
-        return sum(
-            len(ss.get("spans", []))
-            for rs in obj.get("resourceSpans", [])
-            for ss in rs.get("scopeSpans", [])
-        )
-    # metrics: count every data point across all metric types, so the chunk
-    # budget bounds every read_otlp_metrics_<type> call (gauge, sum, histogram,
-    # exp_histogram).
-    total = 0
-    for rm in obj.get("resourceMetrics", []):
-        for sm in rm.get("scopeMetrics", []):
-            for metric in sm.get("metrics", []):
-                for kind in (
-                    "gauge",
-                    "sum",
-                    "histogram",
-                    "exponentialHistogram",
-                    "summary",
-                ):
-                    points = metric.get(kind)
-                    if points:
-                        total += len(points.get("dataPoints", []))
-    return total
-
-
-def _decode_line(signal: str, line: str) -> tuple[dict[str, Any], int] | None:
-    """Parse one OTLP/JSON line, applying the two robustness guards.
-
-    Returns (parsed_obj, output_row_count), or None when the line must be
-    skipped: a blank/partially-written trailing line (JSONDecodeError), or a
-    single export batch whose row count exceeds the read_otlp 2048 crash limit.
-    Shared by the cold whole-file reader and the incremental tail reader so the
-    skip behaviour (SPEC FR-15) can never drift between the two paths.
+    The v0.6.0 reader hard-errors on any line that is not a JSON object —
+    a half-written trailing line would fail the whole query — so this guard
+    is what keeps FR-15/FR-21's skip-and-continue behaviour: blank lines,
+    partially-written lines (JSONDecodeError), and non-object JSON are
+    filtered out before bytes reach the extension. A decodable JSON object
+    that is not OTLP is harmless (the reader yields zero rows for it).
+    Shared by the cold whole-file reader and the incremental tail reader so
+    the skip behaviour can never drift between the two paths.
     """
     if not line.strip():
-        return None
+        return False
     try:
-        obj = json.loads(line)
+        return isinstance(json.loads(line), dict)
     except json.JSONDecodeError:
-        return None  # skip a partially-written trailing line
-    rows = _count_rows(signal, obj)
-    if rows > _CRASH_LIMIT:
-        # One export batch is a single indivisible JSON object; if it alone
-        # exceeds the limit it cannot be chunked.
-        print(
-            f"otelq: skipping a {signal} batch of {rows} records "
-            f"(exceeds the {_CRASH_LIMIT}-row read_otlp limit — "
-            f"lower the Collector's send_batch_max_size)",
-            file=sys.stderr,
-        )
-        return None
-    return obj, rows
+        return False  # skip a partially-written trailing line
 
 
-def _buffer_to_chunks(
-    signal: str, lines: Iterable[str], tmp_dir: str, tag: str
-) -> list[str]:
-    """Slice an iterable of JSONL lines into <=_SAFE_CHUNK-row chunk files.
+def _stage_lines(lines: Iterable[str], tmp_dir: str, tag: str) -> list[str]:
+    """Write the readable lines of an iterable to sanitized staging file(s).
 
-    Each chunk file stays under the duckdb-otlp 2048-row crash boundary, so a
-    read_otlp_* call over one chunk is safe. Returns the chunk file paths.
+    Files are split below the reader's per-file size cap so one read_otlp_*
+    call per staged file always succeeds. Unreadable lines are skipped
+    (_line_is_readable). Returns the staged file paths.
     """
-    chunks: list[str] = []
+    staged: list[str] = []
     buf: list[str] = []
-    buf_rows = 0
+    buf_bytes = 0
 
     def flush() -> None:
-        nonlocal buf, buf_rows
+        nonlocal buf, buf_bytes
         if not buf:
             return
-        path = Path(tmp_dir) / f"{tag}_{len(chunks)}.jsonl"
+        path = Path(tmp_dir) / f"{tag}_{len(staged)}.jsonl"
         path.write_text("".join(buf), encoding="utf-8")
-        chunks.append(path.as_posix())
-        buf, buf_rows = [], 0
+        staged.append(path.as_posix())
+        buf, buf_bytes = [], 0
 
     for line in lines:
-        stripped = line.strip()
-        if not stripped:
+        if not _line_is_readable(line):
             continue
-        ub = _rows_upper_bound(line)
-        if stripped.endswith("}") and ub <= _CRASH_LIMIT:
-            # Fast path (P-2): a complete object (ends with '}') whose upper bound
-            # is under the crash limit needs no parse — the bound is a safe row
-            # count for chunk sizing. This skips json.loads for the overwhelming
-            # majority of lines on the cold path over a large corpus.
-            rows = ub
-        else:
-            # A partially-written trailing line (won't end in '}') or a batch whose
-            # bound reaches the crash limit: confirm with a real parse, which skips
-            # blank/partial lines and oversize batches with a warning (FR-15).
-            decoded = _decode_line(signal, line)
-            if decoded is None:
-                continue
-            _, rows = decoded
-        if buf and buf_rows + rows > _SAFE_CHUNK:
+        if buf and buf_bytes + len(line) > _STAGE_FILE_BUDGET:
             flush()
         buf.append(line if line.endswith("\n") else line + "\n")
-        buf_rows += rows
+        buf_bytes += len(line)
     flush()
-    return chunks
+    return staged
 
 
-def _chunk_signal(signal: str, telemetry_dir: Path, tmp_dir: str) -> list[str]:
-    """Slice a stream's whole JSONL file(s) into <=_SAFE_CHUNK-row chunk files.
+def _stage_stream(stream: str, telemetry_dir: Path, tmp_dir: str) -> list[str]:
+    """Sanitize a stream's whole JSONL file(s) into staged file(s).
 
     Used by the cold path, which re-reads every matching file. Streams lines
-    from disk (no full-file buffering) and shares the per-line guards via
-    _buffer_to_chunks/_decode_line.
+    from disk (no full-file buffering) and shares the per-line guard via
+    _stage_lines/_line_is_readable.
     """
-    sources = sorted(glob.glob(str(telemetry_dir / SIGNAL_GLOBS[signal])))
+    sources = sorted(glob.glob(str(telemetry_dir / SIGNAL_GLOBS[stream])))
     if not sources:
         return []
 
@@ -391,12 +339,12 @@ def _chunk_signal(signal: str, telemetry_dir: Path, tmp_dir: str) -> list[str]:
             with open(src, encoding="utf-8") as handle:
                 yield from handle
 
-    return _buffer_to_chunks(signal, line_iter(), tmp_dir, signal)
+    return _stage_lines(line_iter(), tmp_dir, stream)
 
 
 def _schema_probe_chunk(telemetry_dir: Path, tmp_dir: str) -> str | None:
-    """Write one small (crash-safe) chunk from whichever stream has data, usable
-    as a typed-schema probe for ANY read_otlp_* reader.
+    """Write one small staged file from whichever stream has data, usable as a
+    typed-schema probe for ANY read_otlp_* reader.
 
     The readers are cross-tolerant: each returns its own fixed typed schema — and
     zero rows — over a batch of any other signal (read_otlp_logs over a traces
@@ -404,7 +352,7 @@ def _schema_probe_chunk(telemetry_dir: Path, tmp_dir: str) -> str | None:
     first stream that has one is enough to seed an empty typed relation for ANY
     absent signal via `read_otlp_<reader>(probe) WHERE false` — drift-free, with
     no embedded schema. Reads at most that first batch — never the whole corpus —
-    so it stays cheap on the hot path. Returns the chunk path, or None when no
+    so it stays cheap on the hot path. Returns the staged path, or None when no
     telemetry is present at all (a truly empty dir, or all raw files rotated
     away)."""
     for stream in CURSOR_STREAMS:
@@ -415,10 +363,10 @@ def _schema_probe_chunk(telemetry_dir: Path, tmp_dir: str) -> str | None:
                 continue
             with handle:
                 for line in handle:
-                    if _decode_line(stream, line) is None:
-                        continue  # blank/partial/oversized — try the next batch
-                    chunks = _buffer_to_chunks(stream, [line], tmp_dir, "schema_probe")
-                    return chunks[0] if chunks else None
+                    if not _line_is_readable(line):
+                        continue  # blank/partial — try the next batch
+                    staged = _stage_lines([line], tmp_dir, "schema_probe")
+                    return staged[0] if staged else None
     return None
 
 
@@ -461,22 +409,23 @@ _EMBEDDED_PROBE_LINE = json.dumps(
 
 
 def _embedded_probe_chunk(tmp_dir: str) -> str | None:
-    """Write the embedded schema-probe sample to a chunk file and return its path.
+    """Write the embedded schema-probe sample to a staged file, return its path.
 
     The schema-source fallback when the telemetry dir offers no readable line of
     its own, so absent relations can be seeded empty even over a truly empty or
     absent directory (FR-1: no "table does not exist" ever)."""
-    chunks = _buffer_to_chunks("metrics", [_EMBEDDED_PROBE_LINE], tmp_dir, "schema_probe")
-    return chunks[0] if chunks else None
+    staged = _stage_lines([_EMBEDDED_PROBE_LINE], tmp_dir, "schema_probe")
+    return staged[0] if staged else None
 
 
-# gauge/sum expose a scalar `value`; histogram/exp_histogram have no scalar
-# value, so the unified `metrics.value` surfaces their `sum` (quoted — it is a
-# column name, not the aggregate). metric_type tags each row by its origin
+# gauge/sum split the scalar reading into int_value/double_value; the unified
+# `metrics.value` coalesces them to one DOUBLE. histogram/exp_histogram have no
+# scalar reading, so `value` surfaces their distribution `sum` (quoted — it is
+# a column name, not the aggregate). metric_type tags each row by its origin
 # sub-relation; the suffixes match the relation names (metrics_<type>).
 _METRIC_VIEW_PARTS: tuple[tuple[str, str, str], ...] = (
-    ("metrics_gauge", "gauge", "value"),
-    ("metrics_sum", "sum", "value"),
+    ("metrics_gauge", "gauge", "coalesce(double_value, CAST(int_value AS DOUBLE))"),
+    ("metrics_sum", "sum", "coalesce(double_value, CAST(int_value AS DOUBLE))"),
     ("metrics_histogram", "histogram", '"sum"'),
     ("metrics_exp_histogram", "exp_histogram", '"sum"'),
 )
@@ -487,8 +436,9 @@ def create_unified_metrics_view(conn: duckdb.DuckDBPyConnection) -> None:
 
     Unions all four per-type sub-relations that are present — gauge, sum,
     histogram, exp_histogram — projecting the common columns plus a `metric_type`
-    discriminator. The unified `value` is each gauge/sum row's `value` and each
-    histogram/exp_histogram row's `sum`. Self-guarding: builds from whichever
+    discriminator. The unified `value` is each gauge/sum row's scalar reading
+    (double_value, else int_value) and each histogram/exp_histogram row's `sum`.
+    Self-guarding: builds from whichever
     sub-relations are present and no-ops when none are. Both the hot and cold
     paths expose all four sub-relations whenever metrics are present (absent
     types seeded empty) and none when metrics are absent, so they produce the
@@ -497,7 +447,7 @@ def create_unified_metrics_view(conn: duckdb.DuckDBPyConnection) -> None:
     """
     have = _existing_relations(conn)
     parts = [
-        f"SELECT timestamp, service_name, metric_name, metric_unit, "
+        f"SELECT time_unix_nano, service_name, name, unit, "
         f"{value} AS value, '{mtype}' AS metric_type FROM {tbl}"
         for tbl, mtype, value in _METRIC_VIEW_PARTS
         if tbl in have
@@ -509,18 +459,17 @@ def create_unified_metrics_view(conn: duckdb.DuckDBPyConnection) -> None:
 def _materialize(
     conn: duckdb.DuckDBPyConnection,
     name: str,
-    reader: str,
-    chunks: list[str],
-    ts_fix: str,
+    signal: str,
+    staged: list[str],
 ) -> None:
-    """Read each chunk with its own read_otlp_* call into one table.
+    """Read each staged file with its own read_otlp_* call into one table.
 
-    Every call sees at most _SAFE_CHUNK rows, so none can trip the extension's
-    2048-row crash. The result is materialised, so the chunk files are no
-    longer needed once this returns.
+    Each call adopts the reader's schema verbatim (_read_select). The result
+    is materialised, so the staged files are no longer needed once this
+    returns.
     """
-    for index, chunk in enumerate(chunks):
-        select = f"SELECT * REPLACE ({ts_fix}) FROM {reader}({_sql_str(chunk)})"
+    for index, path in enumerate(staged):
+        select = _read_select(signal, path)
         if index == 0:
             conn.execute(f"CREATE TABLE {name} AS {select}")
         else:
@@ -651,8 +600,9 @@ def _iso_utc(dt: datetime) -> str:
     (a trailing 'Z'), so the value itself asserts UTC — a naive `str(datetime)`
     (space separator, no offset) is indistinguishable from any other timezone
     and would leave FR-29's "all timestamps are UTC" notice unverifiable from
-    the data alone (FR-16). Millisecond precision (3 decimals, fixed): matches
-    `duration`'s own millisecond granularity (FR-2) and keeps the value
+    the data alone (FR-16). Millisecond precision (3 decimals, fixed): a fixed
+    presentation precision (FR-16 — the stored event-times are ns-exact) that
+    keeps the value
     readable — sub-millisecond digits add width without adding signal an
     agent would act on."""
     return dt.isoformat(timespec="milliseconds") + "Z"
@@ -1013,17 +963,18 @@ def _iter_stream_delta(
 def _build_staging(
     conn: duckdb.DuckDBPyConnection,
     telemetry_dir: Path,
-    stream_chunks: dict[str, list[str]],
+    stream_staged: dict[str, list[str]],
 ) -> set[str]:
     """Create _stage_<signal> = persisted pending parquet UNION this run's delta.
 
-    The pending parquet already holds post-_TS_FIX rows, so it is read as-is;
-    the delta chunks come straight from read_otlp_* and get the timestamp fix.
-    Both arms share a column set, unioned by name. Returns the signals staged.
+    The pending parquet already holds canonical-schema rows, so it is read
+    as-is; the delta files go through the reader with the canonical projection
+    (_read_select). Both arms share a column set, unioned by name. Returns the
+    signals staged.
     """
     staged: set[str] = set()
     for stream in CURSOR_STREAMS:
-        chunks = stream_chunks.get(stream, [])
+        delta = stream_staged.get(stream, [])
         for signal in STREAM_SIGNALS[stream]:
             arms: list[str] = []
             pending = pending_path(telemetry_dir, signal)
@@ -1031,11 +982,8 @@ def _build_staging(
                 arms.append(
                     f"SELECT * FROM read_parquet({_sql_str(pending.as_posix())})"
                 )
-            for chunk in chunks:
-                arms.append(
-                    f"SELECT * REPLACE ({_TS_FIX}) FROM "
-                    f"{SIGNAL_READERS[signal]}({_sql_str(chunk)})"
-                )
+            for path in delta:
+                arms.append(_read_select(signal, path))
             if arms:
                 conn.execute(
                     f"CREATE TABLE _stage_{signal} AS "
@@ -1054,11 +1002,10 @@ def _ingest_and_seal(
     """Read each stream's delta, seal newly-complete minutes, rewrite pending,
     evict stale partitions, and persist the advanced cursor. Caller holds the
     writer lock."""
-    stream_chunks: dict[str, list[str]] = {}
+    stream_staged: dict[str, list[str]] = {}
     for stream in CURSOR_STREAMS:
         new_state: dict[str, FileState] = {}
-        stream_chunks[stream] = _buffer_to_chunks(
-            stream,
+        stream_staged[stream] = _stage_lines(
             _iter_stream_delta(
                 telemetry_dir,
                 stream,
@@ -1070,7 +1017,7 @@ def _ingest_and_seal(
         )
         cursor["streams"][stream]["files"] = new_state
 
-    staged = _build_staging(conn, telemetry_dir, stream_chunks)
+    staged = _build_staging(conn, telemetry_dir, stream_staged)
 
     # Advance each stream watermark to the max event-time ever seen.
     for stream in CURSOR_STREAMS:
@@ -1081,7 +1028,10 @@ def _ingest_and_seal(
         for signal in STREAM_SIGNALS[stream]:
             if signal in staged:
                 hi = _scalar(
-                    conn.execute(f"SELECT max(timestamp) FROM _stage_{signal}")
+                    conn.execute(
+                        f"SELECT max({EVENT_TIME_COLUMNS[signal]}) "
+                        f"FROM _stage_{signal}"
+                    )
                 )
                 if hi is not None:
                     candidates.append(hi)
@@ -1134,8 +1084,9 @@ def _seal_signal(
     return the set of minutes freshly sealed this run."""
     sdir = sealed_dir(telemetry_dir, signal)
     sdir.mkdir(parents=True, exist_ok=True)
+    event_col = EVENT_TIME_COLUMNS[signal]
     minutes = conn.execute(
-        f"SELECT DISTINCT date_trunc('minute', timestamp) AS m "
+        f"SELECT DISTINCT date_trunc('minute', {event_col}) AS m "
         f"FROM _stage_{signal} ORDER BY m"
     ).fetchall()
     sealed: set[datetime] = set()
@@ -1148,7 +1099,7 @@ def _seal_signal(
         tmp = target.with_suffix(target.suffix + _TMP_SUFFIX)
         conn.execute(
             f"COPY (SELECT * FROM _stage_{signal} "
-            f"WHERE date_trunc('minute', timestamp) = TIMESTAMP '{_fmt_ts(m)}') "
+            f"WHERE date_trunc('minute', {event_col}) = TIMESTAMP '{_fmt_ts(m)}') "
             f"TO {_sql_str(tmp.as_posix())} (FORMAT PARQUET)"
         )
         os.replace(tmp, target)
@@ -1171,10 +1122,11 @@ def _rewrite_pending(
     (SPEC FR-5/FR-11/INV-4)."""
     pending = pending_path(telemetry_dir, signal)
     pending.parent.mkdir(parents=True, exist_ok=True)
-    where = f"date_trunc('minute', timestamp) >= TIMESTAMP '{_fmt_ts(hot_floor)}'"
+    event_col = EVENT_TIME_COLUMNS[signal]
+    where = f"date_trunc('minute', {event_col}) >= TIMESTAMP '{_fmt_ts(hot_floor)}'"
     if newly_sealed:
         excl = ", ".join(f"TIMESTAMP '{_fmt_ts(m)}'" for m in sorted(newly_sealed))
-        where += f" AND date_trunc('minute', timestamp) NOT IN ({excl})"
+        where += f" AND date_trunc('minute', {event_col}) NOT IN ({excl})"
     candidate = f"SELECT * FROM _stage_{signal} WHERE {where}"
     # When a candidate minute already has a sealed partition (a genuine late/
     # out-of-order arrival, or a crash that rolled the cursor back and re-read the
@@ -1182,7 +1134,7 @@ def _rewrite_pending(
     # (no duplication — INV-2/EC-11), while a genuinely new late row is kept (so
     # the hot read still equals a full raw re-scan — FR-11/INV-4).
     minutes = conn.execute(
-        f"SELECT DISTINCT date_trunc('minute', timestamp) FROM ({candidate})"
+        f"SELECT DISTINCT date_trunc('minute', {event_col}) FROM ({candidate})"
     ).fetchall()
     overlap = [
         sealed_path(telemetry_dir, signal, m).as_posix()
@@ -1258,8 +1210,8 @@ def _seed_absent_relations(
         return
     for signal in absent:
         conn.execute(
-            f"CREATE TABLE {prefix}{signal} AS SELECT * REPLACE ({_TS_FIX}) "
-            f"FROM {SIGNAL_READERS[signal]}({_sql_str(probe)}) WHERE false"
+            f"CREATE TABLE {prefix}{signal} AS "
+            f"{_read_select(signal, probe)} WHERE false"
         )
         present.add(signal)
 
@@ -1293,7 +1245,7 @@ def _assemble_hot(
             # once from this in _finalize_relations, so a table here would copy the
             # whole hot window twice (parquet -> _all_ -> final). As a view DuckDB
             # does a single lazy parquet scan with the window predicate pushed down
-            # (P-1). max(timestamp) in _finalize uses parquet zone-map stats, not a
+            # (P-1). max(event-time) in _finalize uses parquet zone-map stats, not a
             # full scan. The final relations stay materialised tables, so the reads
             # (and any "a partition vanished mid-query" error) still happen inside
             # build_connection's guarded region, preserving the cold fallback
@@ -1317,7 +1269,9 @@ def _finalize_relations(
         return
     maxes: list[datetime] = []
     for s in present:
-        v = _scalar(conn.execute(f"SELECT max(timestamp) FROM _all_{s}"))
+        v = _scalar(
+            conn.execute(f"SELECT max({EVENT_TIME_COLUMNS[s]}) FROM _all_{s}")
+        )
         if v is not None:
             maxes.append(v)
     now_evt = max(maxes) if maxes else None
@@ -1335,10 +1289,11 @@ def _finalize_relations(
         if lo is None or hi is None:
             conn.execute(f"CREATE TABLE {s} AS SELECT * FROM _all_{s}")
         else:
+            event_col = EVENT_TIME_COLUMNS[s]
             conn.execute(
                 f"CREATE TABLE {s} AS SELECT * FROM _all_{s} "
-                f"WHERE timestamp >= TIMESTAMP '{_fmt_ts(lo)}' "
-                f"AND timestamp <= TIMESTAMP '{_fmt_ts(hi)}'"
+                f"WHERE {event_col} >= TIMESTAMP '{_fmt_ts(lo)}' "
+                f"AND {event_col} <= TIMESTAMP '{_fmt_ts(hi)}'"
             )
     # FR-1 expose-empty: whenever ANY telemetry is present, `present` carries all
     # six base signals — present streams are materialised (cold) or read from
@@ -1391,13 +1346,11 @@ def build_cold(
     the fallback for queries reaching older than the hot window."""
     present: set[str] = set()
     for stream in CURSOR_STREAMS:
-        chunks = _chunk_signal(stream, telemetry_dir, tmp_dir)
-        if not chunks:
+        staged = _stage_stream(stream, telemetry_dir, tmp_dir)
+        if not staged:
             continue
         for signal in STREAM_SIGNALS[stream]:
-            _materialize(
-                conn, f"_all_{signal}", SIGNAL_READERS[signal], chunks, _TS_FIX
-            )
+            _materialize(conn, f"_all_{signal}", signal, staged)
             present.add(signal)
     _seed_absent_relations(conn, telemetry_dir, tmp_dir, present, "_all_")
     _finalize_relations(conn, present, window)
@@ -1416,11 +1369,11 @@ def connect(telemetry_dir: Path) -> duckdb.DuckDBPyConnection:
     with tempfile.TemporaryDirectory(prefix="otelq-") as tmp_dir:
         present: set[str] = set()
         for stream in CURSOR_STREAMS:
-            chunks = _chunk_signal(stream, telemetry_dir, tmp_dir)
-            if not chunks:
+            staged = _stage_stream(stream, telemetry_dir, tmp_dir)
+            if not staged:
                 continue
             for signal in STREAM_SIGNALS[stream]:
-                _materialize(conn, signal, SIGNAL_READERS[signal], chunks, _TS_FIX)
+                _materialize(conn, signal, signal, staged)
                 present.add(signal)
         # Expose-empty (FR-1): seed every absent signal empty so all documented
         # relations resolve, even over an empty/absent dir (embedded probe).
@@ -1583,7 +1536,8 @@ def _result_time_range(
         placeholders = ",".join("?" * len(span_ids))
         lo, hi = _one_row(
             conn.execute(
-                f"SELECT min(timestamp), max(timestamp) FROM traces "
+                f"SELECT min(start_time_unix_nano), max(start_time_unix_nano) "
+                f"FROM traces "
                 f"WHERE span_id IN ({placeholders})",
                 span_ids,
             )
@@ -1867,11 +1821,21 @@ _LOG_LEVELS: tuple[tuple[str, int, int], ...] = (
     ("ERROR", 17, 20),
     ("FATAL", 21, 24),
 )
-_TRACE_SLOW_MS = 1000  # 1s in milliseconds; the >1s / =<1s span split. The
-# duckdb-otlp extension reports `duration` in integer milliseconds (sub-ms spans
-# truncate to 0), NOT nanoseconds — so the threshold and duration_ms below are ms.
-# Per-subset aggregates every summary row carries (count, span, distinct services).
-_SUMMARY_AGG = "count(*), min(timestamp), max(timestamp), count(DISTINCT service_name)"
+_TRACE_SLOW_NS = 1_000_000_000  # 1s in nanoseconds; the >1s / =<1s span split
+# (duration_time_unix_nano is integer nanoseconds — ADR-010 native schema).
+# The ns→ms divisor for the presented duration_ms output column.
+_NS_PER_MS = 1_000_000
+
+
+def _summary_agg(event_col: str) -> str:
+    """Per-subset aggregates every summary row carries (count, span, distinct
+    services), keyed on the relation's own event-time column (ADR-010)."""
+    return (
+        f"count(*), min({event_col}), max({event_col}), "
+        f"count(DISTINCT service_name)"
+    )
+
+
 _SUMMARY_ZERO = (0, None, None, 0)  # a bucket/level present but with no records
 # The four metric types `summary` breaks metrics into (the suffixes of the
 # metrics_<type> relations). All four rows appear when metrics are present, zeros
@@ -1914,11 +1878,15 @@ def _limited(
 
 def _summary_traces(conn: duckdb.DuckDBPyConnection) -> list[Row]:
     """Two duration buckets; both rows present even when one is empty (FR-3)."""
-    bucket = f"CASE WHEN duration > {_TRACE_SLOW_MS} THEN '>1s' ELSE '=<1s' END"
+    bucket = (
+        f"CASE WHEN duration_time_unix_nano > {_TRACE_SLOW_NS} "
+        f"THEN '>1s' ELSE '=<1s' END"
+    )
     got = {
         r[0]: r[1:]
         for r in conn.execute(
-            f"SELECT {bucket} AS b, {_SUMMARY_AGG} FROM traces GROUP BY b"
+            f"SELECT {bucket} AS b, {_summary_agg('start_time_unix_nano')} "
+            f"FROM traces GROUP BY b"
         ).fetchall()
     }
     return [("traces", b, *got.get(b, _SUMMARY_ZERO)) for b in (">1s", "=<1s")]
@@ -1936,7 +1904,8 @@ def _summary_logs(conn: duckdb.DuckDBPyConnection) -> list[Row]:
     got = {
         r[0]: r[1:]
         for r in conn.execute(
-            f"SELECT {level} AS lvl, {_SUMMARY_AGG} FROM logs GROUP BY lvl"
+            f"SELECT {level} AS lvl, {_summary_agg('time_unix_nano')} "
+            f"FROM logs GROUP BY lvl"
         ).fetchall()
     }
     rows: list[Row] = [
@@ -1953,7 +1922,8 @@ def _summary_metrics(conn: duckdb.DuckDBPyConnection) -> list[Row]:
     got = {
         r[0]: r[1:]
         for r in conn.execute(
-            f"SELECT metric_type AS t, {_SUMMARY_AGG} FROM metrics GROUP BY t"
+            f"SELECT metric_type AS t, {_summary_agg('time_unix_nano')} "
+            f"FROM metrics GROUP BY t"
         ).fetchall()
     }
     return [
@@ -2075,15 +2045,15 @@ def cmd_errors(
     arms: list[str] = []
     if _has_rows(conn, "traces"):
         arms.append(
-            "SELECT 'span' AS kind, timestamp, service_name, "
-            "span_name AS label, status_message AS detail, trace_id "
-            "FROM traces WHERE status_code = 2"
+            "SELECT 'span' AS kind, start_time_unix_nano AS timestamp, "
+            "service_name, name AS label, status_status_message AS detail, "
+            "trace_id FROM traces WHERE status_code = 2"
         )
     if _has_rows(conn, "logs"):
         # FR-4: match case-insensitively. severity_text carries inconsistent
         # casing in practice (e.g. "Error"), so fold before comparing (cf. FR-2).
         arms.append(
-            "SELECT 'log' AS kind, timestamp, service_name, "
+            "SELECT 'log' AS kind, time_unix_nano AS timestamp, service_name, "
             "severity_text AS label, body AS detail, trace_id "
             "FROM logs WHERE upper(severity_text) IN ('ERROR', 'FATAL')"
         )
@@ -2108,14 +2078,16 @@ def cmd_slow(
     columns = ["timestamp", "service_name", "span_name", "duration_ms", "trace_id"]
     rows = _limited(
         conn,
-        # FR-5 orders by duration desc; the trailing keys (all output columns, so
-        # they exist on every traces relation) are a deterministic tie-breaker so
+        # FR-5 orders by duration desc; the trailing keys (all present on every
+        # traces relation) are a deterministic tie-breaker so
         # equal-duration spans — and which ones the LIMIT keeps — match on the hot
         # (parquet) and cold (raw) paths — byte-identical cached vs --no-cache.
-        "SELECT timestamp, service_name, span_name, "
-        "duration AS duration_ms, trace_id "
-        "FROM traces "
-        "ORDER BY duration DESC, timestamp DESC, trace_id, service_name, span_name",
+        f"SELECT start_time_unix_nano AS timestamp, service_name, "
+        f"name AS span_name, "
+        f"duration_time_unix_nano // {_NS_PER_MS} AS duration_ms, trace_id "
+        f"FROM traces "
+        f"ORDER BY duration_time_unix_nano DESC, start_time_unix_nano DESC, "
+        f"trace_id, service_name, name",
         [],
         args.top,
     )
@@ -2161,9 +2133,10 @@ def cmd_trace(
     _require(conn, "traces")
     trace_id = _resolve_trace_id(conn, args.trace_id)
     spans = conn.execute(
-        "SELECT span_id, parent_span_id, span_name, service_name, "
-        "duration, status_code, timestamp "
-        "FROM traces WHERE trace_id = ? ORDER BY timestamp",
+        f"SELECT span_id, parent_span_id, name AS span_name, service_name, "
+        f"duration_time_unix_nano // {_NS_PER_MS} AS duration_ms, status_code, "
+        f"start_time_unix_nano AS timestamp "
+        f"FROM traces WHERE trace_id = ? ORDER BY start_time_unix_nano",
         [trace_id],
     ).fetchall()
     if not spans:
@@ -2225,9 +2198,11 @@ def cmd_logs(
         # FR-7 orders newest-first; the trailing keys are a deterministic
         # tie-breaker so rows sharing a timestamp render in the same order on the
         # hot (parquet) and cold (raw) paths — byte-identical cached vs --no-cache.
-        f"SELECT timestamp, service_name, severity_text, body, trace_id "
+        f"SELECT time_unix_nano AS timestamp, service_name, severity_text, "
+        f"body, trace_id "
         f"FROM logs{clause} "
-        f"ORDER BY timestamp DESC, service_name, severity_text, body, trace_id",
+        f"ORDER BY time_unix_nano DESC, service_name, severity_text, body, "
+        f"trace_id",
         params,
         getattr(args, "top", _DEFAULT_TOP),
     )
@@ -2248,13 +2223,14 @@ def cmd_metric(
     ]
     rows = _limited(
         conn,
-        # FR-8 orders ascending by timestamp; the trailing keys are a
-        # deterministic tie-breaker (metric_name is filtered to a constant) so
+        # FR-8 orders ascending by event-time; the trailing keys are a
+        # deterministic tie-breaker (name is filtered to a constant) so
         # equal-timestamp points render in the same order on the hot (parquet)
         # and cold (raw) paths — byte-identical cached vs --no-cache.
-        "SELECT timestamp, service_name, metric_name, metric_type, value, "
-        "metric_unit FROM metrics WHERE metric_name = ? "
-        "ORDER BY timestamp, service_name, value, metric_type, metric_unit",
+        "SELECT time_unix_nano AS timestamp, service_name, "
+        "name AS metric_name, metric_type, value, "
+        "unit AS metric_unit FROM metrics WHERE name = ? "
+        "ORDER BY time_unix_nano, service_name, value, metric_type, unit",
         [args.name],
         getattr(args, "top", _DEFAULT_TOP),
     )
@@ -2587,26 +2563,32 @@ def build_parser() -> argparse.ArgumentParser:
                                regex) or collector-config/doctor/troubleshoot.
 
             sql views (for `otelq sql "<query>"`):
-              data model: below is a curated subset. Explore the full live
+              data model: the duckdb-otlp v0.6.0 reader schema, adopted
+              verbatim (see the duckdb-otlp project docs for full semantics).
+              Below is a curated subset. Explore the full live
               schema with standard DuckDB introspection, e.g.
               sql "DESCRIBE traces" or sql "PRAGMA table_info('logs')" — it
               reveals extra columns (span_attributes/log_attributes/
               metric_attributes, resource_attributes, scope_attributes, ...)
               carrying whatever custom OTel tags an app actually emits.
-              traces   timestamp, duration (ms), trace_id, span_id, parent_span_id,
-                       service_name, span_name, span_kind,
-                       status_code (0=unset,1=ok,2=error), status_message
-              logs     timestamp, trace_id, service_name, severity_text,
-                       severity_number, body
-              metrics  timestamp, service_name, metric_name, metric_type, value,
-                       metric_unit  (metric_type: gauge|sum|histogram|exp_histogram;
-                       value = the value of gauge/sum, the sum of histogram/exp)
+              traces   start_time_unix_nano (event-time),
+                       duration_time_unix_nano (ns), trace_id, span_id,
+                       parent_span_id, service_name, name (span name), kind,
+                       status_code (0=unset,1=ok,2=error), status_status_message
+              logs     time_unix_nano (event-time), trace_id, service_name,
+                       severity_text, severity_number, body
+              metrics  time_unix_nano (event-time), service_name, name,
+                       metric_type, value, unit
+                       (metric_type: gauge|sum|histogram|exp_histogram;
+                       value = gauge/sum's double_value else int_value,
+                       the sum of histogram/exp)
               per-type metric relations (metrics unions whichever are present):
-                metrics_gauge, metrics_sum               value
+                metrics_gauge, metrics_sum               int_value, double_value
                 metrics_histogram, metrics_exp_histogram  count, sum, min, max
                        (+ bucket_counts/explicit_bounds, or scale/zero_count/…)
               (the OTel Summary metric type is unsupported by the reader extension)
-              timestamp columns are naive UTC — see "timestamps" above for the
+              *_unix_nano event-time columns are naive UTC TIMESTAMP_NS — see
+              "timestamps" above for the
               literal convention when filtering on them.
               the built-in commands read only the telemetry under --dir. `sql`
               is an escape hatch that runs with YOUR user's file access (it can

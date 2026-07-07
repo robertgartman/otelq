@@ -44,7 +44,7 @@ semantic_tags:
 ## Context
 
 `otelq` answers a query by parsing OTLP JSONL through the `duckdb-otlp` reader
-([ADR-006](../adr/ADR-006-read-otlp-extension-quirks.md)). The reader cannot tail,
+([ADR-006](ADR-006-read-otlp-extension-quirks.md)). The reader cannot tail,
 follow, or seek a file; every invocation re-parses whole files from byte zero.
 For the dev workflow — repeated, narrow, recent-window queries against a
 `.telemetry/` corpus that only grows ([ADR-004](../adr/ADR-004-collector-in-docker-bind-mount.md))
@@ -109,7 +109,7 @@ The mechanics (rationale here; the binding contract is the SPEC) are:
   source of truth. This option is deferred, not foreclosed.
 - **Tailing or watching the raw files to ingest incrementally in real time.**
   Rejected: the `duckdb-otlp` reader cannot follow or seek a file
-  ([ADR-006](../adr/ADR-006-read-otlp-extension-quirks.md)), so there is no supported
+  ([ADR-006](ADR-006-read-otlp-extension-quirks.md)), so there is no supported
   way to consume an append stream live. The cursor's byte-offset approach is the
   available substitute and runs per invocation, not continuously.
 

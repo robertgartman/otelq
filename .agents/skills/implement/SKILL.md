@@ -98,7 +98,7 @@ This step is well suited to fan out on parallel agents.
 
 Validate the implementation against the test cases:
 
-1. **Run the relevant test suite** created in Step 5. Prefer `just otelq-test` for the full suite; use a focused `uv run --with pytest --with "duckdb==1.5.3" pytest <path> -v` command while iterating when useful.
+1. **Run the relevant test suite** created in Step 5. Prefer `just otelq-test` for the full suite; use a focused `uv run --with pytest --with "duckdb==1.5.4" pytest <path> -v` command while iterating when useful.
 2. **Verify all tests pass** — implementation satisfies requirements.
 3. **Check coverage** — ensure critical paths are tested.
 4. **Fix any failures** — iterate until tests pass.

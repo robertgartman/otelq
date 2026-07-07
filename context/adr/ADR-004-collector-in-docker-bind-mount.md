@@ -49,7 +49,7 @@ The constraints that force the shape of this Collector are not free design
 choices — they are dictated by the downstream reader (`duckdb-otlp`, the
 smithclay OTLP community extension; see
 [ADR-003](ADR-003-duckdb-otlp-extension-pin-governance.md) and
-[ADR-006](ADR-006-read-otlp-extension-quirks.md)) and by the need to keep a
+[ADR-006](../archive/ADR-006-read-otlp-extension-quirks.md)) and by the need to keep a
 dev-only collector cheap, off-by-default, and observable without any extra
 tooling.
 
@@ -122,7 +122,7 @@ application emitted.
   `.telemetry/`; it is opted into only when needed.
 - **A non-stock, locally patched image to work around reader quirks.** Rejected:
   the `duckdb-otlp` quirks are mitigated **client-side** in `otelq`
-  ([ADR-006](ADR-006-read-otlp-extension-quirks.md)), leaving the Collector
+  ([ADR-006](../archive/ADR-006-read-otlp-extension-quirks.md)), leaving the Collector
   image stock and replaceable.
 
 ## Consequences

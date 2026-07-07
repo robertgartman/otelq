@@ -26,68 +26,67 @@ def synth_conn() -> duckdb.DuckDBPyConnection:
     conn.execute(
         """
         CREATE TABLE traces (
-            timestamp TIMESTAMP_MS, end_timestamp BIGINT, duration BIGINT,
+            start_time_unix_nano TIMESTAMP_NS, duration_time_unix_nano BIGINT,
             trace_id VARCHAR, span_id VARCHAR, parent_span_id VARCHAR,
             trace_state VARCHAR, service_name VARCHAR, service_namespace VARCHAR,
-            service_instance_id VARCHAR, span_name VARCHAR, span_kind INTEGER,
-            status_code INTEGER, status_message VARCHAR, resource_attributes VARCHAR,
-            scope_name VARCHAR, scope_version VARCHAR, scope_attributes VARCHAR,
-            span_attributes VARCHAR, events_json VARCHAR, links_json VARCHAR,
+            service_instance_id VARCHAR, name VARCHAR, kind INTEGER,
+            status_code INTEGER, status_status_message VARCHAR,
+            resource_attributes VARCHAR, scope_name VARCHAR, scope_version VARCHAR,
+            scope_attributes VARCHAR, span_attributes VARCHAR, events_json VARCHAR, links_json VARCHAR,
             dropped_attributes_count INTEGER, dropped_events_count INTEGER,
             dropped_links_count INTEGER, flags INTEGER);
-        -- duration is integer milliseconds (extension unit): 5 / 90 / 12 ms.
+        -- duration_time_unix_nano is nanoseconds: 5 / 90 / 12 ms.
         INSERT INTO traces VALUES
-          ('2026-05-22 10:00:00',0,5,'trace-a','span-a1','','','checkout-api',
+          ('2026-05-22 10:00:00',5000000,'trace-a','span-a1','','','checkout-api',
            '','','GET /orders',2,1,'','','','','','','','',0,0,0,0),
-          ('2026-05-22 10:00:01',0,90,'trace-a','span-a2','span-a1','',
+          ('2026-05-22 10:00:01',90000000,'trace-a','span-a2','span-a1','',
            'checkout-api','','','SELECT orders',3,1,'','','','','','','','',0,0,0,0),
-          ('2026-05-22 10:00:02',0,12,'trace-b','span-b1','','','catalog-api',
+          ('2026-05-22 10:00:02',12000000,'trace-b','span-b1','','','catalog-api',
            '','','POST /products',2,2,'boom','','','','','','','',0,0,0,0);
         """
     )
     conn.execute(
         """
         CREATE TABLE logs (
-            timestamp TIMESTAMP_MS, observed_timestamp BIGINT, trace_id VARCHAR,
+            time_unix_nano TIMESTAMP_NS, observed_time_unix_nano TIMESTAMP_NS, trace_id VARCHAR,
             span_id VARCHAR, service_name VARCHAR, service_namespace VARCHAR,
             service_instance_id VARCHAR, severity_number INTEGER, severity_text VARCHAR,
-            body VARCHAR, resource_attributes VARCHAR, scope_name VARCHAR,
-            scope_version VARCHAR, scope_attributes VARCHAR, log_attributes VARCHAR);
+            event_name VARCHAR, body VARCHAR, resource_attributes VARCHAR, scope_name VARCHAR,
+            scope_version VARCHAR, scope_attributes VARCHAR, log_attributes VARCHAR,
+            dropped_attributes_count INTEGER, flags INTEGER);
         INSERT INTO logs VALUES
-          ('2026-05-22 10:00:00',0,'trace-a','span-a1','checkout-api','','',9,
-           'INFO','order received','','','','',''),
-          ('2026-05-22 10:00:02',0,'trace-b','span-b1','catalog-api','','',17,
-           'ERROR','product save failed','','','','','');
+          ('2026-05-22 10:00:00','2026-05-22 10:00:00','trace-a','span-a1','checkout-api','','',9,
+           'INFO','','order received','','','','','',0,0),
+          ('2026-05-22 10:00:02','2026-05-22 10:00:02','trace-b','span-b1','catalog-api','','',17,
+           'ERROR','','product save failed','','','','','',0,0);
         """
     )
     conn.execute(
         """
         CREATE TABLE metrics_gauge (
-            timestamp TIMESTAMP_MS, start_timestamp BIGINT, metric_name VARCHAR,
-            metric_description VARCHAR, metric_unit VARCHAR, value DOUBLE,
+            time_unix_nano TIMESTAMP_NS, start_time_unix_nano TIMESTAMP_NS, name VARCHAR,
+            description VARCHAR, unit VARCHAR, int_value BIGINT, double_value DOUBLE,
             service_name VARCHAR, service_namespace VARCHAR, service_instance_id VARCHAR,
             resource_attributes VARCHAR, scope_name VARCHAR, scope_version VARCHAR,
-            scope_attributes VARCHAR, metric_attributes VARCHAR, flags INTEGER,
-            exemplars_json VARCHAR);
+            scope_attributes VARCHAR, metric_attributes VARCHAR, flags INTEGER, exemplars_json VARCHAR);
         INSERT INTO metrics_gauge VALUES
-          ('2026-05-22 10:00:00',0,'db.pool.in_use','','{connections}',4,
+          ('2026-05-22 10:00:00','2026-05-22 10:00:00','db.pool.in_use','','{connections}',NULL,4,
            'checkout-api','','','','','','','',0,''),
-          ('2026-05-22 10:00:05',0,'db.pool.in_use','','{connections}',7,
+          ('2026-05-22 10:00:05','2026-05-22 10:00:05','db.pool.in_use','','{connections}',NULL,7,
            'checkout-api','','','','','','','',0,'');
         """
     )
     conn.execute(
         """
         CREATE TABLE metrics_sum (
-            timestamp TIMESTAMP_MS, start_timestamp BIGINT, metric_name VARCHAR,
-            metric_description VARCHAR, metric_unit VARCHAR, value DOUBLE,
+            time_unix_nano TIMESTAMP_NS, start_time_unix_nano TIMESTAMP_NS, name VARCHAR,
+            description VARCHAR, unit VARCHAR, int_value BIGINT, double_value DOUBLE,
             service_name VARCHAR, service_namespace VARCHAR, service_instance_id VARCHAR,
             resource_attributes VARCHAR, scope_name VARCHAR, scope_version VARCHAR,
             scope_attributes VARCHAR, metric_attributes VARCHAR, flags INTEGER,
-            exemplars_json VARCHAR, aggregation_temporality INTEGER,
-            is_monotonic BOOLEAN);
+            exemplars_json VARCHAR, aggregation_temporality INTEGER, is_monotonic BOOLEAN);
         INSERT INTO metrics_sum VALUES
-          ('2026-05-22 10:00:00',0,'http.server.requests','','{requests}',42,
+          ('2026-05-22 10:00:00','2026-05-22 10:00:00','http.server.requests','','{requests}',NULL,42,
            'checkout-api','','','','','','','',0,'',2,true);
         """
     )
@@ -96,15 +95,15 @@ def synth_conn() -> duckdb.DuckDBPyConnection:
     conn.execute(
         """
         CREATE TABLE metrics_histogram (
-            timestamp TIMESTAMP_MS, start_timestamp BIGINT, metric_name VARCHAR,
-            metric_description VARCHAR, metric_unit VARCHAR, count BIGINT, sum DOUBLE,
-            min DOUBLE, max DOUBLE, bucket_counts VARCHAR, explicit_bounds VARCHAR,
+            time_unix_nano TIMESTAMP_NS, start_time_unix_nano TIMESTAMP_NS, name VARCHAR,
+            description VARCHAR, unit VARCHAR, count BIGINT, sum DOUBLE,
+            min DOUBLE, max DOUBLE, bucket_counts BIGINT[], explicit_bounds DOUBLE[],
             service_name VARCHAR, service_namespace VARCHAR, service_instance_id VARCHAR,
             resource_attributes VARCHAR, scope_name VARCHAR, scope_version VARCHAR,
             scope_attributes VARCHAR, metric_attributes VARCHAR, flags INTEGER,
             exemplars_json VARCHAR, aggregation_temporality INTEGER);
         INSERT INTO metrics_histogram
-          (timestamp, metric_name, metric_unit, count, sum, min, max, service_name,
+          (time_unix_nano, name, unit, count, sum, min, max, service_name,
            aggregation_temporality)
         VALUES
           ('2026-05-22 10:00:00','http.server.duration','ms',10,123.5,1.0,50.0,
@@ -114,18 +113,18 @@ def synth_conn() -> duckdb.DuckDBPyConnection:
     conn.execute(
         """
         CREATE TABLE metrics_exp_histogram (
-            timestamp TIMESTAMP_MS, start_timestamp BIGINT, metric_name VARCHAR,
-            metric_description VARCHAR, metric_unit VARCHAR, count BIGINT, sum DOUBLE,
+            time_unix_nano TIMESTAMP_NS, start_time_unix_nano TIMESTAMP_NS, name VARCHAR,
+            description VARCHAR, unit VARCHAR, count BIGINT, sum DOUBLE,
             min DOUBLE, max DOUBLE, scale INTEGER, zero_count BIGINT,
             zero_threshold DOUBLE, positive_offset INTEGER,
-            positive_bucket_counts VARCHAR, negative_offset INTEGER,
-            negative_bucket_counts VARCHAR, service_name VARCHAR,
+            positive_bucket_counts BIGINT[], negative_offset INTEGER,
+            negative_bucket_counts BIGINT[], service_name VARCHAR,
             service_namespace VARCHAR, service_instance_id VARCHAR,
             resource_attributes VARCHAR, scope_name VARCHAR, scope_version VARCHAR,
             scope_attributes VARCHAR, metric_attributes VARCHAR, flags INTEGER,
             exemplars_json VARCHAR, aggregation_temporality INTEGER);
         INSERT INTO metrics_exp_histogram
-          (timestamp, metric_name, metric_unit, count, sum, min, max, scale,
+          (time_unix_nano, name, unit, count, sum, min, max, scale,
            zero_count, service_name, aggregation_temporality)
         VALUES
           ('2026-05-22 10:00:01','rpc.server.duration','ms',5,42.0,2.0,20.0,2,0,
@@ -159,28 +158,34 @@ def _summary_conn(
     with_metrics: bool = False,
 ) -> duckdb.DuckDBPyConnection:
     """Minimal in-memory conn for summary tests: only the columns cmd_summary
-    reads (traces.duration, logs.severity_number, the metrics view)."""
+    reads (trace duration, log severity, the metrics view)."""
     conn = duckdb.connect(":memory:")
     if traces is not None:
         conn.execute(
             "CREATE TABLE traces "
-            "(timestamp TIMESTAMP_MS, duration BIGINT, service_name VARCHAR)"
+            "(start_time_unix_nano TIMESTAMP_NS, duration_time_unix_nano BIGINT, "
+            "service_name VARCHAR)"
         )
         if traces:
-            conn.executemany("INSERT INTO traces VALUES (?, ?, ?)", traces)
+            rows = [(ts, duration * 1_000_000, service) for ts, duration, service in traces]
+            conn.executemany("INSERT INTO traces VALUES (?, ?, ?)", rows)
     if logs is not None:
         conn.execute(
-            "CREATE TABLE logs (timestamp TIMESTAMP_MS, severity_number INTEGER, "
+            "CREATE TABLE logs (time_unix_nano TIMESTAMP_NS, severity_number INTEGER, "
             "severity_text VARCHAR, service_name VARCHAR)"
         )
         if logs:
             conn.executemany("INSERT INTO logs VALUES (?, ?, ?, ?)", logs)
     if with_metrics:
         conn.execute(
-            "CREATE TABLE metrics_gauge (timestamp TIMESTAMP_MS, service_name VARCHAR, "
-            "metric_name VARCHAR, metric_unit VARCHAR, value DOUBLE)"
+            "CREATE TABLE metrics_gauge (time_unix_nano TIMESTAMP_NS, "
+            "service_name VARCHAR, name VARCHAR, unit VARCHAR, int_value BIGINT, "
+            "double_value DOUBLE)"
         )
-        conn.execute("INSERT INTO metrics_gauge VALUES ('2026-05-22 10:00:00','svc','m','1',1.0)")
+        conn.execute(
+            "INSERT INTO metrics_gauge VALUES "
+            "('2026-05-22 10:00:00','svc','m','1',NULL,1.0)"
+        )
         otelq.create_unified_metrics_view(conn)
     return conn
 
@@ -303,12 +308,12 @@ def test_all_relations_resolve_and_metric_types(
         assert cols, f"{rel} did not resolve"
     cols, _ = otelq.cmd_sql(synth_conn, Namespace(query="SELECT * FROM metrics LIMIT 1"))
     assert {
-        "timestamp",
+        "time_unix_nano",
         "service_name",
-        "metric_name",
+        "name",
         "metric_type",
         "value",
-        "metric_unit",
+        "unit",
     } <= set(cols)
     _c, rows = otelq.cmd_sql(
         synth_conn, Namespace(query="SELECT DISTINCT metric_type FROM metrics")
@@ -355,7 +360,7 @@ def test_errors_matches_mixed_case_severity_text() -> None:
     # filter silently dropped them.
     conn = duckdb.connect(":memory:")
     conn.execute(
-        "CREATE TABLE logs (timestamp TIMESTAMP_MS, trace_id VARCHAR, "
+        "CREATE TABLE logs (time_unix_nano TIMESTAMP_NS, trace_id VARCHAR, "
         "service_name VARCHAR, severity_text VARCHAR, severity_number INTEGER, "
         "body VARCHAR)"
     )
@@ -378,20 +383,19 @@ def test_slow_orders_by_duration_desc(
     assert rows[0][3] >= rows[1][3]  # duration_ms descending
 
 
-def test_slow_and_summary_use_millisecond_duration() -> None:
-    # FR-3/FR-5 regression: the duckdb-otlp extension reports duration in ms.
-    # A 2000 ms span must land in the ">1s" bucket and show as 2000 ms in `slow`.
-    # The old code treated duration as ns: it never crossed the 1e9 threshold
-    # (so ">1s" was always empty) and divided by 1e6 (so `slow` showed 0.0 ms).
+def test_slow_and_summary_use_nanosecond_duration() -> None:
+    # FR-3/FR-5 regression: the native reader reports duration in ns.
+    # A 2s span must land in the ">1s" bucket and show as 2000 ms in `slow`.
     conn = duckdb.connect(":memory:")
     conn.execute(
-        "CREATE TABLE traces (timestamp TIMESTAMP_MS, duration BIGINT, "
-        "service_name VARCHAR, span_name VARCHAR, trace_id VARCHAR)"
+        "CREATE TABLE traces (start_time_unix_nano TIMESTAMP_NS, "
+        "duration_time_unix_nano BIGINT, service_name VARCHAR, "
+        "name VARCHAR, trace_id VARCHAR)"
     )
     conn.execute(
         "INSERT INTO traces VALUES "
-        "('2026-05-22 10:00:00',2000,'app','slow-op','t1'),"  # 2s  -> >1s
-        "('2026-05-22 10:00:01',12,'app','fast-op','t2')"     # 12ms -> =<1s
+        "('2026-05-22 10:00:00',2000000000,'app','slow-op','t1'),"  # 2s
+        "('2026-05-22 10:00:01',12000000,'app','fast-op','t2')"     # 12ms
     )
     summary = {(r[0], r[1]): r[2] for r in otelq.cmd_summary(conn, Namespace())[1]}
     assert summary[("traces", ">1s")] == 1
@@ -436,7 +440,7 @@ def test_logs_filter_by_level_mixed_case_text() -> None:
     # missed these because only the input was folded, not the column.
     conn = duckdb.connect(":memory:")
     conn.execute(
-        "CREATE TABLE logs (timestamp TIMESTAMP_MS, trace_id VARCHAR, "
+        "CREATE TABLE logs (time_unix_nano TIMESTAMP_NS, trace_id VARCHAR, "
         "service_name VARCHAR, severity_text VARCHAR, severity_number INTEGER, "
         "body VARCHAR)"
     )
@@ -467,15 +471,15 @@ def test_metric_returns_time_series(
     assert [r[4] for r in rows] == [4.0, 7.0]  # value column, time-ordered
 
 
-def test_integration_timestamps_are_scaled() -> None:
-    """Timestamps from real Collector output must be in 2026, not year ~58358.
+def test_integration_event_times_are_sensible_datetimes() -> None:
+    """Timestamps from real Collector output must be sensible datetimes.
 
-    The duckdb-otlp extension stores nanoseconds in a TIMESTAMP_MS column;
-    without the divide-by-1000 correction every timestamp renders as ~year 58358.
-    This test uses the real fixture to guard that register_views applies the fix.
+    Guards the native duckdb-otlp reader schema: `start_time_unix_nano` must
+    land as a sane wall-clock TIMESTAMP_NS. This test uses the real fixture end
+    to end through connect().
     """
     conn = otelq.connect(TESTDATA)
-    row = conn.execute("SELECT min(timestamp) FROM traces").fetchone()
+    row = conn.execute("SELECT min(start_time_unix_nano) FROM traces").fetchone()
     assert row is not None
     assert row[0].year == 2026
 
@@ -825,7 +829,7 @@ def test_fabricated_corpus_roundtrips(temp_telemetry: Path) -> None:
     for r in otelq.cmd_summary(conn, Namespace())[1]:  # sum the per-signal breakdown
         by[r[0]] = by.get(r[0], 0) + r[2]
     assert by == {"traces": 1, "logs": 1, "metrics": 4}  # one of each metric type
-    row = conn.execute("SELECT min(timestamp) FROM traces").fetchone()
+    row = conn.execute("SELECT min(start_time_unix_nano) FROM traces").fetchone()
     assert row is not None
     assert row[0].year == 2026
 
@@ -1329,14 +1333,15 @@ def test_ac14_version_mismatch_self_heals(temp_telemetry: Path) -> None:
     assert _signal_count(temp_telemetry, "traces", "summary") == 6
 
 
-# --- AC-15 / FR-15 / EC-4, EC-5: partial line + oversized batch are skipped ----
+# --- AC-15 / FR-15 / EC-4, EC-5: partial line skipped, large batch fully read --
 
 
 def test_ac15_robust_tail_parsing(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     traces = temp_telemetry / "traces.jsonl"
     write_jsonl(traces, _minutes_per_minute(base, 5))  # 5 valid spans
-    # one indivisible batch of 2049 spans (exceeds the read_otlp 2048 limit)
+    # one indivisible batch of 2049 spans — larger than the old extension's
+    # 2048-row crash threshold; must now be fully read (ADR-010)
     big = {
         "resourceSpans": [
             {
@@ -1358,8 +1363,8 @@ def test_ac15_robust_tail_parsing(temp_telemetry: Path) -> None:
         fh.write(_json.dumps(big) + "\n")
         fh.write('{"resourceSpans": [ {"partial"')  # truncated trailing line
     out, err = _run_both(temp_telemetry, "--all", "summary")
-    assert _sum_signal(out) == 5  # only the valid spans
-    assert "exceeds the 2048-row" in err  # oversized batch warned + skipped
+    assert _sum_signal(out) == 2054  # 5 valid + 2049 from the big batch
+    assert "exceeds" not in err  # no size-based skip warning anymore
 
 
 # --- AC-18 / INV-6: raw files are never modified ------------------------------
@@ -1603,7 +1608,7 @@ def test_require_names_missing_signal_when_others_present() -> None:
     conn = duckdb.connect(":memory:")
     # traces has DATA (a row), no logs at all. "Present" = has rows, not mere
     # table existence (every relation can now be seeded empty), so insert a row.
-    conn.execute("CREATE TABLE traces(timestamp TIMESTAMP)")
+    conn.execute("CREATE TABLE traces(start_time_unix_nano TIMESTAMP_NS)")
     conn.execute("INSERT INTO traces VALUES (TIMESTAMP '2026-05-22 10:00:00')")
     with pytest.raises(otelq.NoTelemetryError) as exc:
         otelq.cmd_logs(conn, Namespace(service=None, level=None, grep=None))
@@ -1624,7 +1629,7 @@ def test_errors_names_gap_when_only_metrics_present() -> None:
     conn = duckdb.connect(":memory:")
     # metrics has DATA (a row), no traces/logs. "Present" = has rows (FR-19), so
     # insert a row rather than relying on an empty table as a presence proxy.
-    conn.execute("CREATE TABLE metrics(timestamp TIMESTAMP)")
+    conn.execute("CREATE TABLE metrics(time_unix_nano TIMESTAMP_NS)")
     conn.execute("INSERT INTO metrics VALUES (TIMESTAMP '2026-05-22 10:00:00')")
     with pytest.raises(otelq.NoTelemetryError) as exc:
         otelq.cmd_errors(conn, Namespace())
@@ -2367,13 +2372,10 @@ def test_ac61_generated_session_ids_are_unique_per_invocation(
 
 
 def test_ac43_sql_timestamp_literal_utc_convention(temp_telemetry: Path) -> None:
-    # FR-30/EC-24: timestamp columns are naive UTC. A bare or Z-suffixed
-    # literal must match a known-UTC record; a literal carrying an explicit
-    # non-Z offset for the SAME instant must NOT match, because DuckDB
-    # silently discards the offset instead of converting it — pinning the
-    # documented footgun against otelq's own relations (not an isolated
-    # DuckDB sanity check), so a future DuckDB upgrade that changes this
-    # parsing behavior is caught rather than silently masked.
+    # FR-30/EC-24: native TIMESTAMP_NS event-time columns are naive UTC. Bare
+    # and Z-suffixed literals both match a known-UTC record. DuckDB 1.5.4 also
+    # normalizes explicit offsets for TIMESTAMP_NS comparison, so the same
+    # instant written with +02:00 matches too.
     base = datetime(2026, 7, 1, 10, 0, 0, tzinfo=timezone.utc)  # == 12:00 at +02:00
     write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
 
@@ -2381,16 +2383,13 @@ def test_ac43_sql_timestamp_literal_utc_convention(temp_telemetry: Path) -> None
         out = _run(
             temp_telemetry,
             "sql",
-            f"SELECT count(*) AS n FROM logs WHERE timestamp = '{literal}'",
+            f"SELECT count(*) AS n FROM logs WHERE time_unix_nano = '{literal}'",
         )
         return _json.loads(out)[0]["n"]
 
     assert count("2026-07-01 10:00:00") == 1  # bare UTC literal matches
     assert count("2026-07-01T10:00:00Z") == 1  # Z-suffixed literal matches
-    # Same instant, correctly converted, written with an explicit +02:00
-    # offset: DuckDB discards the offset instead of applying it, so this must
-    # NOT match — the silently-wrong result the convention warns against.
-    assert count("2026-07-01T12:00:00+02:00") == 0
+    assert count("2026-07-01T12:00:00+02:00") == 1  # same instant with offset
 
 
 _UTC_TS_RE = _re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
@@ -2483,7 +2482,7 @@ def test_ac47_compact_header_names_its_shape(temp_telemetry: Path) -> None:
 def test_ac48_sql_schema_discovery_documented_and_works(temp_telemetry: Path) -> None:
     # FR-31/EC-28: --help documents that the sql views cheat-sheet is a
     # curated subset and points at DESCRIBE/PRAGMA for the full live schema;
-    # a live DESCRIBE actually returns more columns than the cheat-sheet lists.
+    # a live DESCRIBE exposes the native duckdb-otlp reader schema.
     help_text = otelq.build_parser().format_help()
     assert "DESCRIBE" in help_text and "PRAGMA" in help_text
 
@@ -2491,20 +2490,33 @@ def test_ac48_sql_schema_discovery_documented_and_works(temp_telemetry: Path) ->
     write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base)])
     out = _run(temp_telemetry, "sql", "DESCRIBE traces")
     described_columns = {r["column_name"] for r in _json.loads(out)}
-    documented_columns = {
-        "timestamp",
-        "duration",
+    native_columns = {
+        "start_time_unix_nano",
+        "duration_time_unix_nano",
         "trace_id",
         "span_id",
         "parent_span_id",
+        "trace_state",
         "service_name",
-        "span_name",
-        "span_kind",
+        "service_namespace",
+        "service_instance_id",
+        "name",
+        "kind",
         "status_code",
-        "status_message",
+        "status_status_message",
+        "resource_attributes",
+        "scope_name",
+        "scope_version",
+        "scope_attributes",
+        "span_attributes",
+        "events_json",
+        "links_json",
+        "dropped_attributes_count",
+        "dropped_events_count",
+        "dropped_links_count",
+        "flags",
     }
-    assert documented_columns <= described_columns  # cheat-sheet is a subset
-    assert "span_attributes" in described_columns  # the undocumented escape hatch
+    assert described_columns == native_columns
 
 
 # =============================================================================
