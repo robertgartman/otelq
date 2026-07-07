@@ -12,9 +12,10 @@ must_not_contain:
   - architectural_rationale
   - api_schema_definitions
 created: 2026-06-22
-last_updated: 2026-07-02
+last_updated: 2026-07-07
 related_documents:
   - ADR-008-unified-cache-first-read-and-retention
+  - ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0
   - ADR-005-incremental-parquet-cache
   - ADR-004-collector-in-docker-bind-mount
   - SPEC-otelq-cli
@@ -71,7 +72,9 @@ rationale for the cache (see
   `metrics` raw byte-stream feeds the four per-type metric signals (one
   `read_otlp_metrics_<type>` reader each); the cursor tracks bytes and a
   watermark per raw stream, while sealed parquet partitions are kept per signal.
-- **Event-time** — a record's own timestamp (`timeUnixNano`), never wall-clock.
+- **Event-time** — a record's own timestamp (its relation's `TIMESTAMP_NS`
+  event-time column: `start_time_unix_nano` for traces, `time_unix_nano`
+  otherwise — see SPEC-otelq-cli FR-2), never wall-clock.
 - **Minute M** — the UTC clock-minute `[M, M+1)`, keyed filename-safe as
   `<date>T<hour>-<minute>` (e.g. `2026-06-22T10-30`; colon-free).
 - **Cache** — `.telemetry/.otelq-cache/`, containing per-signal sealed parquet
@@ -208,10 +211,16 @@ rationale for the cache (see
   version. On a version mismatch, or when cache state is missing or unreadable,
   otelq **must** discard and rebuild the cache rather than fail. Leftover `*.tmp`
   files **must** be ignored when reading and removed when stale.
-- **FR-15 — Robust tail parsing.** The incremental reader **must** preserve the
-  existing handling of a partially-written trailing JSON line (skip on decode
-  error) and of a single export batch exceeding the reader's 2048-row limit (skip
-  with a warning).
+- **FR-15 — Robust tail parsing.** The incremental reader **must** skip a
+  partially-written or otherwise undecodable trailing JSON line without failing
+  the run, re-reading it once complete on a later run. Because the reader
+  extension hard-errors on unparsable input (see
+  [ADR-010](../adr/ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md)), undecodable lines
+  **must** be filtered out before bytes reach the extension, and the sanitized
+  content handed to it **must** respect the extension's per-file size cap. No
+  batch-size-based skip is permitted: export batches of any record count
+  **must** be read in full (revised 2026-07-07 — the former 2048-row
+  skip-with-warning is obsolete; see SPEC-otelq-cli FR-20).
 - **FR-16 — `otel-clean` wipes the cache.** Clearing captured telemetry **must**
   also remove `.telemetry/.otelq-cache/`, so a clean is a full reset.
 - **FR-17 — `--no-cache` bypass.** A `--no-cache` global flag **must** force a
@@ -246,8 +255,8 @@ rationale for the cache (see
   corrupt or duplicate the partition; sealing is idempotent via atomic replace.
 - **EC-4 — Partial trailing line.** A half-written final JSONL line is skipped and
   the run still succeeds.
-- **EC-5 — Oversized batch.** A single export batch exceeding 2048 records is
-  skipped with a warning, as today.
+- **EC-5 — Large batch.** A single export batch exceeding 2048 records is read
+  in full, with no warning and no omission.
 - **EC-6 — Unreliable inode.** On filesystems where `st_ino` is `0` or
   non-unique (e.g. FAT32, some network shares), or after inode reuse, the
   fingerprint disambiguates; the worst outcome is a safe re-read, never
@@ -408,10 +417,10 @@ rationale for the cache (see
   correct output.*
 - **AC-15** (Verifies FR-15, EC-4, EC-5): Given a corpus with a truncated trailing
   line and one batch of >2048 records, when otelq runs incrementally, then the
-  truncated line is skipped, the oversized batch is skipped with a warning, and the
-  run succeeds.
+  truncated line is skipped, every record of the large batch is returned, no
+  size warning is printed, and the run succeeds.
   *Verification hint: fabricate both conditions in a temp corpus; assert exit
-  success and warning on stderr.*
+  success, full row count, and no size warning on stderr.*
 - **AC-16** (Verifies FR-16): Given a populated cache, when `just otel-clean` runs,
   then `.telemetry/.otelq-cache/` no longer exists.
   *Verification hint: seed cache; run the recipe; assert the directory is gone.*

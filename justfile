@@ -77,7 +77,7 @@ otelq-sql QUERY:
 
 # Run the otelq test suite
 otelq-test:
-    uv run --with pytest --with "duckdb==1.5.3" pytest tests/ -v
+    uv run --with pytest --with "duckdb==1.5.4" pytest tests/ -v
 
 # Lint the project
 lint:

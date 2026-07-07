@@ -12,12 +12,12 @@ must_not_contain:
   - architectural_rationale
   - external_data_schemas
 created: 2026-06-23
-last_updated: 2026-07-04
+last_updated: 2026-07-07
 related_documents:
   - PRD-otelq
   - SPEC-otelq-incremental-cache
   - CONTRACT-telemetry-directory
-  - ADR-006-read-otlp-extension-quirks
+  - ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0
   - ADR-009-query-history-triage-store
 ai_summary: "otelq CLI base behavior: the query relations/columns it exposes, its subcommands (incl. history/triage over the query-history store), global flags and argument order, and its friendly read-only failure handling."
 semantic_tags:
@@ -46,9 +46,10 @@ telemetry directory and OTLP JSONL layout that otelq reads are defined in
 [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md) and
 **must not** be redefined here. The cache that accelerates repeated and recent
 queries is specified in
-[SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md); the quirks of
-the `duckdb-otlp` reader extension that otelq compensates for are recorded in
-[ADR-006-read-otlp-extension-quirks](../adr/ADR-006-read-otlp-extension-quirks.md).
+[SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md); how otelq
+adopts the `duckdb-otlp` reader extension's schema natively as the relations
+below is recorded in
+[ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0](../adr/ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md).
 Product intent lives in [PRD-otelq](../prd/PRD-otelq.md).
 
 ## Scope
@@ -71,8 +72,8 @@ malformed.
 input — see [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md));
 the parquet cache mechanics, sealing, eviction, and cache-first read routing (see
 [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md)); the
-`duckdb-otlp` extension itself and the rationale for working around it (see
-[ADR-006](../adr/ADR-006-read-otlp-extension-quirks.md)); and the OTel Collector
+`duckdb-otlp` extension itself and the rationale for adopting its schema (see
+[ADR-010](../adr/ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md)); and the OTel Collector
 configuration that produces the raw files.
 
 ### Definitions
@@ -95,8 +96,10 @@ configuration that produces the raw files.
   `uv run otelq.py` from a checkout (run from the repo root) and for an installed
   copy (`uvx`/`pipx`) run from a project directory; a script-relative default
   would resolve into the install location (e.g. site-packages).
-- **Event-time** — a record's own timestamp, as corrected and presented in the
-  `timestamp` column (see FR-16).
+- **Event-time** — a record's own timestamp: the value of its relation's
+  event-time column (`start_time_unix_nano` for `traces`, `time_unix_nano`
+  for `logs` and the metric relations), rendered in command output as the
+  presented `timestamp` column (see FR-16).
 - **Result** — the `(columns, rows)` pair a command produces, rendered by the
   selected output format.
 - **Response header** — a fixed-format plain-text preamble that otelq prints to
@@ -134,42 +137,48 @@ configuration that produces the raw files.
   emits no zero-count skeleton (FR-3). The OTel **Summary** metric type is **not**
   supported (the `duckdb-otlp` reader for it is an unimplemented stub) and is
   never exposed.
-- **FR-2 — Relation columns.** Each relation **must** present at least the
-  following columns (the `sql` cheat-sheet), with `timestamp` carrying the
-  corrected wall-clock event-time (FR-16):
-  - **`traces`**: `timestamp`, `duration` (integer **milliseconds** — the
-    duckdb-otlp extension reports span duration in ms, so sub-millisecond spans
-    truncate to `0`), `trace_id`, `span_id`,
-    `parent_span_id`, `service_name`, `span_name`, `span_kind`, `status_code`
-    (`0`=unset, `1`=ok, `2`=error), `status_message`.
-  - **`logs`**: `timestamp`, `trace_id`, `service_name`, `severity_text`,
-    `severity_number`, `body`. `severity_number` is the OTel numeric severity;
-    otelq maps it to a canonical level for `summary` (FR-3) using the standard
-    ranges **TRACE** `1–4`, **DEBUG** `5–8`, **INFO** `9–12`, **WARN** `13–16`,
-    **ERROR** `17–20`, **FATAL** `21–24` (values outside `1–24`, including `0`
-    and null, are **UNSET**). The level is derived from `severity_number`, not
-    the free-form `severity_text`, which carries inconsistent casing in practice
+- **FR-2 — Relation columns.** The six stored relations **must** carry the
+  `duckdb-otlp` v0.6.0 reader columns **verbatim** — names, types, and units as
+  published by the upstream extension (see
+  [ADR-010](../adr/ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md)); the upstream
+  project's documentation is the semantic reference for these columns. The
+  `sql` cheat-sheet subset each relation **must** present:
+  - **`traces`**: `start_time_unix_nano` (`TIMESTAMP_NS` event-time),
+    `duration_time_unix_nano` (integer **nanoseconds**), `trace_id`, `span_id`,
+    `parent_span_id`, `service_name`, `name` (the span name), `kind`,
+    `status_code` (`0`=unset, `1`=ok, `2`=error), `status_status_message`.
+  - **`logs`**: `time_unix_nano` (`TIMESTAMP_NS` event-time), `trace_id`,
+    `service_name`, `severity_text`, `severity_number`, `body`.
+    `severity_number` is the OTel numeric severity; otelq maps it to a
+    canonical level for `summary` (FR-3) using the standard ranges **TRACE**
+    `1–4`, **DEBUG** `5–8`, **INFO** `9–12`, **WARN** `13–16`, **ERROR**
+    `17–20`, **FATAL** `21–24` (values outside `1–24`, including `0` and null,
+    are **UNSET**). The level is derived from `severity_number`, not the
+    free-form `severity_text`, which carries inconsistent casing in practice
     (e.g. `Info`).
-  - **`metrics`** (the union view over the per-type relations):
-    `timestamp`, `service_name`, `metric_name`, `metric_type`, `value`,
-    `metric_unit`. `metric_type` **must** be one of `gauge`, `sum`, `histogram`,
-    or `exp_histogram`, naming the per-type relation each row originates from
+  - **`metrics`** (the otelq-defined union view over the per-type relations):
+    `time_unix_nano`, `service_name`, `name`, `metric_type`, `value`, `unit`.
+    `metric_type` **must** be one of `gauge`, `sum`, `histogram`, or
+    `exp_histogram`, naming the per-type relation each row originates from
     (`metrics_gauge`, `metrics_sum`, `metrics_histogram`,
-    `metrics_exp_histogram`). The unified `value` **must** be the row's own
-    `value` for `gauge`/`sum` rows and its `sum` for `histogram`/`exp_histogram`
-    rows (the histogram types have no scalar value, so their distribution `sum`
-    is surfaced as `value`).
-  - **`metrics_gauge`** / **`metrics_sum`**: at least `timestamp`,
-    `service_name`, `metric_name`, `metric_unit`, and a scalar `value`
-    (`metrics_sum` additionally carries `aggregation_temporality`,
-    `is_monotonic`).
-  - **`metrics_histogram`**: at least `timestamp`, `service_name`,
-    `metric_name`, `metric_unit`, `count`, `sum`, `min`, `max`, `bucket_counts`,
-    `explicit_bounds`, and `aggregation_temporality`.
-  - **`metrics_exp_histogram`**: at least `timestamp`, `service_name`,
-    `metric_name`, `metric_unit`, `count`, `sum`, `min`, `max`, `scale`,
-    `zero_count`, `zero_threshold`, the positive/negative bucket offsets and
-    counts, and `aggregation_temporality`.
+    `metrics_exp_histogram`). The unified `value` **must** be, for
+    `gauge`/`sum` rows, the row's scalar reading — its `double_value` when
+    set, else its `int_value` cast to DOUBLE (the reader splits the OTLP
+    number into the two typed columns) — and, for
+    `histogram`/`exp_histogram` rows, the row's distribution `sum` (the
+    histogram types have no scalar reading).
+  - **`metrics_gauge`** / **`metrics_sum`**: at least `time_unix_nano`,
+    `service_name`, `name`, `unit`, and the split scalar reading
+    `int_value`/`double_value` (`metrics_sum` additionally carries
+    `aggregation_temporality`, `is_monotonic`).
+  - **`metrics_histogram`**: at least `time_unix_nano`, `service_name`,
+    `name`, `unit`, `count`, `sum`, `min`, `max`, `bucket_counts`
+    (`BIGINT[]`), `explicit_bounds` (`DOUBLE[]`), and
+    `aggregation_temporality`.
+  - **`metrics_exp_histogram`**: at least `time_unix_nano`, `service_name`,
+    `name`, `unit`, `count`, `sum`, `min`, `max`, `scale`, `zero_count`,
+    `zero_threshold`, the positive/negative bucket offsets and counts (typed
+    `BIGINT[]` lists), and `aggregation_temporality`.
 
   The precise field semantics of the underlying raw records are owned by
   [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md);
@@ -185,7 +194,7 @@ configuration that produces the raw files.
   service count of just those records). Rows are produced **only for present
   signals**, as follows:
   - **`traces`** (when present): exactly two rows that partition spans by
-    `duration` — `details = ">1s"` for `duration > 1s` (`> 1000` ms) and
+    duration — `details = ">1s"` for `duration_time_unix_nano > 1s` and
     `details = "=<1s"` for the remainder. **Both** rows **must** appear even when
     a bucket's count is zero.
   - **`logs`** (when present): one row per canonical severity level
@@ -233,19 +242,20 @@ configuration that produces the raw files.
   (`traces` rows with `status_code == 2`) and error/fatal logs (`logs` rows with
   `severity_text` in `{ERROR, FATAL}`, matched **case-insensitively** since
   `severity_text` carries inconsistent casing in practice — see FR-2), combined
-  into one result and ordered newest-first by `timestamp`. Each row **must**
+  into one result and ordered newest-first by event-time. Each row **must**
   identify whether it is a span or a log, and **must** carry its record's
   `trace_id`, so a caller pivots straight to `trace <trace_id>` (FR-6) without
   a second lookup — `errors` is the triage entry point of an investigation and
   the trace tree is its localization step, so the pivot key travels with the
   row (as it already does for `slow` and `logs`). A log record with no trace
   context carries its raw (empty) `trace_id` value.
-- **FR-5 — `slow`.** `slow` **must** return spans ordered by `duration`
-  descending, limited to the top `N` where `N` is the value of `--top`
+- **FR-5 — `slow`.** `slow` **must** return spans ordered by
+  `duration_time_unix_nano` descending, limited to the top `N` where `N` is the
+  value of `--top`
   (default **20**). The presented duration **must** be expressed in milliseconds.
 - **FR-6 — `trace <trace_id>`.** `trace` **must** take a `trace_id` positional
   argument and return every span of that trace arranged as a parent/child tree
-  (each span ordered under its parent by `timestamp`, with a depth indicator). A
+  (each span ordered under its parent by event-time, with a depth indicator). A
   span whose `parent_span_id` is absent or not present among the trace's own
   spans **must** be treated as a root. The `trace_id` argument **must** accept a
   unique **prefix** of a trace id in addition to a full id: an exact match wins;
@@ -253,13 +263,13 @@ configuration that produces the raw files.
   prefix matching two or more **must** be rejected as a real error (FR-17) naming
   the ambiguity. A prefix matching none takes the normal empty-result path (EC-3).
 - **FR-7 — `logs`.** `logs` **must** return log records ordered newest-first by
-  `timestamp`, filtered by the optional subcommand flags `--service`
+  event-time, filtered by the optional subcommand flags `--service`
   (exact `service_name`), `--level` (exact `severity_text`, case-insensitive
   input), and `--grep` (case-insensitive substring of `body`). With no filter
   flags it **must** return all in-window log records.
 - **FR-8 — `metric <name>`.** `metric` **must** take a `name` positional
   argument and return the time series for that metric (`metrics` rows whose
-  `metric_name` equals `name`) ordered ascending by `timestamp`.
+  `name` equals the given name) ordered ascending by event-time.
 - **FR-9 — `sql "<query>"`.** `sql` **must** take a SQL string positional
   argument, execute it against the exposed relations (FR-1), and return its
   columns and rows. A SQL execution error **must** be reported as a real error
@@ -320,11 +330,11 @@ configuration that produces the raw files.
 
 ### Presentation and robustness
 
-- **FR-16 — Corrected timestamps.** The `timestamp` column in every relation and
-  every command's output **must** render as the real wall-clock date/time of the
-  event. otelq **must** correct the nanosecond-in-millisecond-column value
-  surfaced by the reader extension (see
-  [ADR-006](../adr/ADR-006-read-otlp-extension-quirks.md)); a raw 2026 event
+- **FR-16 — Corrected timestamps.** Event-times are stored as native
+  `TIMESTAMP_NS` values in the relations' `*_unix_nano` columns (FR-2), and the
+  `timestamp` column every command's output presents **must** render as the
+  real wall-clock date/time of the event (see
+  [ADR-010](../adr/ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md)); a raw 2026 event
   **must not** render as a far-future year. A single implausible far-future
   event-time (a clock-skewed producer or a unit mistake) **must not** blank out
   otherwise-valid queries: the trailing-window anchor is clamped to a plausible
@@ -334,20 +344,23 @@ configuration that produces the raw files.
   the window/watermark anchor, in
   [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md) (INV-7, EC-12);
   `doctor` surfaces the condition as a non-fatal warning (FR-26). Every rendered
-  timestamp value — every relation's `timestamp` column, `summary`'s `earliest`/
+  timestamp value — every command output's `timestamp` column, `summary`'s
+  `earliest`/
   `latest` columns, and the FR-29 response header's `Time range` — **must** be an
   explicit-UTC ISO-8601/RFC-3339 string carrying a trailing `Z`, at fixed
   millisecond precision (`YYYY-MM-DDTHH:MM:SS.fffZ`, exactly 3 fractional
-  digits, matching `duration`'s own millisecond granularity, FR-2), in every
+  digits — a fixed presentation precision; the stored values are ns-exact,
+  FR-2), in every
   `--format`, so the value itself asserts UTC. A naive `str(datetime)`
   rendering (a space separator and no offset/designator) **must not** be used:
   it is visually indistinguishable from any other timezone, which would leave
   FR-29's "all timestamps are UTC" notice unverifiable from the data itself.
-- **FR-30 — `sql` timestamp-literal input convention.** `timestamp` columns
-  (FR-2) are naive (timezone-free) and always represent corrected UTC
+- **FR-30 — `sql` timestamp-literal input convention.** The relations'
+  `*_unix_nano` event-time columns (FR-2) are naive (timezone-free)
+  `TIMESTAMP_NS` values that always represent UTC
   wall-clock (FR-16); this is the counterpart requirement for the one place a
   caller writes a timestamp back **into** otelq, `sql`'s free-form `WHERE`
-  clauses (FR-9). A caller **must** write a `timestamp` literal either bare
+  clauses (FR-9). A caller **must** write a timestamp literal either bare
   (`'YYYY-MM-DD HH:MM:SS[.ffffff]'`) or as an ISO-8601 string with a trailing
   `Z` (e.g. `'2026-07-01T10:00:00Z'`) — both **must** be treated as UTC and
   compare correctly against the column. A literal carrying an explicit non-`Z`
@@ -385,11 +398,11 @@ configuration that produces the raw files.
   (which needs `traces` or `logs`) **must** name "traces or logs" when only
   `metrics` has data. A required signal whose relation resolves empty (FR-1) is
   treated as absent here — presence is by row count, not table existence.
-- **FR-20 — Oversized export batch is skipped.** A single export batch whose
-  record count exceeds the reader's 2048-row limit **must** be skipped, with a
-  warning printed to stderr, rather than crashing the run. (The limit and its
-  cause are described in
-  [ADR-006](../adr/ADR-006-read-otlp-extension-quirks.md); the cache path shares
+- **FR-20 — Export batches of any size are read.** An export batch **must** be
+  read in full regardless of its record count; no size-based skip or warning is
+  permitted. (Revised 2026-07-07: the former reader 2048-row limit and its
+  skip-with-warning behavior are obsolete — see
+  [ADR-010](../adr/ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md); the cache path shares
   this behavior per
   [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md) FR-15.)
 - **FR-21 — Partial trailing line is skipped.** A partially-written trailing
@@ -644,12 +657,12 @@ configuration that produces the raw files.
   `otelq --format json errors`. (FR-11)
 - **EC-6 — Malformed `--since`.** `--since 10x` (or `--since abc`) exits non-zero
   with a message naming the accepted forms (`10m`, `2h`, `1d`). (FR-15)
-- **EC-7 — Far-future timestamps avoided.** With raw records carrying nanosecond
-  timestamps in a millisecond column, presented `timestamp` values render in the
-  correct year, not ~58000 CE. (FR-16)
-- **EC-8 — Oversized batch present.** A corpus containing one export batch of
-  more than 2048 records yields a stderr warning naming the batch size and the
-  limit, the batch is omitted, and the rest of the corpus is queried normally.
+- **EC-7 — Far-future timestamps avoided.** Presented `timestamp` values render
+  in the correct (near-present) year for genuine events, never a far-future one,
+  whatever encoding the reader surfaces. (FR-16)
+- **EC-8 — Large batch present.** A corpus containing one export batch of
+  more than 2048 records is read in full — no warning, no omission — and queried
+  normally alongside the rest of the corpus.
   (FR-20)
 - **EC-9 — Truncated trailing line present.** A corpus whose final line is a
   half-written JSON object is queried as if that line were absent, with no error.
@@ -710,11 +723,11 @@ configuration that produces the raw files.
   `Time range: n/a - n/a`. A corpus with both traces and logs makes `summary`'s
   and `errors`'s header signal field read `traces, logs`; a traces-only corpus
   makes `errors`'s read `traces` alone. (FR-29)
-- **EC-24 — `sql` timestamp-literal offset is silently discarded.** Given a
-  `timestamp` value known to be `2026-07-01 10:00:00` UTC, `sql "SELECT * FROM
-  logs WHERE timestamp = '2026-07-01 10:00:00'"` and `sql "SELECT * FROM logs
-  WHERE timestamp = '2026-07-01T10:00:00Z'"` both match the row; `sql "SELECT *
-  FROM logs WHERE timestamp = '2026-07-01T12:00:00+02:00'"` — the same instant,
+- **EC-24 — `sql` timestamp-literal offset is silently discarded.** Given a log
+  event-time known to be `2026-07-01 10:00:00` UTC, `sql "SELECT * FROM
+  logs WHERE time_unix_nano = '2026-07-01 10:00:00'"` and `sql "SELECT * FROM logs
+  WHERE time_unix_nano = '2026-07-01T10:00:00Z'"` both match the row; `sql "SELECT *
+  FROM logs WHERE time_unix_nano = '2026-07-01T12:00:00+02:00'"` — the same instant,
   correctly converted — does **not** match, because the offset is discarded
   rather than applied. (FR-30)
 - **EC-25 — Explicit-UTC timestamp rendering.** A presented `timestamp` (or
@@ -810,7 +823,7 @@ configuration that produces the raw files.
   `..._by_grep`.*
 - **AC-7** (Verifies FR-8): Given a metric with multiple data points, when
   `metric <name>` runs, then its time series is returned ordered ascending by
-  `timestamp` with the FR-2 metric columns.
+  event-time with the presented metric output columns.
   *Verification hint: `test_metric_returns_time_series` for `db.pool.in_use`.*
 - **AC-8** (Verifies FR-9): Given a synthetic connection, when `sql "SELECT
   count(*) AS n FROM traces"` runs, then the query's own columns and rows are
@@ -848,10 +861,9 @@ configuration that produces the raw files.
   `--since` (e.g. `10x`), otelq exits non-zero with a message naming `10m/2h/1d`.
   *Verification hint: `_parse_since` accepts `10m/2h/1d` and raises `SystemExit`
   on `10x`; window behavior cross-checked via `test_ac9_recent_default_vs_all`.*
-- **AC-15** (Verifies FR-16, EC-7): Given the real fixture whose raw timestamps
-  are nanoseconds stored in a millisecond column, when any relation is queried,
-  then the presented `timestamp` falls in the correct (near-present) year, not a
-  far-future one.
+- **AC-15** (Verifies FR-16, EC-7): Given the real fixture, when any relation is
+  queried, then the presented `timestamp` falls in the correct (near-present)
+  year, not a far-future one.
   *Verification hint: `test_integration_timestamps_are_scaled`.*
 - **AC-16** (Verifies FR-17, FR-18, INV-1, INV-4, EC-1): Given an empty telemetry
   directory, when any command runs through `main`, then a friendly message is
@@ -874,11 +886,10 @@ configuration that produces the raw files.
   *Verification hint: `test_trace_unknown_id_raises` (caught by `main` → exit 0);
   `test_format_output_table_empty`.*
 - **AC-19** (Verifies FR-20, EC-8): Given a corpus containing one export batch of
-  more than 2048 records, when otelq runs, then that batch is skipped with a
-  stderr warning naming the size and the limit, and the run exits `0` returning
-  the remaining rows.
-  *Verification hint: `test_ac15_robust_tail_parsing` (oversized batch arm);
-  assert warning on stderr and success.*
+  more than 2048 records, when otelq runs, then every record of that batch is
+  returned, no size warning is printed, and the run exits `0`.
+  *Verification hint: `test_ac15_robust_tail_parsing` (large-batch arm);
+  assert full row count and empty stderr for the batch.*
 - **AC-20** (Verifies FR-21, EC-9): Given a corpus whose final JSONL line is
   truncated, when otelq runs, then the partial line is skipped and the run exits
   `0` with the complete records returned.
@@ -1013,7 +1024,7 @@ configuration that produces the raw files.
   *Verification hint: a fixture with only healthy (non-error) traces/logs; run
   `errors`; assert `OpenTelemetry signal: n/a` and `Time range: n/a - n/a`.*
 - **AC-43** (Verifies FR-30, EC-24): Given a record with a known UTC
-  `timestamp`, when `sql` filters on that value as a bare literal or as a
+  event-time, when `sql` filters on that value as a bare literal or as a
   `Z`-suffixed ISO-8601 literal, then both match the record; when it filters on
   the same instant written with an explicit non-`Z` offset, then it does
   **not** match, pinning that the offset is silently discarded rather than

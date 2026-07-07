@@ -31,4 +31,4 @@ pre-commit:
     pytest:
       priority: 3
       glob: "*.py"
-      run: uv run --with pytest --with "duckdb==1.5.3" pytest tests/ -q
+      run: uv run --with pytest --with "duckdb==1.5.4" pytest tests/ -q

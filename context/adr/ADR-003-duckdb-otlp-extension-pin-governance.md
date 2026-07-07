@@ -12,10 +12,11 @@ must_not_contain:
   - implementation_walkthroughs
   - reversible_decisions
 created: 2026-06-23
-last_updated: 2026-06-23
+last_updated: 2026-07-07
 related_documents:
   - ADR-002-pep723-uv-single-file-distribution
   - ADR-006-read-otlp-extension-quirks
+  - ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0
   - ADR-001-host-cli-reads-bind-mounted-files
   - SPEC-otelq-cli
 supersedes: null
@@ -66,7 +67,8 @@ extension**, and govern its version as follows:
 
 1. **Pin DuckDB to the exact version for which the extension is published.** The
    pin is `duckdb==1.5.3` — the latest DuckDB version with a published `otlp`
-   community build at the time of writing. This pin appears in **both** the PEP
+   community build at the time of writing. (Amended 2026-07-07: the pin is now
+   `duckdb==1.5.4`; see the amendment below.) This pin appears in **both** the PEP
    723 inline block and the package `pyproject`, kept in sync per
    [ADR-002](ADR-002-pep723-uv-single-file-distribution.md).
 2. **Govern the pin with CI.** A scheduled **extension-probe workflow** verifies
@@ -97,6 +99,31 @@ the per-version build lag described in the Context, observed in the wild. Revisi
 only when the extension-probe (which loads `otlp` against the pinned version)
 shows a published 1.5.4 build; then run the checklist below.
 
+### Amendment 2026-07-07 — pin bumped to 1.5.4 (checklist executed)
+
+The condition above was met: upstream published **duckdb-otlp v0.6.0 built for
+DuckDB 1.5.4** (extension version `5f32698`) to the community-extensions
+repository. The pin-bump checklist was executed and the pin is now
+**`duckdb==1.5.4`**:
+
+1. **Published build confirmed** — `INSTALL otlp FROM community; LOAD otlp`
+   under `duckdb==1.5.4` succeeds on `osx_arm64`, and
+   `community-extensions.duckdb.org/v1.5.4/linux_amd64/otlp.duckdb_extension.gz`
+   returns HTTP 200 — an actual published build on the supported platforms, not
+   a manifest claim.
+2. **Pin bumped in both places together** — the PEP 723 inline block and
+   `pyproject` (plus the `justfile` test recipe that repeats the pin).
+3. **2048-row workaround re-validated** — and found **obsolete**: v0.6.0 fixes
+   the row-count crash (a 300 000-row single-call read is crash-free) and the
+   `TIMESTAMP_MS` bug. The workaround is retired rather than re-applied.
+
+v0.6.0 is a **breaking schema change** with new failure modes; how otelq
+absorbs it is decided in
+[ADR-010](ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md), which supersedes
+[ADR-006](../archive/ADR-006-read-otlp-extension-quirks.md). The governance
+model of this ADR — exact pin, CI probe, offline fallback, checklist-gated
+bumps — is unchanged and applies to all future bumps.
+
 ## Alternatives Considered
 
 - **Hand-write an OTLP-JSON parser.** Rejected. OTLP's JSON encoding (nested
@@ -104,7 +131,7 @@ shows a published 1.5.4 build; then run the checklist below.
   non-trivial and a moving target; owning a parser means owning that surface
   forever and re-deriving the SQL-queryable shape the extension already provides.
   The extension's own parsing quirks are instead documented and worked around in
-  [ADR-006](ADR-006-read-otlp-extension-quirks.md), which is far less costly than
+  [ADR-006](../archive/ADR-006-read-otlp-extension-quirks.md), which is far less costly than
   reimplementing the parser.
 - **A different embedded query engine.** Rejected. No other embeddable, in-process
   SQL engine pairs with a ready-made OTLP reader; switching engines would forfeit
@@ -126,7 +153,7 @@ shows a published 1.5.4 build; then run the checklist below.
      together — never one without the other (ADR-002).
   3. **Re-validate the 2048-row workaround** against the new DuckDB version, since
      that workaround depends on `read_otlp_*` behavior the new version could alter
-     (see [ADR-006](ADR-006-read-otlp-extension-quirks.md)).
+     (see [ADR-006](../archive/ADR-006-read-otlp-extension-quirks.md)).
 - **A scheduled extension-probe workflow governs the pin continuously.** It is the
   early-warning system for the deferred 1.5.4 bump (it surfaces when a published
   1.5.4 `otlp` build appears) and any future divergence; the pin is only ever moved
@@ -144,4 +171,4 @@ shows a published 1.5.4 build; then run the checklist below.
   but the DuckDB version is fixed by the pin; the behavioral surface the loaded
   extension exposes is specified in
   [SPEC-otelq-cli](../spec/SPEC-otelq-cli.md), and its parsing peculiarities are
-  captured in [ADR-006](ADR-006-read-otlp-extension-quirks.md).
+  captured in [ADR-006](../archive/ADR-006-read-otlp-extension-quirks.md).

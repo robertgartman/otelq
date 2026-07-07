@@ -80,7 +80,7 @@ CLI, not a server the agent connects to.
 
 The single runtime dependency is pinned **exactly and identically** in both
 distribution forms: the PEP 723 inline block and the package `pyproject` both
-declare `duckdb==1.5.3`. The two pins **must be kept in sync** — they are the
+declare `duckdb==1.5.4`. The two pins **must be kept in sync** — they are the
 same decision expressed twice, governed by
 [ADR-003](ADR-003-duckdb-otlp-extension-pin-governance.md).
 

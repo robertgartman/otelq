@@ -60,7 +60,7 @@ jobs:
       - name: Pytest
         env:
           PYTHONPATH: .
-        run: uv run --with pytest --with "duckdb==1.5.3" pytest tests/ -v
+        run: uv run --with pytest --with "duckdb==1.5.4" pytest tests/ -v
 
       - name: Prepare package version
         run: |

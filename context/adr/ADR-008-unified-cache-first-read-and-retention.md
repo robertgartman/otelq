@@ -57,7 +57,7 @@ Real usage is different. A debugging **investigation is a burst of queries over
 the same, often wide, time window** — "show me the last hour," then a dozen
 follow-ups narrowing, pivoting, and re-widening across that same hour. Under
 ADR-005 every one of those wide queries is a full raw re-scan
-([ADR-006](ADR-006-read-otlp-extension-quirks.md): the reader cannot tail or
+([ADR-006](../archive/ADR-006-read-otlp-extension-quirks.md): the reader cannot tail or
 seek, so it re-parses whole files from byte zero). The cache — the one mechanism
 that could amortise the burst — is bypassed precisely when it would help most,
 because the window reaches past the hot window. The first wide query and the
