@@ -10,3 +10,6 @@ user-invocable: true
 First, read the canonical instructions at `.agents/skills/otelq/SKILL.md` and follow them exactly.
 
 This skill captures OTEL traces, logs, and metrics from the local dev Collector and queries them with the otelq CLI to verify or debug system behaviour.
+
+Important: in git worktrees, use `--dir` for the default-branch worktree's
+`.telemetry/` directory; all worktrees share that Collector output path.

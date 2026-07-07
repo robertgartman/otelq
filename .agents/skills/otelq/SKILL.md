@@ -19,6 +19,15 @@ the default path won't resolve to your project. Point it at the Collector's
 output folder (the bind-mounted `.telemetry/` at the project root). Pin a
 version with `uvx otelq@<version> …`.
 
+## Git worktree warning (important)
+
+When running inside a git worktree, set `--dir` to the `.telemetry/` directory
+of the repository's **default branch worktree** (the canonical root checkout
+where the Collector persists telemetry), not the current worktree path.
+
+Concurrent development across git worktrees aggregates telemetry into that same
+default-branch `.telemetry/` directory.
+
 ## Start every investigation with `triage`
 
 **The first instruction of an investigation is `triage`, not `summary`.**
