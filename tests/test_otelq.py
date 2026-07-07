@@ -19,6 +19,32 @@ import otelq  # noqa: E402
 TESTDATA = Path(__file__).resolve().parent / "testdata"
 
 
+@pytest.fixture(autouse=True)
+def hermetic_git_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Strip inherited git plumbing env vars so the tests that shell out to git
+    (worktree-identity resolution, set_resource_attributes, _git_init) discover
+    repositories from the filesystem alone.
+
+    A lefthook pre-commit run exports GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE
+    into pytest's environment; left in place, `git rev-parse --show-toplevel`
+    treats any cwd as a worktree root, so a bare tmp_path resolves as if it were
+    a checkout. That is a test-only hazard — otelq is never invoked from inside a
+    git hook — and plain `pytest` (CI) sets none of these, so this only hardens
+    local runs to match CI."""
+    for var in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_PREFIX",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture
 def synth_conn() -> duckdb.DuckDBPyConnection:
     """In-memory DuckDB with the duckdb-otlp schema and known rows."""
@@ -3282,3 +3308,390 @@ def test_sessionization_survives_interleaved_concurrent_agents(
     assert rows["summary"]["terminal_pct"] == 0
     # the id-less row is frequency evidence only, never a session terminal
     assert rows["logs loose"]["terminal_pct"] == 0
+
+
+# --- worktree scoping (SPEC-otelq-worktree-scoping / ADR-011) -----------------
+import subprocess as _subprocess  # noqa: E402
+
+
+def _tag_worktree(
+    obj: dict[str, Any], wt_id: str | None = None, branch: str | None = None
+) -> dict[str, Any]:
+    """Append otelq.worktree.* resource attributes onto an OTLP-JSON dict in
+    place (a no-op when both are None, i.e. an untagged producer)."""
+    for key in ("resourceSpans", "resourceLogs", "resourceMetrics"):
+        for entry in obj.get(key, []):
+            attrs = entry["resource"].setdefault("attributes", [])
+            if wt_id is not None:
+                attrs.append(
+                    {"key": "otelq.worktree.id", "value": {"stringValue": wt_id}}
+                )
+            if branch is not None:
+                attrs.append(
+                    {"key": "otelq.worktree.branch", "value": {"stringValue": branch}}
+                )
+    return obj
+
+
+# Three cohorts: worktree A, worktree B, and untagged — each contributing exactly
+# one error span, one ERROR log, and one gauge point (3 rows/cohort). Scoping to A
+# must surface A + untagged and hide B's 3 rows across one distinct other worktree.
+_WT_COHORTS = (("A", "svc-a", "feat-a"), ("B", "svc-b", "feat-b"), (None, "svc-u", None))
+
+
+def _write_wt_corpus(d: Path, base: datetime) -> None:
+    spans: list[dict[str, Any]] = []
+    logs: list[dict[str, Any]] = []
+    metrics: list[dict[str, Any]] = []
+    for wt, svc, br in _WT_COHORTS:
+        spans.append(
+            _tag_worktree(
+                make_span(
+                    base,
+                    trace_id=f"t-{svc}",
+                    span_id=f"s-{svc}",
+                    service=svc,
+                    status_code=2,
+                    status_msg="boom",
+                    duration_ms=10,
+                ),
+                wt,
+                br,
+            )
+        )
+        logs.append(
+            _tag_worktree(
+                make_log(base, service=svc, severity="ERROR", sevnum=17, body=f"fail {svc}"),
+                wt,
+                br,
+            )
+        )
+        metrics.append(
+            _tag_worktree(make_gauge(base, name="m.pool", service=svc, value=1.0), wt, br)
+        )
+    write_jsonl(d / "traces.jsonl", spans)
+    write_jsonl(d / "logs.jsonl", logs)
+    write_jsonl(d / "metrics.jsonl", metrics)
+
+
+def _header_of(out: str) -> str:
+    return out.split("----------", 1)[0]
+
+
+def _git_init(path: Path, branch: str = "main") -> None:
+    env = {**_os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    _subprocess.run(["git", "init", "-q", "-b", branch, str(path)], check=True, env=env)
+    for cfg in (["user.email", "t@e"], ["user.name", "t"]):
+        _subprocess.run(["git", "-C", str(path), "config", *cfg], check=True, env=env)
+
+
+def _patch_identity(monkeypatch: pytest.MonkeyPatch, value: str | None) -> None:
+    """Force otelq.resolve_worktree_identity to a fixed value. The integration
+    scope tests run in-process with cwd at the repo root (itself a real git
+    checkout), so the live git resolution can't stand in for a synthetic worktree
+    id — pin it instead. A typed inner function (not a lambda) keeps strict
+    pyright happy."""
+
+    def _fixed(cwd: Path | None = None) -> str | None:
+        return value
+
+    monkeypatch.setattr(otelq, "resolve_worktree_identity", _fixed)
+
+
+# ---- identity resolution (FR-2 / AC-2) --------------------------------------
+
+
+def test_ac2_identity_from_env_local(tmp_path: Path) -> None:
+    (tmp_path / ".env.local").write_text(
+        'OTEL_RESOURCE_ATTRIBUTES="otelq.worktree.id=/path/A,'
+        'otelq.worktree.branch=feat"\n'
+    )
+    assert otelq.resolve_worktree_identity(tmp_path) == "/path/A"
+
+
+def test_ac2_identity_from_git_when_no_env(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+    # git normalizes the toplevel through realpath; compare likewise.
+    assert otelq.resolve_worktree_identity(repo) == str(repo.resolve())
+
+
+def test_ac2_identity_undefined_outside_git(tmp_path: Path) -> None:
+    # A plain dir with no .env.local and not under any git repo.
+    assert otelq.resolve_worktree_identity(tmp_path) is None
+
+
+# ---- set_resource_attributes (FR-3 / AC-3, AC-4) ----------------------------
+
+
+def _read_attrs(env_path: Path) -> dict[str, str]:
+    text = env_path.read_text()
+    assignments = otelq._parse_env_assignments(text)
+    return otelq._parse_resource_attributes(assignments.get("OTEL_RESOURCE_ATTRIBUTES", ""))
+
+
+def test_ac3_set_resource_attributes_writes_and_merges(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo, branch="feat")
+    code = otelq._run_set_resource_attributes(repo)
+    assert code == 0
+    env_path = repo / ".env.local"
+    attrs = _read_attrs(env_path)
+    assert attrs["otelq.worktree.id"] == str(repo.resolve())
+    assert attrs["otelq.worktree.branch"] == "feat"
+
+    # A bespoke attribute and an unrelated variable must both survive a re-run.
+    env_path.write_text(
+        'OTHER_VAR=keep\n'
+        'OTEL_RESOURCE_ATTRIBUTES="otelq.worktree.id=stale,'
+        'otelq.worktree.branch=feat,team=blue"\n'
+    )
+    assert otelq._run_set_resource_attributes(repo) == 0
+    attrs2 = _read_attrs(env_path)
+    assert attrs2["otelq.worktree.id"] == str(repo.resolve())  # updated in place
+    assert attrs2["team"] == "blue"  # bespoke preserved
+    assert "OTHER_VAR=keep" in env_path.read_text()  # other lines preserved
+
+
+def test_ac4_set_resource_attributes_non_git_is_friendly_noop(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = otelq._run_set_resource_attributes(tmp_path)
+    assert code == 0
+    assert not (tmp_path / ".env.local").exists()
+    err = capsys.readouterr().err
+    assert "git" in err.lower()
+
+
+# ---- metrics view now carries resource_attributes (enables scoping) ---------
+
+
+def test_metrics_view_exposes_resource_attributes(
+    synth_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    cols, _ = otelq.cmd_sql(synth_conn, Namespace(query="SELECT * FROM metrics LIMIT 1"))
+    assert "resource_attributes" in cols
+
+
+# ---- census grouping (FR-4 / AC-5) ------------------------------------------
+
+
+def _census_rows(out: str) -> list[dict[str, Any]]:
+    label = otelq._SUMMARY_SERVICE_LABEL
+    second = _strip_header(out).split("\n\n" + label + "\n", 1)[1]
+    return _json.loads(second)
+
+
+def test_ac5_summary_census_groups_by_worktree(temp_telemetry: Path) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _write_wt_corpus(temp_telemetry, base)
+    out = _run(temp_telemetry, "summary")
+    got = {
+        (r["worktree_id"], r["worktree_branch"], r["service"], r["count"])
+        for r in _census_rows(out)
+    }
+    assert got == {
+        ("A", "feat-a", "svc-a", 3),
+        ("B", "feat-b", "svc-b", 3),
+        ("(untagged)", "", "svc-u", 3),
+    }
+    # The census is global — identical with --all-worktrees.
+    assert _census_rows(_run(temp_telemetry, "--all-worktrees", "summary")) == _census_rows(out)
+
+
+def test_ac1_untagged_census_is_two_columns(temp_telemetry: Path) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, service="svc")])
+    census = _census_rows(_run(temp_telemetry, "summary"))
+    assert all(set(r.keys()) == {"service", "count"} for r in census)
+    # And a scoped command emits no worktree banner on untagged telemetry.
+    assert "Worktree scope:" not in _run(temp_telemetry, "errors")
+
+
+# ---- default scoping + banner (FR-5, FR-6 / AC-6, AC-7) ---------------------
+
+
+def _services(out: str) -> set[str]:
+    return {r["service_name"] for r in _json.loads(_strip_header(out))}
+
+
+def test_ac6_default_scoping_mine_or_untagged(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _write_wt_corpus(temp_telemetry, base)
+    _patch_identity(monkeypatch, "A")
+    for cmd, argv in (
+        ("errors", ("errors",)),
+        ("slow", ("slow",)),
+        ("logs", ("logs",)),
+        ("metric", ("metric", "m.pool")),
+    ):
+        assert _services(_run(temp_telemetry, *argv)) == {"svc-a", "svc-u"}, cmd
+
+
+def test_ac7_scope_banner_reports_hidden(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _write_wt_corpus(temp_telemetry, base)
+    _patch_identity(monkeypatch, "A")
+    header = _header_of(_run(temp_telemetry, "errors"))
+    assert "Worktree scope: A" in header
+    # B contributes 3 rows (span+log+metric) across 1 distinct other worktree.
+    assert "3 row(s) from 1 other worktree(s) hidden" in header
+
+
+# ---- opt-out / redirection flags (FR-7 / AC-8, AC-9) ------------------------
+
+
+def test_ac8_all_worktrees_and_worktree_flags(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _write_wt_corpus(temp_telemetry, base)
+    _patch_identity(monkeypatch, "A")
+    assert _services(_run(temp_telemetry, "--all-worktrees", "errors")) == {
+        "svc-a",
+        "svc-b",
+        "svc-u",
+    }
+    assert "all worktrees" in _header_of(_run(temp_telemetry, "--all-worktrees", "errors"))
+    assert _services(_run(temp_telemetry, "--worktree", "B", "errors")) == {"svc-b", "svc-u"}
+    with pytest.raises(SystemExit):
+        otelq.main(
+            ["--dir", str(temp_telemetry), "--all-worktrees", "--worktree", "B", "errors"]
+        )
+
+
+def test_ac9_worktree_flag_forces_scope_on_untagged(temp_telemetry: Path) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            make_log(base, service="svc-1", severity="ERROR", sevnum=17),
+            make_log(base, service="svc-2", severity="ERROR", sevnum=17),
+        ],
+    )
+    out = _run(temp_telemetry, "--worktree", "nope", "errors")
+    # All rows are untagged, so mine-or-untagged keeps them all.
+    assert _services(out) == {"svc-1", "svc-2"}
+    header = _header_of(out)
+    assert "Worktree scope: nope" in header
+    assert "0 row(s) from 0 other worktree(s) hidden" in header
+
+
+# ---- undefined identity (FR-8 / AC-10) --------------------------------------
+
+
+def test_ac10_undefined_identity_is_unscoped(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _write_wt_corpus(temp_telemetry, base)
+    _patch_identity(monkeypatch, None)
+    out = _run(temp_telemetry, "errors")
+    assert _services(out) == {"svc-a", "svc-b", "svc-u"}
+    assert "showing all worktrees" in _header_of(out)
+
+
+# ---- sql never rewritten (FR-9 / AC-11) -------------------------------------
+
+
+def test_ac11_sql_is_never_scope_rewritten(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _write_wt_corpus(temp_telemetry, base)
+    _patch_identity(monkeypatch, "A")
+    out = _run(temp_telemetry, "sql", "SELECT count(*) AS n FROM logs")
+    assert _json.loads(out)[0]["n"] == 3  # all three cohorts, unscoped
+
+
+# ---- trace is a targeted lookup, not scoped (FR-10 / AC-12) -----------------
+
+
+def test_ac12_trace_not_scoped(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _write_wt_corpus(temp_telemetry, base)
+    _patch_identity(monkeypatch, "A")
+    out = _run(temp_telemetry, "trace", trace_hex("t-svc-b"))
+    rows = _json.loads(_strip_header(out))
+    assert len(rows) >= 1  # B's span tree resolves from worktree A
+    assert "Worktree scope:" not in out
+
+
+# ---- branch-only rows are untagged (FR-11 / AC-13) --------------------------
+
+
+def test_ac13_branch_only_is_untagged(temp_telemetry: Path) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [_tag_worktree(make_log(base, service="svc"), wt_id=None, branch="feat")],
+    )
+    census = _census_rows(_run(temp_telemetry, "summary"))
+    # No otelq.worktree.id anywhere ⇒ master switch off ⇒ 2-column census.
+    assert all(set(r.keys()) == {"service", "count"} for r in census)
+
+
+# ---- malformed / empty tags & env never raise (FR-12 / AC-14) ---------------
+
+
+def test_ac14_empty_tag_and_corrupt_env_dont_raise(
+    temp_telemetry: Path, tmp_path: Path
+) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [_tag_worktree(make_log(base, service="svc"), wt_id="")],  # empty ⇒ untagged
+    )
+    census = _census_rows(_run(temp_telemetry, "summary"))
+    assert all(set(r.keys()) == {"service", "count"} for r in census)
+
+    # A corrupt .env.local (no parseable OTEL_RESOURCE_ATTRIBUTES) falls back to git.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+    (repo / ".env.local").write_text("this is not = a valid attributes file\n\x00\n")
+    assert otelq.resolve_worktree_identity(repo) == str(repo.resolve())
+
+
+# ---- identity independent of --dir (EC-2 / AC-15) ---------------------------
+
+
+def test_ac15_identity_independent_of_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = tmp_path / ".telemetry"
+    store.mkdir()
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _write_wt_corpus(store, base)
+    _patch_identity(monkeypatch, "B")
+    out = _run(store, "errors")  # --dir points at a store carrying A/B/untagged
+    assert _services(out) == {"svc-b", "svc-u"}
+    assert "Worktree scope: B" in _header_of(out)
+
+
+# ---- --worktree matching nothing ⇒ empty + banner + exit 0 (EC-5 / AC-16) ---
+
+
+def test_ac16_worktree_no_match_is_empty_with_banner(temp_telemetry: Path) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    # Only tagged rows (A and B), no untagged: a non-matching --worktree keeps
+    # nothing, since the mine-or-untagged predicate has no untagged rows to admit.
+    write_jsonl(
+        temp_telemetry / "traces.jsonl",
+        [
+            _tag_worktree(make_span(base, trace_id="ta", span_id="sa", service="svc-a"), "A"),
+            _tag_worktree(make_span(base, trace_id="tb", span_id="sb", service="svc-b"), "B"),
+        ],
+    )
+    out = _run(temp_telemetry, "--worktree", "does-not-exist", "slow")
+    rows = _json.loads(_strip_header(out))
+    assert rows == []
+    assert "Worktree scope: does-not-exist" in _header_of(out)

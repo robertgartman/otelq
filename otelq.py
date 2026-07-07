@@ -60,6 +60,7 @@ import time
 import weakref
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict, cast
@@ -134,6 +135,11 @@ __all__ = [
     "_triage_config",
     "_TRIAGE_NO_HISTORY_MSG",
     "_TRIAGE_NO_CANDIDATE_MSG",
+    # worktree scoping (SPEC-otelq-worktree-scoping)
+    "resolve_worktree_identity",
+    "_parse_env_assignments",
+    "_parse_resource_attributes",
+    "_run_set_resource_attributes",
 ]
 
 # Default to ./.telemetry under the *current working directory* so the zero-config
@@ -220,6 +226,200 @@ EVENT_TIME_COLUMNS = {
     "metrics_histogram": "time_unix_nano",
     "metrics_exp_histogram": "time_unix_nano",
 }
+
+
+# --- Worktree identity (ADR-011 / SPEC-otelq-worktree-scoping) ----------------
+# A git-derived OTel resource attribute distinguishes telemetry from concurrent
+# worktrees that share one dev Collector. otelq only ever CONSUMES the tag (and
+# writes it into .env.local on request); the instrumented app emits it via
+# OTEL_RESOURCE_ATTRIBUTES. The whole feature is opt-in: nothing engages unless
+# the telemetry actually carries `otelq.worktree.id` (the master switch, FR-1).
+WORKTREE_ID_KEY = "otelq.worktree.id"
+WORKTREE_BRANCH_KEY = "otelq.worktree.branch"
+_WORKTREE_ENV_VAR = "OTEL_RESOURCE_ATTRIBUTES"
+# Precedence for the current worktree identity (FR-2): the per-checkout .env.local
+# the launcher sources, then the committed-convention .env, then git.
+_WORKTREE_ENV_FILES = (".env.local", ".env")
+_WORKTREE_UNTAGGED_LABEL = "(untagged)"
+# The list-shaped aggregates that scope to the current worktree by default
+# (FR-5). `summary` (a global discovery map), `trace` (a globally-unique id
+# lookup, FR-10), and `sql` (never rewritten, FR-9) are deliberately excluded.
+_WORKTREE_SCOPED_COMMANDS = frozenset({"errors", "slow", "logs", "metric"})
+
+
+def _git_output(git_args: list[str], cwd: Path) -> str | None:
+    """Run `git <git_args>` in `cwd`; return trimmed stdout, or None on any
+    failure (git absent, not a checkout, non-zero exit). otelq's only git
+    touch-point — bounded to worktree-identity resolution, and fail-friendly:
+    outside a checkout there is simply no identity (FR-12)."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", *git_args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, ValueError):
+        return None
+    if result.returncode != 0:
+        return None
+    out = result.stdout.strip()
+    return out or None
+
+
+def _git_toplevel(cwd: Path) -> str | None:
+    """The worktree's root path — guaranteed unique per worktree (the canonical
+    `otelq.worktree.id` value)."""
+    return _git_output(["rev-parse", "--show-toplevel"], cwd)
+
+
+def _git_branch(cwd: Path) -> str | None:
+    """The current branch name (a human-friendly `otelq.worktree.branch`).
+
+    `symbolic-ref --short HEAD` resolves the branch on both a normal and an
+    unborn branch (a fresh checkout with no commit yet); a detached-HEAD worktree
+    has no symbolic HEAD, so fall back to `rev-parse --abbrev-ref HEAD`, which
+    reports the non-descriptive `HEAD` there (EC-1). None only if neither yields a
+    value (branch is descriptive-only, so its absence never blocks scoping)."""
+    return _git_output(["symbolic-ref", "--short", "HEAD"], cwd) or _git_output(
+        ["rev-parse", "--abbrev-ref", "HEAD"], cwd
+    )
+
+
+def _parse_env_assignments(text: str) -> dict[str, str]:
+    """Parse `KEY=VALUE` lines from a .env-style file into a dict, honoring an
+    optional `export ` prefix and stripping one layer of matching quotes. Last
+    assignment wins. Never raises on odd lines — they are skipped (FR-12)."""
+    result: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key:
+            result[key] = value
+    return result
+
+
+def _parse_resource_attributes(value: str) -> dict[str, str]:
+    """Parse an `OTEL_RESOURCE_ATTRIBUTES` value (`k1=v1,k2=v2`) into a dict,
+    per the OpenTelemetry env-var convention. Malformed pairs are skipped."""
+    attrs: dict[str, str] = {}
+    for pair in value.split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        key, _, val = pair.partition("=")
+        key = key.strip()
+        if key:
+            attrs[key] = val.strip()
+    return attrs
+
+
+def _render_resource_attributes(attrs: dict[str, str]) -> str:
+    return ",".join(f"{key}={val}" for key, val in attrs.items())
+
+
+def _worktree_id_from_env_files(cwd: Path) -> str | None:
+    """The `otelq.worktree.id` declared in the cwd's .env.local (then .env)
+    `OTEL_RESOURCE_ATTRIBUTES`, or None. Empty is treated as absent (FR-11)."""
+    for name in _WORKTREE_ENV_FILES:
+        try:
+            text = (cwd / name).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        raw = _parse_env_assignments(text).get(_WORKTREE_ENV_VAR)
+        if not raw:
+            continue
+        wid = _parse_resource_attributes(raw).get(WORKTREE_ID_KEY)
+        if wid:
+            return wid
+    return None
+
+
+def resolve_worktree_identity(cwd: Path | None = None) -> str | None:
+    """The current worktree identity (FR-2): the env-file `otelq.worktree.id`
+    if declared, else `git rev-parse --show-toplevel`, else None. Resolved from
+    the CURRENT WORKING DIRECTORY — never from `--dir` (INV-1), so otelq reading
+    another worktree's shared store still knows which worktree it itself is."""
+    base = Path.cwd() if cwd is None else cwd
+    from_env = _worktree_id_from_env_files(base)
+    if from_env:
+        return from_env
+    return _git_toplevel(base)
+
+
+def _upsert_env_line(lines: list[str], key: str, value: str) -> list[str]:
+    """Return `lines` with the first `KEY=`/`export KEY=` assignment replaced by
+    `KEY="value"` (preserving an `export ` prefix), or the assignment appended
+    when none exists. Every other line is left byte-for-byte intact (INV-6)."""
+    rendered = f'{key}="{value}"'
+    out: list[str] = []
+    replaced = False
+    for raw in lines:
+        stripped = raw.strip()
+        bare = (
+            stripped[len("export ") :].lstrip()
+            if stripped.startswith("export ")
+            else stripped
+        )
+        if not replaced and bare.startswith(key + "="):
+            prefix = "export " if stripped.startswith("export ") else ""
+            out.append(prefix + rendered)
+            replaced = True
+        else:
+            out.append(raw)
+    if not replaced:
+        out.append(rendered)
+    return out
+
+
+def _run_set_resource_attributes(cwd: Path) -> int:
+    """`set_resource_attributes` (FR-3): merge the git-derived worktree keys into
+    the cwd's .env.local `OTEL_RESOURCE_ATTRIBUTES`, preserving bespoke attributes
+    and every other line. A friendly no-op (exit 0) outside a git checkout."""
+    top = _git_toplevel(cwd)
+    if top is None:
+        print(
+            "otelq: not a git checkout — nothing written. Run "
+            "set_resource_attributes from within a worktree.",
+            file=sys.stderr,
+        )
+        return 0
+    branch = _git_branch(cwd) or ""
+    env_path = cwd / ".env.local"
+    try:
+        existing_text = env_path.read_text(encoding="utf-8")
+    except OSError:
+        existing_text = ""
+    attrs = _parse_resource_attributes(
+        _parse_env_assignments(existing_text).get(_WORKTREE_ENV_VAR, "")
+    )
+    attrs[WORKTREE_ID_KEY] = top
+    attrs[WORKTREE_BRANCH_KEY] = branch
+    lines = existing_text.splitlines() if existing_text else []
+    lines = _upsert_env_line(lines, _WORKTREE_ENV_VAR, _render_resource_attributes(attrs))
+    try:
+        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"otelq: could not write {env_path}: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"otelq: wrote {WORKTREE_ID_KEY} and {WORKTREE_BRANCH_KEY} into "
+        f"{env_path} (source it before launching the instrumented app)."
+    )
+    return 0
 
 
 def _read_select(signal: str, staged_path: str) -> str:
@@ -436,9 +636,11 @@ def create_unified_metrics_view(conn: duckdb.DuckDBPyConnection) -> None:
 
     Unions all four per-type sub-relations that are present — gauge, sum,
     histogram, exp_histogram — projecting the common columns plus a `metric_type`
-    discriminator. The unified `value` is each gauge/sum row's scalar reading
-    (double_value, else int_value) and each histogram/exp_histogram row's `sum`.
-    Self-guarding: builds from whichever
+    discriminator and `resource_attributes` (so worktree scoping and the census
+    can key on it, SPEC-otelq-worktree-scoping; NULL for a sub-relation that
+    lacks the column, e.g. a minimal test double). The unified `value` is each
+    gauge/sum row's scalar reading (double_value, else int_value) and each
+    histogram/exp_histogram row's `sum`. Self-guarding: builds from whichever
     sub-relations are present and no-ops when none are. Both the hot and cold
     paths expose all four sub-relations whenever metrics are present (absent
     types seeded empty) and none when metrics are absent, so they produce the
@@ -446,12 +648,16 @@ def create_unified_metrics_view(conn: duckdb.DuckDBPyConnection) -> None:
     one place; reused by every relation builder and the test fixture.
     """
     have = _existing_relations(conn)
-    parts = [
-        f"SELECT time_unix_nano, service_name, name, unit, "
-        f"{value} AS value, '{mtype}' AS metric_type FROM {tbl}"
-        for tbl, mtype, value in _METRIC_VIEW_PARTS
-        if tbl in have
-    ]
+    parts: list[str] = []
+    for tbl, mtype, value in _METRIC_VIEW_PARTS:
+        if tbl not in have:
+            continue
+        ra = "resource_attributes" if _column_exists(conn, tbl, "resource_attributes") else "NULL"
+        parts.append(
+            f"SELECT time_unix_nano, service_name, name, unit, "
+            f"{value} AS value, '{mtype}' AS metric_type, "
+            f"{ra} AS resource_attributes FROM {tbl}"
+        )
     if parts:
         conn.execute("CREATE OR REPLACE VIEW metrics AS " + " UNION ALL ".join(parts))
 
@@ -513,6 +719,20 @@ def _scalar(rel: duckdb.DuckDBPyConnection) -> Any:
 def _existing_relations(conn: duckdb.DuckDBPyConnection) -> set[str]:
     rows = conn.execute("SELECT table_name FROM information_schema.tables").fetchall()
     return {r[0] for r in rows}
+
+
+def _column_exists(
+    conn: duckdb.DuckDBPyConnection, relation: str, column: str
+) -> bool:
+    """True iff `relation` (table or view) exposes `column`. Lets the worktree
+    helpers stay fail-friendly over minimal relations that omit the reader's
+    `resource_attributes` column (they simply contribute no worktree tags)."""
+    rows = conn.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = ? AND column_name = ? LIMIT 1",
+        [relation, column],
+    ).fetchall()
+    return bool(rows)
 
 
 # Per-connection memo of `relation -> has-rows`. otelq's query relations are built
@@ -1635,6 +1855,7 @@ def _format_response_header(
     session_id: str,
     regex: str | None = None,
     regex_removed: int | None = None,
+    worktree_banner: str | None = None,
 ) -> str:
     """Render the FR-29 response header: a fixed plain-text block naming the
     command, format, OpenTelemetry signal(s), UTC time range, and the FR-33
@@ -1642,7 +1863,10 @@ def _format_response_header(
     local time and can carry the session tag into follow-up calls. When
     `--regex` (FR-32) was supplied, two extra lines report the verbatim
     pattern and how many rows it removed, so a caller is never blind to what
-    was filtered away — unlike post-hoc `grep` on rendered output."""
+    was filtered away — unlike post-hoc `grep` on rendered output. When worktree
+    scoping engaged (FR-6), one `Worktree scope:` line names the active scope and
+    how many other-worktree rows were hidden; absent otherwise, so untagged
+    output is byte-identical (INV-2)."""
     lo, hi = time_range
     from_str = _iso_utc(lo) if lo is not None else "n/a"
     to_str = _iso_utc(hi) if hi is not None else "n/a"
@@ -1653,6 +1877,8 @@ def _format_response_header(
         f"OpenTelemetry signal: {_result_signal(command, rows)}",
         f"Time range: {from_str} - {to_str}",
     ]
+    if worktree_banner is not None:
+        lines.append(worktree_banner)
     if regex is not None:
         lines.append(f"Regex filter applied: {regex}")
         lines.append(f"Rows removed by regex: {regex_removed}")
@@ -1704,15 +1930,19 @@ def _resolve_regex_arg(args: argparse.Namespace) -> re.Pattern[str] | None:
 
 def run_command(
     args: argparse.Namespace, regex: re.Pattern[str] | None
-) -> tuple[list[str], list[Row], TimeRange, int | None, list[Row] | None]:
+) -> tuple[
+    list[str], list[Row], TimeRange, int | None, tuple[list[str], list[Row]] | None, str | None
+]:
     """Plan, build the connection, dispatch, and apply trace/metric cold-fallback.
 
     `regex` (already compiled and scope-validated by the caller, FR-32) is
     applied to each candidate result before the time range is computed, so
     `Time range` in the header reflects the rows actually returned. The
     fourth return value is the regex-removed row count, or `None` when no
-    `--regex` was supplied. The fifth is `summary`'s service-list second block
-    (FR-3), or `None` for every other command."""
+    `--regex` was supplied. The fifth is `summary`'s service census as
+    (columns, rows) (FR-4), or `None` for every other command. The sixth is the
+    worktree-scope header banner (FR-6), or `None` when no worktree behavior
+    engaged (⇒ untagged output stays byte-identical, INV-2)."""
     # A --dir that exists but is not a directory (e.g. a regular file) would
     # crash deep in the cache layer: _acquire_lock does mkdir('<file>/.otelq-cache')
     # and raises NotADirectoryError. Reject it up front with a friendly message
@@ -1728,6 +1958,9 @@ def run_command(
     fallback = plan.use_cache and plan.route == "HOT_THEN_COLD"
     with closing(build_connection(args.dir, plan)) as conn:
         _seal_external_access(conn, args.command)
+        # Resolve worktree scope BEFORE dispatch so scoped commands see the
+        # predicate on args; the banner is computed AFTER, over the same window.
+        args._worktree_scope = _resolve_worktree_scope(conn, args)
         try:
             columns, rows = command(conn, args)
         except NoTelemetryError:
@@ -1740,7 +1973,8 @@ def run_command(
                     rows, regex_removed = _apply_regex_filter(regex, rows)
                 time_range = _result_time_range(conn, args.command, columns, rows)
                 services = _maybe_service_rows(conn, args.command)
-                return columns, rows, time_range, regex_removed, services
+                banner = _worktree_banner(conn, args)
+                return columns, rows, time_range, regex_removed, services, banner
     # Fell through: the hot window held no answer and this command may widen to a
     # full-history cold scan (only `trace` today). closing() has already released
     # the hot connection before we open the cold one (D-3).
@@ -1751,13 +1985,15 @@ def run_command(
         )
     with closing(build_connection(args.dir, Plan("COLD", None, True))) as conn:
         _seal_external_access(conn, args.command)
+        args._worktree_scope = _resolve_worktree_scope(conn, args)
         columns, rows = command(conn, args)
         regex_removed = None
         if regex is not None:
             rows, regex_removed = _apply_regex_filter(regex, rows)
         time_range = _result_time_range(conn, args.command, columns, rows)
         services = _maybe_service_rows(conn, args.command)
-        return columns, rows, time_range, regex_removed, services
+        banner = _worktree_banner(conn, args)
+        return columns, rows, time_range, regex_removed, services, banner
 
 
 def format_output(columns: list[str], rows: list[tuple[Any, ...]], fmt: str) -> str:
@@ -1848,6 +2084,141 @@ _METRIC_TYPES: tuple[str, ...] = ("gauge", "sum", "histogram", "exp_histogram")
 # from flooding an agent's context; --top overrides it and a stderr notice fires
 # when the cap actually truncated the result (F-1).
 _DEFAULT_TOP = 50
+
+
+# --- Worktree scoping SQL + activation (SPEC-otelq-worktree-scoping) ----------
+
+
+def _worktree_id_sql(column: str = "resource_attributes") -> str:
+    """SQL that extracts a normalized `otelq.worktree.id` from a JSON
+    `resource_attributes` column: the string value, with empty coerced to NULL
+    so an empty tag reads as untagged (FR-11)."""
+    path = f'$."{WORKTREE_ID_KEY}"'
+    return f"NULLIF(json_extract_string({column}, '{path}'), '')"
+
+
+def _worktree_branch_sql(column: str = "resource_attributes") -> str:
+    path = f'$."{WORKTREE_BRANCH_KEY}"'
+    return f"NULLIF(json_extract_string({column}, '{path}'), '')"
+
+
+def _worktree_resource_union(conn: duckdb.DuckDBPyConnection) -> str | None:
+    """A `SELECT resource_attributes` union over whichever of traces/logs/metrics
+    both resolve and carry the column, or None. Defensive so the master switch
+    and hidden-row census never raise on a minimal relation (FR-12)."""
+    have = _existing_relations(conn)
+    parts = [
+        f"SELECT resource_attributes FROM {rel}"
+        for rel in ("traces", "logs", "metrics")
+        if rel in have and _column_exists(conn, rel, "resource_attributes")
+    ]
+    return " UNION ALL ".join(parts) if parts else None
+
+
+def _worktree_tags_present(conn: duckdb.DuckDBPyConnection) -> bool:
+    """The master switch (FR-1): True iff at least one row under the active
+    window carries a non-empty `otelq.worktree.id`. Absent ⇒ every command is
+    byte-identical to its pre-feature behavior (INV-2)."""
+    union = _worktree_resource_union(conn)
+    if union is None:
+        return False
+    expr = _worktree_id_sql()
+    row = conn.execute(
+        f"SELECT 1 FROM ({union}) WHERE {expr} IS NOT NULL LIMIT 1"
+    ).fetchone()
+    return row is not None
+
+
+def _worktree_hidden_stats(
+    conn: duckdb.DuckDBPyConnection, scope_id: str
+) -> tuple[int, int]:
+    """Window-level (rows_hidden, distinct_other_worktrees): the tagged rows from
+    OTHER worktrees across traces∪logs∪metrics that scoping to `scope_id` hides
+    (untagged rows are shown, so never counted). Uniform across scoped commands
+    (FR-6)."""
+    union = _worktree_resource_union(conn)
+    if union is None:
+        return 0, 0
+    expr = _worktree_id_sql()
+    row = conn.execute(
+        f"SELECT count(*), count(DISTINCT {expr}) FROM ({union}) "
+        f"WHERE {expr} IS NOT NULL AND {expr} <> ?",
+        [scope_id],
+    ).fetchone()
+    return (int(row[0]), int(row[1])) if row is not None else (0, 0)
+
+
+@dataclass(frozen=True)
+class _WorktreeScope:
+    """Resolved scoping state for one command invocation.
+
+    `active` ⇒ the command filters rows to `scope_id` (mine-or-untagged).
+    `mode` drives the header banner: 'scope' (active), 'all' (--all-worktrees),
+    'no-identity' (tags present but identity undefined), or 'off' (byte-identical,
+    no banner)."""
+
+    active: bool
+    scope_id: str | None
+    mode: str
+
+
+def _resolve_worktree_scope(
+    conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
+) -> _WorktreeScope:
+    """Decide whether/how a scoped command filters (FR-5, FR-7, FR-8). Identity
+    is resolved (a git touch) ONLY on the opt-in path — tags present and no
+    explicit flag — so untagged invocations pay no git cost and stay
+    byte-identical."""
+    if args.command not in _WORKTREE_SCOPED_COMMANDS:
+        return _WorktreeScope(False, None, "off")
+    override = getattr(args, "worktree", None)
+    if override is not None:  # --worktree forces scoping on (FR-7)
+        return _WorktreeScope(True, override, "scope")
+    if getattr(args, "all_worktrees", False):  # explicit global view (FR-7)
+        mode = "all" if _worktree_tags_present(conn) else "off"
+        return _WorktreeScope(False, None, mode)
+    if not _worktree_tags_present(conn):  # master switch off (FR-1)
+        return _WorktreeScope(False, None, "off")
+    identity = resolve_worktree_identity()
+    if identity is None:  # tagged telemetry but no resolvable identity (FR-8)
+        return _WorktreeScope(False, None, "no-identity")
+    return _WorktreeScope(True, identity, "scope")
+
+
+def _worktree_predicate(args: argparse.Namespace) -> tuple[str, list[str]]:
+    """The mine-or-untagged WHERE fragment for a scoped command, or ('', []) when
+    scoping is inactive. Always includes the `IS NULL` branch so untagged rows
+    are never hidden (INV-5)."""
+    scope: _WorktreeScope | None = getattr(args, "_worktree_scope", None)
+    if scope is None or not scope.active or scope.scope_id is None:
+        return "", []
+    expr = _worktree_id_sql()
+    return f"({expr} IS NULL OR {expr} = ?)", [scope.scope_id]
+
+
+def _worktree_banner(
+    conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
+) -> str | None:
+    """The header banner line for a scoped command (FR-6), or None when no
+    worktree behavior engaged (⇒ untagged output is byte-identical, INV-2)."""
+    scope: _WorktreeScope | None = getattr(args, "_worktree_scope", None)
+    if scope is None:
+        return None
+    if scope.mode == "off":
+        return None
+    if scope.mode == "all":
+        return "Worktree scope: all worktrees (scoping disabled via --all-worktrees)"
+    if scope.mode == "no-identity":
+        return (
+            "Worktree scope: none resolved (not in a git checkout and no "
+            ".env.local OTEL_RESOURCE_ATTRIBUTES); showing all worktrees"
+        )
+    hidden, others = _worktree_hidden_stats(conn, scope.scope_id or "")
+    return (
+        f"Worktree scope: {scope.scope_id} — this worktree + untagged; "
+        f"{hidden} row(s) from {others} other worktree(s) hidden "
+        f"(use --all-worktrees to include)"
+    )
 
 
 def _limited(
@@ -1958,29 +2329,58 @@ def cmd_summary(
 # after the per-signal block in every --format, behind a plain-text delimiter
 # that keeps the two format-rendered blocks unambiguous for a machine consumer.
 _SUMMARY_SERVICE_COLUMNS = ["service", "count"]
+# When worktree telemetry is present the census gains worktree columns AHEAD of
+# the service/count pair (FR-4); it stays global (never scoped, INV-3).
+_SUMMARY_SERVICE_WORKTREE_COLUMNS = [
+    "worktree_id",
+    "worktree_branch",
+    "service",
+    "count",
+]
 _SUMMARY_SERVICE_LABEL = "** List of services in telemetry data **"
 
 
-def _summary_by_service(conn: duckdb.DuckDBPyConnection) -> list[Row]:
-    """Per-service total record count across traces ∪ logs ∪ metrics, ordered
-    by count desc then service_name for determinism (byte-identical cached vs
-    --no-cache). All three relations always resolve under expose-empty (FR-1),
-    so the union is safe even when a signal is absent."""
-    return conn.execute(
+def _summary_by_service(
+    conn: duckdb.DuckDBPyConnection,
+) -> tuple[list[str], list[Row]]:
+    """`summary`'s service census (FR-4), always GLOBAL (never scoped, INV-3).
+
+    When worktree telemetry is present, group by
+    (otelq.worktree.id, otelq.worktree.branch, service_name) with untagged rows
+    rendered under `(untagged)`; otherwise keep the pre-feature (service, count)
+    shape byte-for-byte (INV-2). Ordered by count desc then the grouping keys for
+    determinism (byte-identical cached vs --no-cache). All three relations resolve
+    under expose-empty (FR-1)."""
+    if _worktree_tags_present(conn):
+        wid = _worktree_id_sql()
+        wbr = _worktree_branch_sql()
+        rows = conn.execute(
+            f"SELECT COALESCE({wid}, '{_WORKTREE_UNTAGGED_LABEL}') AS worktree_id, "
+            f"COALESCE({wbr}, '') AS worktree_branch, service_name, "
+            f"count(*) AS n FROM ("
+            "  SELECT service_name, resource_attributes FROM traces"
+            "  UNION ALL SELECT service_name, resource_attributes FROM logs"
+            "  UNION ALL SELECT service_name, resource_attributes FROM metrics"
+            ") GROUP BY 1, 2, 3 ORDER BY n DESC, worktree_id, worktree_branch, service_name"
+        ).fetchall()
+        return _SUMMARY_SERVICE_WORKTREE_COLUMNS, rows
+    rows = conn.execute(
         "SELECT service_name, count(*) AS n FROM ("
         "  SELECT service_name FROM traces"
         "  UNION ALL SELECT service_name FROM logs"
         "  UNION ALL SELECT service_name FROM metrics"
         ") GROUP BY service_name ORDER BY n DESC, service_name"
     ).fetchall()
+    return _SUMMARY_SERVICE_COLUMNS, rows
 
 
 def _maybe_service_rows(
     conn: duckdb.DuckDBPyConnection, command: str
-) -> list[Row] | None:
-    """`summary`'s service-list second block (FR-3), or `None` for every other
-    command — computed here (not in `cmd_summary`) so it stays out of the
-    command's own single-result contract and the direct-call summary tests."""
+) -> tuple[list[str], list[Row]] | None:
+    """`summary`'s service census as (columns, rows) — the columns vary with the
+    worktree master switch (FR-4) — or `None` for every other command. Computed
+    here (not in `cmd_summary`) so it stays out of the command's own single-result
+    contract and the direct-call summary tests."""
     return _summary_by_service(conn) if command == "summary" else None
 
 
@@ -2042,21 +2442,28 @@ def cmd_errors(
     # not require a second sql lookup. A log with no trace context carries its
     # raw (empty) value.
     columns = ["kind", "timestamp", "service_name", "label", "detail", "trace_id"]
+    # Worktree scoping (FR-5): AND the mine-or-untagged predicate onto each arm's
+    # own WHERE; the param repeats once per arm, in union order.
+    pred, pred_params = _worktree_predicate(args)
+    scope = f" AND {pred}" if pred else ""
     arms: list[str] = []
+    params: list[str] = []
     if _has_rows(conn, "traces"):
         arms.append(
             "SELECT 'span' AS kind, start_time_unix_nano AS timestamp, "
             "service_name, name AS label, status_status_message AS detail, "
-            "trace_id FROM traces WHERE status_code = 2"
+            "trace_id FROM traces WHERE status_code = 2" + scope
         )
+        params.extend(pred_params)
     if _has_rows(conn, "logs"):
         # FR-4: match case-insensitively. severity_text carries inconsistent
         # casing in practice (e.g. "Error"), so fold before comparing (cf. FR-2).
         arms.append(
             "SELECT 'log' AS kind, time_unix_nano AS timestamp, service_name, "
             "severity_text AS label, body AS detail, trace_id "
-            "FROM logs WHERE upper(severity_text) IN ('ERROR', 'FATAL')"
+            "FROM logs WHERE upper(severity_text) IN ('ERROR', 'FATAL')" + scope
         )
+        params.extend(pred_params)
     if not arms:
         return columns, []
     # FR-4 orders newest-first; the trailing keys are a deterministic tie-breaker
@@ -2067,7 +2474,7 @@ def cmd_errors(
         " UNION ALL ".join(arms)
         + " ORDER BY timestamp DESC, kind, service_name, label, detail, trace_id"
     )
-    rows = _limited(conn, query, [], getattr(args, "top", _DEFAULT_TOP))
+    rows = _limited(conn, query, params, getattr(args, "top", _DEFAULT_TOP))
     return columns, rows
 
 
@@ -2076,6 +2483,8 @@ def cmd_slow(
 ) -> CommandResult:
     _require(conn, "traces")
     columns = ["timestamp", "service_name", "span_name", "duration_ms", "trace_id"]
+    pred, pred_params = _worktree_predicate(args)  # FR-5
+    where = f" WHERE {pred}" if pred else ""
     rows = _limited(
         conn,
         # FR-5 orders by duration desc; the trailing keys (all present on every
@@ -2085,10 +2494,10 @@ def cmd_slow(
         f"SELECT start_time_unix_nano AS timestamp, service_name, "
         f"name AS span_name, "
         f"duration_time_unix_nano // {_NS_PER_MS} AS duration_ms, trace_id "
-        f"FROM traces "
+        f"FROM traces{where} "
         f"ORDER BY duration_time_unix_nano DESC, start_time_unix_nano DESC, "
         f"trace_id, service_name, name",
-        [],
+        pred_params,
         args.top,
     )
     return columns, rows
@@ -2191,6 +2600,10 @@ def cmd_logs(
         # both sides keeping it case-insensitive.
         where.append("contains(lower(body), lower(?))")
         params.append(args.grep)
+    pred, pred_params = _worktree_predicate(args)  # FR-5
+    if pred:
+        where.append(pred)
+        params.extend(pred_params)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     columns = ["timestamp", "service_name", "severity_text", "body", "trace_id"]
     rows = _limited(
@@ -2221,17 +2634,19 @@ def cmd_metric(
         "value",
         "metric_unit",
     ]
+    pred, pred_params = _worktree_predicate(args)  # FR-5
+    scope = f" AND {pred}" if pred else ""
     rows = _limited(
         conn,
         # FR-8 orders ascending by event-time; the trailing keys are a
         # deterministic tie-breaker (name is filtered to a constant) so
         # equal-timestamp points render in the same order on the hot (parquet)
         # and cold (raw) paths — byte-identical cached vs --no-cache.
-        "SELECT time_unix_nano AS timestamp, service_name, "
-        "name AS metric_name, metric_type, value, "
-        "unit AS metric_unit FROM metrics WHERE name = ? "
-        "ORDER BY time_unix_nano, service_name, value, metric_type, unit",
-        [args.name],
+        f"SELECT time_unix_nano AS timestamp, service_name, "
+        f"name AS metric_name, metric_type, value, "
+        f"unit AS metric_unit FROM metrics WHERE name = ?{scope} "
+        f"ORDER BY time_unix_nano, service_name, value, metric_type, unit",
+        [args.name, *pred_params],
         getattr(args, "top", _DEFAULT_TOP),
     )
     return columns, rows
@@ -2546,6 +2961,16 @@ def build_parser() -> argparse.ArgumentParser:
               errors / slow / logs / metric cap output with --top N and print a
               one-line notice to stderr when the result was truncated.
 
+            worktree scoping (opt-in; engages only when telemetry carries
+              otelq.worktree.id tags — otherwise every command is unchanged):
+              errors / slow / logs / metric default to the CURRENT worktree
+              (plus untagged rows) and print a `Worktree scope:` header line.
+              --all-worktrees   include every worktree (disable scoping)
+              --worktree ID     scope to a specific otelq.worktree.id
+              (both GLOBAL, mutually exclusive; `summary`, `trace`, and `sql`
+              are never scoped). Run `set_resource_attributes` to write the
+              git-derived tags into ./.env.local for the launcher to source.
+
             regex filtering (summary/errors/slow/trace/logs/metric only):
               --regex PATTERN  keep only rows matching PATTERN in some cell.
                                Applied BEFORE rendering, so JSON escaping/CSV
@@ -2656,6 +3081,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="tag this and consecutive related invocations with a shared id "
         "(default: a generated UUIDv7); echoed in the header and session footer",
     )
+    # Worktree scoping (SPEC-otelq-worktree-scoping): both are GLOBAL and mutually
+    # exclusive. By default a scoped command (errors/slow/logs/metric) filters to
+    # the current worktree ONLY when the telemetry carries otelq.worktree.id tags
+    # (FR-1). --all-worktrees opts out of that filtering; --worktree ID forces a
+    # specific scope even when no identity resolves (FR-7).
+    worktree_group = parser.add_mutually_exclusive_group()
+    worktree_group.add_argument(
+        "--all-worktrees",
+        action="store_true",
+        help="include every worktree's telemetry (disable default worktree scoping)",
+    )
+    worktree_group.add_argument(
+        "--worktree",
+        metavar="ID",
+        help="scope errors/slow/logs/metric to this otelq.worktree.id (plus untagged rows)",
+    )
 
     # Not required: a bare `otelq` (command is None) prints full help in main().
     sub = parser.add_subparsers(dest="command", required=False)
@@ -2723,6 +3164,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "troubleshoot",
         help="print the capture → query loop and common fixes",
+    )
+    sub.add_parser(
+        "set_resource_attributes",
+        help="write git-derived otelq.worktree.id/branch into ./.env.local "
+        "(opt-in worktree tagging; source it before launching the app)",
     )
     p_help = sub.add_parser("help", help="show help for otelq or a command")
     p_help.add_argument(
@@ -3640,6 +4086,10 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "collector-config":
         print(render_collector_config())
         return 0
+    if args.command == "set_resource_attributes":
+        # A meta command (FR-3): no --dir/connection. Writes the git-derived
+        # worktree keys into the cwd's .env.local for the launcher to source.
+        return _run_set_resource_attributes(Path.cwd())
     if args.command == "troubleshoot":
         print(render_troubleshooting())
         return 0
@@ -3658,7 +4108,9 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "triage":
         return _run_triage(args, session_supplied)
     try:
-        columns, rows, time_range, regex_removed, services = run_command(args, regex)
+        columns, rows, time_range, regex_removed, services, worktree_banner = (
+            run_command(args, regex)
+        )
     except NoTelemetryError as exc:
         _history_note_rows(0)
         print(exc, file=sys.stderr)
@@ -3674,17 +4126,19 @@ def _dispatch(args: argparse.Namespace) -> int:
                 args.session_id,
                 args.regex,
                 regex_removed,
+                worktree_banner,
             )
         )
     print(format_output(columns, rows, args.format))
     if services is not None:
-        # summary's second block (FR-3): a plain-text delimiter makes the two
+        # summary's second block (FR-3/FR-4): a plain-text delimiter makes the two
         # format-rendered blocks unambiguous for a machine consumer, in every
-        # --format. The first block above is byte-identical to summary's output
-        # before this block existed.
+        # --format. Without worktree tags the columns/rows are byte-identical to
+        # summary's output before this block existed (INV-2).
+        service_columns, service_rows = services
         print()
         print(_SUMMARY_SERVICE_LABEL)
-        print(format_output(_SUMMARY_SERVICE_COLUMNS, services, args.format))
+        print(format_output(service_columns, service_rows, args.format))
     return 0
 
 
