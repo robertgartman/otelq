@@ -20,7 +20,7 @@ otel-demo:
     mkdir -p .telemetry
     docker compose -f compose.yaml -f compose.demo.yaml --profile otel up -d
     @echo "Generating ~15s of synthetic telemetry via telemetrygen (fast+slow traces, metrics, all six log levels; one-shot)..."
-    docker compose -f compose.yaml -f compose.demo.yaml --profile demo up
+    id=; br=; [ -f .env.local ] && { set -a; . ./.env.local; set +a; }; ra="${OTEL_RESOURCE_ATTRIBUTES:-}"; id=$(printf '%s' "$ra" | tr ',' '\n' | sed -n 's/^ *otelq\.worktree\.id=//p' | head -1); br=$(printf '%s' "$ra" | tr ',' '\n' | sed -n 's/^ *otelq\.worktree\.branch=//p' | head -1); [ -n "$id" ] || id=$(git rev-parse --show-toplevel 2>/dev/null || echo /repo/otelq-demo); [ -n "$br" ] || br=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo demo); echo "Tagging demo telemetry with worktree id=$id branch=$br"; OTELQ_WORKTREE_ID="$id" OTELQ_WORKTREE_BRANCH="$br" docker compose -f compose.yaml -f compose.demo.yaml --profile demo up
     -docker compose -f compose.yaml -f compose.demo.yaml --profile demo rm -fs >/dev/null 2>&1
     @echo "Waiting for the Collector to flush its final batch (5s batch timeout)..."
     sleep 7

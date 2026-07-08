@@ -23,6 +23,16 @@ x-telemetrygen: &telemetrygen
   image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen@sha256:6bb6a56e325b8e8a600a9d6a5acb7e08a96cfefac08ddab052af540633abce77
   profiles: ["demo"]
   restart: "no" # one-shot: emit for --duration, then exit
+  # Every generator stamps the SAME worktree resource attributes, so the demo
+  # populates otelq's worktree census (SPEC-otelq-worktree-scoping). These are set
+  # per-command via `--otlp-attributes` (resource-level attrs) rather than via the
+  # OTEL_RESOURCE_ATTRIBUTES env var, because telemetrygen only honors that env var
+  # for TRACES — its logs and metrics generators build their resource solely from
+  # flags. The id/branch come from the environment: `just otel-demo` derives THIS
+  # worktree's identity (preferring ./.env.local, else git) and exports
+  # OTELQ_WORKTREE_ID / OTELQ_WORKTREE_BRANCH, so demo rows stay visible in scoped
+  # views (errors/slow/logs/metric) as well as the always-global summary census. A
+  # synthetic fallback keeps a bare `docker compose ... --profile demo up` tagged.
 
 services:
   otel-collector:
@@ -63,7 +73,9 @@ services:
     <<: *telemetrygen
     command:
       ["traces", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
-       "--duration", "15s", "--rate", "5", "--service", "otelq-demo"]
+       "--duration", "15s", "--rate", "5", "--service", "otelq-demo",
+       "--otlp-attributes", "otelq.worktree.id=\"${OTELQ_WORKTREE_ID:-/repo/otelq-demo}\"",
+       "--otlp-attributes", "otelq.worktree.branch=\"${OTELQ_WORKTREE_BRANCH:-demo}\""]
 
   # Slow spans — a minority over otelq's 1s slow threshold.
   telemetrygen-traces-slow:
@@ -71,7 +83,9 @@ services:
     command:
       ["traces", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
        "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
-       "--span-duration", "2s"]
+       "--span-duration", "2s",
+       "--otlp-attributes", "otelq.worktree.id=\"${OTELQ_WORKTREE_ID:-/repo/otelq-demo}\"",
+       "--otlp-attributes", "otelq.worktree.branch=\"${OTELQ_WORKTREE_BRANCH:-demo}\""]
 
   # Gauge metrics — the bulk (telemetrygen's default metric type, stated explicitly).
   telemetrygen-metrics-gauge:
@@ -79,7 +93,9 @@ services:
     command:
       ["metrics", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
        "--duration", "15s", "--rate", "5", "--service", "otelq-demo",
-       "--metric-type", "Gauge"]
+       "--metric-type", "Gauge",
+       "--otlp-attributes", "otelq.worktree.id=\"${OTELQ_WORKTREE_ID:-/repo/otelq-demo}\"",
+       "--otlp-attributes", "otelq.worktree.branch=\"${OTELQ_WORKTREE_BRANCH:-demo}\""]
 
   # Sum metrics — a smaller stream so `metrics_sum` (and {sum} in the metrics view)
   # is populated too, not just gauge.
@@ -88,7 +104,9 @@ services:
     command:
       ["metrics", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
        "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
-       "--metric-type", "Sum"]
+       "--metric-type", "Sum",
+       "--otlp-attributes", "otelq.worktree.id=\"${OTELQ_WORKTREE_ID:-/repo/otelq-demo}\"",
+       "--otlp-attributes", "otelq.worktree.branch=\"${OTELQ_WORKTREE_BRANCH:-demo}\""]
 
   # Histogram metrics — a smaller stream so `metrics_histogram` is populated.
   telemetrygen-metrics-histogram:
@@ -96,7 +114,9 @@ services:
     command:
       ["metrics", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
        "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
-       "--metric-type", "Histogram"]
+       "--metric-type", "Histogram",
+       "--otlp-attributes", "otelq.worktree.id=\"${OTELQ_WORKTREE_ID:-/repo/otelq-demo}\"",
+       "--otlp-attributes", "otelq.worktree.branch=\"${OTELQ_WORKTREE_BRANCH:-demo}\""]
 
   # Exponential-histogram metrics — a smaller stream for `metrics_exp_histogram`.
   telemetrygen-metrics-exp-histogram:
@@ -104,7 +124,9 @@ services:
     command:
       ["metrics", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
        "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
-       "--metric-type", "ExponentialHistogram"]
+       "--metric-type", "ExponentialHistogram",
+       "--otlp-attributes", "otelq.worktree.id=\"${OTELQ_WORKTREE_ID:-/repo/otelq-demo}\"",
+       "--otlp-attributes", "otelq.worktree.branch=\"${OTELQ_WORKTREE_BRANCH:-demo}\""]
 
   # Logs span all six canonical levels (severity-number ranges TRACE 1-4,
   # DEBUG 5-8, INFO 9-12, WARN 13-16, ERROR 17-20, FATAL 21-24). INFO is the bulk;
@@ -117,7 +139,9 @@ services:
     command:
       ["logs", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
        "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
-       "--severity-number", "1", "--severity-text", "Trace"]
+       "--severity-number", "1", "--severity-text", "Trace",
+       "--otlp-attributes", "otelq.worktree.id=\"${OTELQ_WORKTREE_ID:-/repo/otelq-demo}\"",
+       "--otlp-attributes", "otelq.worktree.branch=\"${OTELQ_WORKTREE_BRANCH:-demo}\""]
 
   # DEBUG logs — a smaller stream (severity 5).
   telemetrygen-logs-debug:
@@ -125,14 +149,18 @@ services:
     command:
       ["logs", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
        "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
-       "--severity-number", "5", "--severity-text", "Debug"]
+       "--severity-number", "5", "--severity-text", "Debug",
+       "--otlp-attributes", "otelq.worktree.id=\"${OTELQ_WORKTREE_ID:-/repo/otelq-demo}\"",
+       "--otlp-attributes", "otelq.worktree.branch=\"${OTELQ_WORKTREE_BRANCH:-demo}\""]
 
   # INFO logs — the bulk (telemetrygen defaults to severity 9 / "Info").
   telemetrygen-logs-info:
     <<: *telemetrygen
     command:
       ["logs", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
-       "--duration", "15s", "--rate", "5", "--service", "otelq-demo"]
+       "--duration", "15s", "--rate", "5", "--service", "otelq-demo",
+       "--otlp-attributes", "otelq.worktree.id=\"${OTELQ_WORKTREE_ID:-/repo/otelq-demo}\"",
+       "--otlp-attributes", "otelq.worktree.branch=\"${OTELQ_WORKTREE_BRANCH:-demo}\""]
 
   # WARN logs — a smaller stream (severity 13).
   telemetrygen-logs-warn:
@@ -140,7 +168,9 @@ services:
     command:
       ["logs", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
        "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
-       "--severity-number", "13", "--severity-text", "Warn"]
+       "--severity-number", "13", "--severity-text", "Warn",
+       "--otlp-attributes", "otelq.worktree.id=\"${OTELQ_WORKTREE_ID:-/repo/otelq-demo}\"",
+       "--otlp-attributes", "otelq.worktree.branch=\"${OTELQ_WORKTREE_BRANCH:-demo}\""]
 
   # ERROR logs — a smaller stream (severity 17); makes `otelq errors` meaningful.
   telemetrygen-logs-error:
@@ -148,7 +178,9 @@ services:
     command:
       ["logs", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
        "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
-       "--severity-number", "17", "--severity-text", "Error"]
+       "--severity-number", "17", "--severity-text", "Error",
+       "--otlp-attributes", "otelq.worktree.id=\"${OTELQ_WORKTREE_ID:-/repo/otelq-demo}\"",
+       "--otlp-attributes", "otelq.worktree.branch=\"${OTELQ_WORKTREE_BRANCH:-demo}\""]
 
   # FATAL logs — a smaller stream (severity 21); also surfaced by `otelq errors`.
   telemetrygen-logs-fatal:
@@ -156,4 +188,6 @@ services:
     command:
       ["logs", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure",
        "--duration", "15s", "--rate", "1", "--service", "otelq-demo",
-       "--severity-number", "21", "--severity-text", "Fatal"]
+       "--severity-number", "21", "--severity-text", "Fatal",
+       "--otlp-attributes", "otelq.worktree.id=\"${OTELQ_WORKTREE_ID:-/repo/otelq-demo}\"",
+       "--otlp-attributes", "otelq.worktree.branch=\"${OTELQ_WORKTREE_BRANCH:-demo}\""]
