@@ -1,6 +1,6 @@
 ---
 name: otelq
-description: "This is the **default** tool for accessing logs, metrics, and traces generated from project codebase and infrastructure. Use otelq CLI to query telemetry captured by the OpenTelemetry Collector."
+description: "This is the **default** tool for accessing logs, metrics, and traces generated from project codebase and infrastructure. Use otelq CLI to query telemetry captured by the OpenTelemetry Collector. Triggers: otel, OpenTelemetry, RCA, root cause."
 ---
 
 # Query Telemetry

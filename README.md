@@ -14,6 +14,41 @@ otelq is a tiny command-line tool that turns the OpenTelemetry signals your appl
 - **Zero heavy infrastructure.** A stock [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) writes signals to plain JSONL files; otelq reads them in-process with DuckDB. Nothing to deploy, nothing to run between queries. A one-shot bundled demo gets you querying real signals in seconds.
 - **Fully local, fully isolated.** Telemetry never leaves your machine — it lives in a directory you own and read directly. Nothing is shipped to a backend, a vendor, or the cloud.
 
+## Install & run
+
+### Install
+
+1. Install [Astral `uv`](https://docs.astral.sh/uv/getting-started/installation/).
+2. Clone otelq locally:
+
+   ```sh
+   git clone https://github.com/robertgartman/otelq
+   ```
+
+3. From inside the clone, open your favourite agentic coding tool and invoke the skill — it wires otelq into the target project's Collector and installs the otelq query skill there:
+
+   ```text
+   /target-project-setup <path-to-the-repo-you-want-to-use-with-otelq>
+   ```
+
+### Run
+
+**(1) Through your AI coding agent (the main path)** — this is what otelq is built for. Once the `otelq` query skill is installed in your project (step 3 above), just ask your agent in plain language — *"did the last run error?"*, *"what was slow?"*, *"show me trace X"*, *"otel RCA on the last error"* — and it drives the `otelq` CLI for you, reading the skill for the commands and query loop. You rarely type otelq yourself; the agent runs it in the same loop it codes in. If you want to nudge the flow, run `/otelq summary`.
+
+The two paths below are the same CLI invoked by hand — useful for a quick check or for the agent under the hood.
+
+**(2a) Zero-install via PyPI (recommended)** — run otelq straight from [PyPI](https://pypi.org/project/otelq/) with `uvx`; no clone, no install. This is what the skill-based AI workflow uses:
+
+```sh
+uvx otelq summary             # pin a version with: uvx otelq@0.1.0 summary
+```
+
+**(2b) From the repo or a local clone** — `otelq.py` is a [PEP 723](https://peps.python.org/pep-0723/) single-file script, so `uv` can run it directly:
+
+```sh
+uv run otelq.py summary
+```
+
 ## Take it for a test run
 
 See it work in under a minute — no app to instrument. Clone the otelq repo and run the demo: it starts the Collector (in Docker) and pushes a few seconds of synthetic traces, metrics, and logs through it with [telemetrygen](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen), the official OpenTelemetry load generator.
@@ -153,21 +188,74 @@ So if you keep the Collector in production, make the configuration this project 
 
 Concretely, that means parameterizing the pieces otelq added — gating the `file` exporters and the `.telemetry/` bind mount behind a profile or environment variable, and selecting the production exporter set when deploying — so a single Compose definition flips cleanly between *"store telemetry locally for otelq"* and *"ship telemetry to a remote, production-compliant collector."*
 
-## Install / run options
+## Worktree isolation
 
-**(a) Zero-install via PyPI (recommended)** — run otelq straight from [PyPI](https://pypi.org/project/otelq/) with `uvx`; no clone, no install. This is what the skill-based AI workflow uses:
+Agentic development increasingly means several **git worktrees** of the same repository checked out side by side, each exercised at the same time by a different agent or human. That collides with otelq's capture model in a way worth understanding up front.
+
+- **The Collector is shared.** Only one dev Collector can run per host — it binds the fixed OTLP ports `:4317` / `:4318` (see [Architecture](#architecture)). Every worktree's instrumented app targets that same endpoint, so all of their telemetry funnels through one Collector.
+- **All signals land in one directory.** That Collector writes JSONL into the single `.telemetry/` directory it bind-mounts — the one under the checkout where you started it (typically your default/primary checkout). Worktrees do **not** get their own `.telemetry/`; their signals are appended right alongside everyone else's.
+- **So concurrent worktrees produce confusing telemetry.** Traces, logs, and metrics from `feature-x`, `hotfix`, and `main` all interleave in the same files with nothing to tell them apart — a slow span you're chasing might belong to a run in an entirely different worktree.
+
+### The fix: a git-derived resource attribute
+
+OpenTelemetry already has a spec-blessed, zero-code way to stamp identity onto every signal: the [`OTEL_RESOURCE_ATTRIBUTES`](https://opentelemetry.io/docs/languages/sdk-configuration/general/#otel_resource_attributes) environment variable. Every official SDK merges it onto the **Resource** carried by every span / log / metric at startup — no application code change required.
+
+otelq leans on exactly that, tagging each worktree with two attributes:
+
+- **`otelq.worktree.id`** — the worktree's absolute path (`git rev-parse --show-toplevel`), guaranteed unique per worktree. This is the discriminator.
+- **`otelq.worktree.branch`** — the checked-out branch, a human-friendly secondary label.
+
+Once telemetry carries these tags, otelq's built-in commands (`errors`, `slow`, `logs`, `metric`, and the `summary` census) automatically scope to the **current** worktree — its own rows plus untagged infrastructure — so you see only what your work emitted. Nothing changes until the tags are present: the feature is fully opt-in. (`sql` is never auto-scoped; see the predicate in [Commands](#commands).)
+
+### Wiring it up
+
+The identity has to reach the app's environment **before the SDK starts**. Two ways:
+
+**1. Let otelq write it.** From inside a worktree:
 
 ```sh
-uvx otelq summary             # pin a version with: uvx otelq@0.1.0 summary
+otelq set_resource_attributes      # merges OTEL_RESOURCE_ATTRIBUTES into ./.env.local
 ```
 
-**(b) From the repo or a local clone** — `otelq.py` is a [PEP 723](https://peps.python.org/pep-0723/) single-file script, so `uv` can run it directly:
+It derives the id/branch from the current checkout and merges them into that worktree's `.env.local`, preserving any other keys. Then **source that file** before launching your process so the SDK picks it up:
 
 ```sh
-uv run otelq.py summary
+set -a; . ./.env.local; set +a
+# ...run your instrumented app / tests...
 ```
 
+Automate it by calling `set_resource_attributes` from your worktree's launch script or task runner.
 
+**2. Manage `.env.local` yourself.** It's just a dotenv file — set `OTEL_RESOURCE_ATTRIBUTES` by hand if you prefer:
+
+```dotenv
+OTEL_RESOURCE_ATTRIBUTES="otelq.worktree.id=/Users/me/dev/my-service-feature-x,otelq.worktree.branch=feature-x"
+```
+
+Either way, point otelq at the shared store when querying from a worktree (it has no `.telemetry/` of its own):
+
+```sh
+otelq --dir ../my-service/.telemetry errors    # auto-scoped to THIS worktree
+```
+
+### Where the files live
+
+```text
+~/dev/
+├── my-service/                  ← default checkout; the Collector runs here
+│   ├── .telemetry/              ← Docker bind mount — the ONE shared store
+│   │   ├── traces.jsonl         ·   EVERY worktree's signals land here
+│   │   ├── logs.jsonl
+│   │   └── metrics.jsonl
+│   └── .env.local               ← OTEL_RESOURCE_ATTRIBUTES for the default checkout
+│                                    (otelq.worktree.id = …/my-service)
+│
+└── my-service-feature-x/        ← a git worktree based off the same repo (no .telemetry/ needed)
+    └── .env.local               ← OTEL_RESOURCE_ATTRIBUTES for THIS worktree
+                                     (otelq.worktree.id = …/my-service-feature-x)
+```
+
+Both checkouts' apps send to the one Collector, which writes into `my-service/.telemetry/`; each app's signals are stamped from its own `.env.local`, and otelq uses that stamp to show you just your worktree's slice.
 
 ## Commands
 
@@ -177,7 +265,7 @@ This is a dump from running `uv run otelq.py --help` within the project root:
 usage: otelq [-h] [--version] [--dir DIR]
              [--format {table,json,jsonl,csv,compact}] [--all] [--no-cache]
              [--verbose] [--since SINCE] [--regex REGEX]
-             [--session-id SESSION_ID] [--all-worktrees | --worktree ID]
+             [--session-id SESSION_ID] [--all-worktrees]
              {summary,sql,errors,slow,trace,logs,metric,history,triage,collector-config,doctor,troubleshoot,set_resource_attributes,help}
              ...
 
@@ -232,8 +320,6 @@ options:
                         header and session footer
   --all-worktrees       include every worktree's telemetry (disable default
                         worktree scoping)
-  --worktree ID         scope errors/slow/logs/metric to this
-                        otelq.worktree.id (plus untagged rows)
 
 timestamps: ALL timestamps — printed by otelq and written into a
   `sql` query — are UTC. Write `sql` timestamp literals bare
@@ -275,9 +361,9 @@ worktree scoping (opt-in; engages only when telemetry carries
   errors / slow / logs / metric default to the CURRENT worktree
   (plus untagged rows) and print a `Worktree scope:` header line.
   --all-worktrees   include every worktree (disable scoping)
-  --worktree ID     scope to a specific otelq.worktree.id
-  (both GLOBAL, mutually exclusive; `summary`, `trace`, and `sql`
-  are never scoped). Run `set_resource_attributes` to write the
+  (GLOBAL; `summary`, `trace`, and `sql` are never scoped). To
+  inspect one specific other worktree, filter in `sql` on
+  otelq.worktree.id. Run `set_resource_attributes` to write the
   git-derived tags into ./.env.local for the launcher to source.
 
 regex filtering (summary/errors/slow/trace/logs/metric only):
@@ -305,6 +391,21 @@ sql views (for `otelq sql "<query>"`):
   reveals extra columns (span_attributes/log_attributes/
   metric_attributes, resource_attributes, scope_attributes, ...)
   carrying whatever custom OTel tags an app actually emits.
+  IMPORTANT — isolate your `sql` to this worktree: unlike the built-in
+  commands, `sql` is NEVER auto-scoped, so on a shared Collector it
+  sees EVERY concurrent worktree's rows. Scope a query to THIS
+  worktree (its own rows OR untagged infra) by AND-ing the
+  mine-or-untagged predicate on otelq.worktree.id into your WHERE.
+  Reference the reserved $WORKTREE_ID parameter — otelq binds it to
+  THIS worktree's id from .env.local at query time (never rewriting
+  your text), so the snippet is identical across worktrees, e.g.
+    sql "SELECT * FROM logs WHERE
+         (NULLIF(json_extract_string(resource_attributes,
+         '$."otelq.worktree.id"'), '') IS NULL
+         OR NULLIF(json_extract_string(resource_attributes,
+         '$."otelq.worktree.id"'), '') = $WORKTREE_ID)"
+  Run `set_resource_attributes` to print THIS worktree's exact id and
+  a ready-to-paste copy of that predicate — no need to hand-build it.
   traces   start_time_unix_nano (event-time),
            duration_time_unix_nano (ns), trace_id, span_id,
            parent_span_id, service_name, name (span name), kind,

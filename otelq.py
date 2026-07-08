@@ -139,7 +139,9 @@ __all__ = [
     "resolve_worktree_identity",
     "_parse_env_assignments",
     "_parse_resource_attributes",
+    "_worktree_scope_clause",
     "_run_set_resource_attributes",
+    "_execute_sql",
 ]
 
 # Default to ./.telemetry under the *current working directory* so the zero-config
@@ -241,6 +243,10 @@ _WORKTREE_ENV_VAR = "OTEL_RESOURCE_ATTRIBUTES"
 # the launcher sources, then the committed-convention .env, then git.
 _WORKTREE_ENV_FILES = (".env.local", ".env")
 _WORKTREE_UNTAGGED_LABEL = "(untagged)"
+# The one DuckDB named parameter `otelq sql` reserves (FR-13): when a submitted
+# query references `$WORKTREE_ID`, otelq binds it to the cwd's env-file worktree
+# identity via DuckDB's native parameter binding, never by rewriting the text.
+_RESERVED_SQL_PARAM = "WORKTREE_ID"
 # The list-shaped aggregates that scope to the current worktree by default
 # (FR-5). `summary` (a global discovery map), `trace` (a globally-unique id
 # lookup, FR-10), and `sql` (never rewritten, FR-9) are deliberately excluded.
@@ -416,9 +422,16 @@ def _run_set_resource_attributes(cwd: Path) -> int:
         print(f"otelq: could not write {env_path}: {exc}", file=sys.stderr)
         return 1
     print(
-        f"otelq: wrote {WORKTREE_ID_KEY} and {WORKTREE_BRANCH_KEY} into "
-        f"{env_path} (source it before launching the instrumented app)."
+        f"otelq: wrote worktree identity into {env_path} "
+        "(source it before launching the instrumented app):"
     )
+    print(f"  {WORKTREE_ID_KEY}     = {top}")
+    print(f"  {WORKTREE_BRANCH_KEY} = {branch}")
+    print(
+        "to scope an `otelq sql` query to this worktree (its rows plus untagged "
+        "infra), add to your WHERE (otelq binds $WORKTREE_ID from .env.local):"
+    )
+    print(f"  {_worktree_scope_clause()}")
     return 0
 
 
@@ -2102,6 +2115,21 @@ def _worktree_branch_sql(column: str = "resource_attributes") -> str:
     return f"NULLIF(json_extract_string({column}, '{path}'), '')"
 
 
+def _worktree_scope_clause(column: str = "resource_attributes") -> str:
+    """A ready-to-paste SQL predicate that scopes an `otelq sql` query to the
+    CURRENT worktree, **mine-or-untagged** (FR-9): the row's `otelq.worktree.id`
+    is absent OR equals the reserved `$WORKTREE_ID` parameter, which otelq binds
+    from the cwd's .env.local at query time (FR-13) — no literal id is embedded,
+    so the snippet is byte-identical across worktrees and never needs
+    hand-editing. Same shape as the parameterized `_worktree_predicate` the
+    built-in commands apply (INV-5), and the single generator reused by
+    `set_resource_attributes` (FR-3) so the snippet is identical wherever otelq
+    emits it."""
+    expr = _worktree_id_sql(column)
+    return f"({expr} IS NULL OR {expr} = ${_RESERVED_SQL_PARAM})"
+
+
+
 def _worktree_resource_union(conn: duckdb.DuckDBPyConnection) -> str | None:
     """A `SELECT resource_attributes` union over whichever of traces/logs/metrics
     both resolve and carry the column, or None. Defensive so the master switch
@@ -2171,9 +2199,6 @@ def _resolve_worktree_scope(
     byte-identical."""
     if args.command not in _WORKTREE_SCOPED_COMMANDS:
         return _WorktreeScope(False, None, "off")
-    override = getattr(args, "worktree", None)
-    if override is not None:  # --worktree forces scoping on (FR-7)
-        return _WorktreeScope(True, override, "scope")
     if getattr(args, "all_worktrees", False):  # explicit global view (FR-7)
         mode = "all" if _worktree_tags_present(conn) else "off"
         return _WorktreeScope(False, None, mode)
@@ -2329,12 +2354,13 @@ def cmd_summary(
 # after the per-signal block in every --format, behind a plain-text delimiter
 # that keeps the two format-rendered blocks unambiguous for a machine consumer.
 _SUMMARY_SERVICE_COLUMNS = ["service", "count"]
-# When worktree telemetry is present the census gains worktree columns AHEAD of
-# the service/count pair (FR-4); it stays global (never scoped, INV-3).
+# When worktree telemetry is present the census inserts worktree columns BETWEEN
+# the leading service column and the trailing count (FR-4); it stays global
+# (never scoped, INV-3).
 _SUMMARY_SERVICE_WORKTREE_COLUMNS = [
-    "worktree_id",
-    "worktree_branch",
     "service",
+    "otelq.worktree.id",
+    "otelq.worktree.branch",
     "count",
 ]
 _SUMMARY_SERVICE_LABEL = "** List of services in telemetry data **"
@@ -2355,13 +2381,14 @@ def _summary_by_service(
         wid = _worktree_id_sql()
         wbr = _worktree_branch_sql()
         rows = conn.execute(
-            f"SELECT COALESCE({wid}, '{_WORKTREE_UNTAGGED_LABEL}') AS worktree_id, "
-            f"COALESCE({wbr}, '') AS worktree_branch, service_name, "
+            f"SELECT service_name, "
+            f"COALESCE({wid}, '{_WORKTREE_UNTAGGED_LABEL}') AS worktree_id, "
+            f"COALESCE({wbr}, '') AS worktree_branch, "
             f"count(*) AS n FROM ("
             "  SELECT service_name, resource_attributes FROM traces"
             "  UNION ALL SELECT service_name, resource_attributes FROM logs"
             "  UNION ALL SELECT service_name, resource_attributes FROM metrics"
-            ") GROUP BY 1, 2, 3 ORDER BY n DESC, worktree_id, worktree_branch, service_name"
+            ") GROUP BY 1, 2, 3 ORDER BY n DESC, service_name, worktree_id, worktree_branch"
         ).fetchall()
         return _SUMMARY_SERVICE_WORKTREE_COLUMNS, rows
     rows = conn.execute(
@@ -2384,13 +2411,50 @@ def _maybe_service_rows(
     return _summary_by_service(conn) if command == "summary" else None
 
 
-def _execute_sql(
+def _sql_named_parameters(
     conn: duckdb.DuckDBPyConnection, query: str
+) -> set[str]:
+    """The DuckDB named parameters (`$name`) the query references, per DuckDB's
+    own parser — a token inside a string literal or comment is therefore NOT
+    counted (EC-8). Empty on any parse failure, so the caller runs the query
+    unchanged and DuckDB surfaces the real syntax error (FR-13)."""
+    import duckdb  # lazy; see TYPE_CHECKING note above
+
+    try:
+        statements = conn.extract_statements(query)
+    except duckdb.Error:
+        return set()
+    names: set[str] = set()
+    for statement in statements:
+        names |= statement.named_parameters
+    return names
+
+
+def _execute_sql(
+    conn: duckdb.DuckDBPyConnection, query: str, cwd: Path | None = None
 ) -> duckdb.DuckDBPyConnection | None:
-    """`execute()` really can return `None` for an empty / whitespace /
+    """Run a user `sql` query verbatim (FR-9). The one value otelq may supply is
+    the reserved `$WORKTREE_ID` named parameter, and only when the query itself
+    references it (FR-13): otelq binds it to the cwd's env-file worktree identity
+    via DuckDB's native parameter binding — the query text is never rewritten.
+    Referenced-but-unresolvable fails friendly and runs nothing; not referenced
+    ⇒ the query runs untouched (preserves FR-1/INV-2, no env-file read).
+
+    `execute()` really can return `None` for an empty / whitespace /
     comment-only query at runtime, even though the installed duckdb stub
     declares a non-Optional return type — this wrapper's own signature
     reflects the observed behavior instead of the stub's (EC-4, test_bug5)."""
+    if _RESERVED_SQL_PARAM in _sql_named_parameters(conn, query):
+        base = Path.cwd() if cwd is None else cwd
+        worktree_id = _worktree_id_from_env_files(base)
+        if not worktree_id:
+            raise SystemExit(
+                "otelq: query references $WORKTREE_ID but no otelq.worktree.id "
+                "is set in .env.local / .env — run "
+                "`otelq set_resource_attributes` (or set "
+                "OTEL_RESOURCE_ATTRIBUTES) first"
+            )
+        return conn.execute(query, {_RESERVED_SQL_PARAM: worktree_id})
     return conn.execute(query)
 
 
@@ -2966,9 +3030,9 @@ def build_parser() -> argparse.ArgumentParser:
               errors / slow / logs / metric default to the CURRENT worktree
               (plus untagged rows) and print a `Worktree scope:` header line.
               --all-worktrees   include every worktree (disable scoping)
-              --worktree ID     scope to a specific otelq.worktree.id
-              (both GLOBAL, mutually exclusive; `summary`, `trace`, and `sql`
-              are never scoped). Run `set_resource_attributes` to write the
+              (GLOBAL; `summary`, `trace`, and `sql` are never scoped). To
+              inspect one specific other worktree, filter in `sql` on
+              otelq.worktree.id. Run `set_resource_attributes` to write the
               git-derived tags into ./.env.local for the launcher to source.
 
             regex filtering (summary/errors/slow/trace/logs/metric only):
@@ -2996,6 +3060,21 @@ def build_parser() -> argparse.ArgumentParser:
               reveals extra columns (span_attributes/log_attributes/
               metric_attributes, resource_attributes, scope_attributes, ...)
               carrying whatever custom OTel tags an app actually emits.
+              IMPORTANT — isolate your `sql` to this worktree: unlike the built-in
+              commands, `sql` is NEVER auto-scoped, so on a shared Collector it
+              sees EVERY concurrent worktree's rows. Scope a query to THIS
+              worktree (its own rows OR untagged infra) by AND-ing the
+              mine-or-untagged predicate on otelq.worktree.id into your WHERE.
+              Reference the reserved $WORKTREE_ID parameter — otelq binds it to
+              THIS worktree's id from .env.local at query time (never rewriting
+              your text), so the snippet is identical across worktrees, e.g.
+                sql "SELECT * FROM logs WHERE
+                     (NULLIF(json_extract_string(resource_attributes,
+                     '$.\"otelq.worktree.id\"'), '') IS NULL
+                     OR NULLIF(json_extract_string(resource_attributes,
+                     '$.\"otelq.worktree.id\"'), '') = $WORKTREE_ID)"
+              Run `set_resource_attributes` to print THIS worktree's exact id and
+              a ready-to-paste copy of that predicate — no need to hand-build it.
               traces   start_time_unix_nano (event-time),
                        duration_time_unix_nano (ns), trace_id, span_id,
                        parent_span_id, service_name, name (span name), kind,
@@ -3081,21 +3160,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="tag this and consecutive related invocations with a shared id "
         "(default: a generated UUIDv7); echoed in the header and session footer",
     )
-    # Worktree scoping (SPEC-otelq-worktree-scoping): both are GLOBAL and mutually
-    # exclusive. By default a scoped command (errors/slow/logs/metric) filters to
-    # the current worktree ONLY when the telemetry carries otelq.worktree.id tags
-    # (FR-1). --all-worktrees opts out of that filtering; --worktree ID forces a
-    # specific scope even when no identity resolves (FR-7).
-    worktree_group = parser.add_mutually_exclusive_group()
-    worktree_group.add_argument(
+    # Worktree scoping (SPEC-otelq-worktree-scoping): a single GLOBAL opt-out.
+    # By default a scoped command (errors/slow/logs/metric) filters to the current
+    # worktree ONLY when the telemetry carries otelq.worktree.id tags (FR-1).
+    # --all-worktrees opts out of that filtering; to target one specific worktree,
+    # filter in `sql` on otelq.worktree.id (FR-7 / FR-9).
+    parser.add_argument(
         "--all-worktrees",
         action="store_true",
         help="include every worktree's telemetry (disable default worktree scoping)",
-    )
-    worktree_group.add_argument(
-        "--worktree",
-        metavar="ID",
-        help="scope errors/slow/logs/metric to this otelq.worktree.id (plus untagged rows)",
     )
 
     # Not required: a bare `otelq` (command is None) prints full help in main().

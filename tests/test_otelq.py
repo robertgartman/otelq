@@ -3431,7 +3431,9 @@ def _read_attrs(env_path: Path) -> dict[str, str]:
     return otelq._parse_resource_attributes(assignments.get("OTEL_RESOURCE_ATTRIBUTES", ""))
 
 
-def test_ac3_set_resource_attributes_writes_and_merges(tmp_path: Path) -> None:
+def test_ac3_set_resource_attributes_writes_and_merges(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     _git_init(repo, branch="feat")
@@ -3441,6 +3443,15 @@ def test_ac3_set_resource_attributes_writes_and_merges(tmp_path: Path) -> None:
     attrs = _read_attrs(env_path)
     assert attrs["otelq.worktree.id"] == str(repo.resolve())
     assert attrs["otelq.worktree.branch"] == "feat"
+
+    # FR-3: stdout echoes the resolved identity and a ready-to-paste
+    # mine-or-untagged sql predicate referencing the reserved $WORKTREE_ID
+    # parameter (no literal id embedded — FR-13).
+    out = capsys.readouterr().out
+    assert str(repo.resolve()) in out
+    assert "feat" in out
+    assert otelq._worktree_scope_clause() in out
+    assert "$WORKTREE_ID" in out
 
     # A bespoke attribute and an unrelated variable must both survive a re-run.
     env_path.write_text(
@@ -3463,6 +3474,86 @@ def test_ac4_set_resource_attributes_non_git_is_friendly_noop(
     assert not (tmp_path / ".env.local").exists()
     err = capsys.readouterr().err
     assert "git" in err.lower()
+
+
+def test_worktree_scope_clause_is_mine_or_untagged() -> None:
+    clause = otelq._worktree_scope_clause()
+    # Mine-or-untagged OR form: untagged (IS NULL) or equal to the bound param.
+    assert "IS NULL OR" in clause
+    assert "otelq.worktree.id" in clause
+    # No literal id is embedded; otelq binds the reserved $WORKTREE_ID param
+    # from .env.local at query time (FR-13).
+    assert "= $WORKTREE_ID" in clause
+
+
+# ---- $WORKTREE_ID sql parameter binding (FR-13 / AC-15, AC-16, AC-17) --------
+
+
+def _worktree_logs_conn() -> duckdb.DuckDBPyConnection:
+    """A tiny in-memory conn whose `logs` rows carry otelq.worktree.id tags, for
+    exercising $WORKTREE_ID binding in `_execute_sql` (FR-13)."""
+    conn = duckdb.connect(":memory:")
+    conn.execute("CREATE TABLE logs (body VARCHAR, resource_attributes VARCHAR)")
+    conn.execute(
+        """
+        INSERT INTO logs VALUES
+          ('a', '{"otelq.worktree.id": "/path/A"}'),
+          ('b', '{"otelq.worktree.id": "/path/A"}'),
+          ('c', '{"otelq.worktree.id": "/path/B"}'),
+          ('d', '{}');
+        """
+    )
+    return conn
+
+
+def test_ac15_worktree_id_param_binds_from_env(tmp_path: Path) -> None:
+    (tmp_path / ".env.local").write_text(
+        'OTEL_RESOURCE_ATTRIBUTES="otelq.worktree.id=/path/A"\n'
+    )
+    conn = _worktree_logs_conn()
+    query = (
+        "SELECT count(*) FROM logs WHERE "
+        "NULLIF(json_extract_string(resource_attributes, "
+        "'$.\"otelq.worktree.id\"'), '') = $WORKTREE_ID"
+    )
+    result = otelq._execute_sql(conn, query, cwd=tmp_path)
+    assert result is not None
+    assert result.fetchall() == [(2,)]  # only the two /path/A rows
+    # The value is BOUND, not substituted into the text: selecting the reserved
+    # param yields exactly the env id (native parameter binding, FR-13).
+    bound = otelq._execute_sql(conn, "SELECT $WORKTREE_ID", cwd=tmp_path)
+    assert bound is not None
+    assert bound.fetchall() == [("/path/A",)]
+
+
+def test_ac16_worktree_id_param_no_env_fails_no_git_fallback(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)  # a real checkout — git identity WOULD resolve, but must NOT
+    conn = _worktree_logs_conn()
+    with pytest.raises(SystemExit) as exc:
+        # The query never runs: referenced-but-unresolvable fails friendly,
+        # and there is no git fallback even inside a git checkout (FR-13).
+        otelq._execute_sql(conn, "SELECT $WORKTREE_ID", cwd=repo)
+    msg = str(exc.value)
+    assert "OTEL_RESOURCE_ATTRIBUTES" in msg
+    assert "set_resource_attributes" in msg
+
+
+def test_ac17_worktree_id_not_referenced_runs_verbatim(tmp_path: Path) -> None:
+    conn = _worktree_logs_conn()
+    # $WORKTREE_ID only inside a string literal is NOT a parameter reference (per
+    # DuckDB's parser), so it returns verbatim and no env file is read — despite
+    # tmp_path having no .env.local, this must NOT raise (EC-8, FR-13).
+    result = otelq._execute_sql(conn, "SELECT '$WORKTREE_ID'", cwd=tmp_path)
+    assert result is not None
+    assert result.fetchall() == [("$WORKTREE_ID",)]
+    # A plain query with no param sees every row (no scoping applied, INV-2).
+    full = otelq._execute_sql(conn, "SELECT count(*) FROM logs", cwd=tmp_path)
+    assert full is not None
+    assert full.fetchall() == [(4,)]
 
 
 # ---- metrics view now carries resource_attributes (enables scoping) ---------
@@ -3489,13 +3580,13 @@ def test_ac5_summary_census_groups_by_worktree(temp_telemetry: Path) -> None:
     _write_wt_corpus(temp_telemetry, base)
     out = _run(temp_telemetry, "summary")
     got = {
-        (r["worktree_id"], r["worktree_branch"], r["service"], r["count"])
+        (r["service"], r["otelq.worktree.id"], r["otelq.worktree.branch"], r["count"])
         for r in _census_rows(out)
     }
     assert got == {
-        ("A", "feat-a", "svc-a", 3),
-        ("B", "feat-b", "svc-b", 3),
-        ("(untagged)", "", "svc-u", 3),
+        ("svc-a", "A", "feat-a", 3),
+        ("svc-b", "B", "feat-b", 3),
+        ("svc-u", "(untagged)", "", 3),
     }
     # The census is global — identical with --all-worktrees.
     assert _census_rows(_run(temp_telemetry, "--all-worktrees", "summary")) == _census_rows(out)
@@ -3544,10 +3635,10 @@ def test_ac7_scope_banner_reports_hidden(
     assert "3 row(s) from 1 other worktree(s) hidden" in header
 
 
-# ---- opt-out / redirection flags (FR-7 / AC-8, AC-9) ------------------------
+# ---- opt-out flag (FR-7 / AC-8) ---------------------------------------------
 
 
-def test_ac8_all_worktrees_and_worktree_flags(
+def test_ac8_all_worktrees_flag(
     temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
@@ -3559,34 +3650,19 @@ def test_ac8_all_worktrees_and_worktree_flags(
         "svc-u",
     }
     assert "all worktrees" in _header_of(_run(temp_telemetry, "--all-worktrees", "errors"))
-    assert _services(_run(temp_telemetry, "--worktree", "B", "errors")) == {"svc-b", "svc-u"}
+
+
+def test_worktree_flag_removed(temp_telemetry: Path) -> None:
+    # FR-7 regression: the --worktree scope-redirect flag was removed; argparse
+    # must reject it rather than silently accept an unknown option.
     with pytest.raises(SystemExit):
-        otelq.main(
-            ["--dir", str(temp_telemetry), "--all-worktrees", "--worktree", "B", "errors"]
-        )
+        otelq.main(["--dir", str(temp_telemetry), "--worktree", "B", "errors"])
 
 
-def test_ac9_worktree_flag_forces_scope_on_untagged(temp_telemetry: Path) -> None:
-    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
-    write_jsonl(
-        temp_telemetry / "logs.jsonl",
-        [
-            make_log(base, service="svc-1", severity="ERROR", sevnum=17),
-            make_log(base, service="svc-2", severity="ERROR", sevnum=17),
-        ],
-    )
-    out = _run(temp_telemetry, "--worktree", "nope", "errors")
-    # All rows are untagged, so mine-or-untagged keeps them all.
-    assert _services(out) == {"svc-1", "svc-2"}
-    header = _header_of(out)
-    assert "Worktree scope: nope" in header
-    assert "0 row(s) from 0 other worktree(s) hidden" in header
+# ---- undefined identity (FR-8 / AC-9) ---------------------------------------
 
 
-# ---- undefined identity (FR-8 / AC-10) --------------------------------------
-
-
-def test_ac10_undefined_identity_is_unscoped(
+def test_ac9_undefined_identity_is_unscoped(
     temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
@@ -3597,10 +3673,10 @@ def test_ac10_undefined_identity_is_unscoped(
     assert "showing all worktrees" in _header_of(out)
 
 
-# ---- sql never rewritten (FR-9 / AC-11) -------------------------------------
+# ---- sql never rewritten (FR-9 / AC-10) -------------------------------------
 
 
-def test_ac11_sql_is_never_scope_rewritten(
+def test_ac10_sql_is_never_scope_rewritten(
     temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
@@ -3610,10 +3686,10 @@ def test_ac11_sql_is_never_scope_rewritten(
     assert _json.loads(out)[0]["n"] == 3  # all three cohorts, unscoped
 
 
-# ---- trace is a targeted lookup, not scoped (FR-10 / AC-12) -----------------
+# ---- trace is a targeted lookup, not scoped (FR-10 / AC-11) -----------------
 
 
-def test_ac12_trace_not_scoped(
+def test_ac11_trace_not_scoped(
     temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
@@ -3625,10 +3701,10 @@ def test_ac12_trace_not_scoped(
     assert "Worktree scope:" not in out
 
 
-# ---- branch-only rows are untagged (FR-11 / AC-13) --------------------------
+# ---- branch-only rows are untagged (FR-11 / AC-12) --------------------------
 
 
-def test_ac13_branch_only_is_untagged(temp_telemetry: Path) -> None:
+def test_ac12_branch_only_is_untagged(temp_telemetry: Path) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     write_jsonl(
         temp_telemetry / "logs.jsonl",
@@ -3639,10 +3715,10 @@ def test_ac13_branch_only_is_untagged(temp_telemetry: Path) -> None:
     assert all(set(r.keys()) == {"service", "count"} for r in census)
 
 
-# ---- malformed / empty tags & env never raise (FR-12 / AC-14) ---------------
+# ---- malformed / empty tags & env never raise (FR-12 / AC-13) ---------------
 
 
-def test_ac14_empty_tag_and_corrupt_env_dont_raise(
+def test_ac13_empty_tag_and_corrupt_env_dont_raise(
     temp_telemetry: Path, tmp_path: Path
 ) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
@@ -3661,10 +3737,10 @@ def test_ac14_empty_tag_and_corrupt_env_dont_raise(
     assert otelq.resolve_worktree_identity(repo) == str(repo.resolve())
 
 
-# ---- identity independent of --dir (EC-2 / AC-15) ---------------------------
+# ---- identity independent of --dir (EC-2 / AC-14) ---------------------------
 
 
-def test_ac15_identity_independent_of_dir(
+def test_ac14_identity_independent_of_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = tmp_path / ".telemetry"
@@ -3675,23 +3751,3 @@ def test_ac15_identity_independent_of_dir(
     out = _run(store, "errors")  # --dir points at a store carrying A/B/untagged
     assert _services(out) == {"svc-b", "svc-u"}
     assert "Worktree scope: B" in _header_of(out)
-
-
-# ---- --worktree matching nothing ⇒ empty + banner + exit 0 (EC-5 / AC-16) ---
-
-
-def test_ac16_worktree_no_match_is_empty_with_banner(temp_telemetry: Path) -> None:
-    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
-    # Only tagged rows (A and B), no untagged: a non-matching --worktree keeps
-    # nothing, since the mine-or-untagged predicate has no untagged rows to admit.
-    write_jsonl(
-        temp_telemetry / "traces.jsonl",
-        [
-            _tag_worktree(make_span(base, trace_id="ta", span_id="sa", service="svc-a"), "A"),
-            _tag_worktree(make_span(base, trace_id="tb", span_id="sb", service="svc-b"), "B"),
-        ],
-    )
-    out = _run(temp_telemetry, "--worktree", "does-not-exist", "slow")
-    rows = _json.loads(_strip_header(out))
-    assert rows == []
-    assert "Worktree scope: does-not-exist" in _header_of(out)
