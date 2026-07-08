@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/robertgartman/otelq/compare/v0.4.0...v0.4.1) (2026-07-08)
+
+
+### Documentation
+
+* **skill:** add git worktree telemetry-dir guidance ([55cb8aa](https://github.com/robertgartman/otelq/commit/55cb8aa0eeaa0cebe1320df744fdb1b686dd744a))
+* **skill:** add git worktree telemetry-dir guidance ([7bf6d27](https://github.com/robertgartman/otelq/commit/7bf6d27678fe65d71b47f77576dabe2ef20f0b04))
+
 ## [0.4.0](https://github.com/robertgartman/otelq/compare/v0.3.0...v0.4.0) (2026-07-05)
 
 
