@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.0](https://github.com/robertgartman/otelq/compare/v0.4.0...v0.5.0) (2026-07-08)
+
+
+### Features
+
+* opt-in git-worktree scoping for otelq ([05e27e5](https://github.com/robertgartman/otelq/commit/05e27e5ceb289155f3eed1892e400841f580a9a4))
+* **otelq:** add opt-in per-worktree telemetry scoping ([498077a](https://github.com/robertgartman/otelq/commit/498077a97a6b1856ed02d4d62e366d765b01d4c9))
+
+
+### Documentation
+
+* **skill:** add git worktree telemetry-dir guidance ([55cb8aa](https://github.com/robertgartman/otelq/commit/55cb8aa0eeaa0cebe1320df744fdb1b686dd744a))
+* **skill:** add git worktree telemetry-dir guidance ([7bf6d27](https://github.com/robertgartman/otelq/commit/7bf6d27678fe65d71b47f77576dabe2ef20f0b04))
+
 ## [0.4.0](https://github.com/robertgartman/otelq/compare/v0.3.0...v0.4.0) (2026-07-05)
 
 

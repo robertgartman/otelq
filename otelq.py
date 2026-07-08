@@ -79,7 +79,7 @@ if TYPE_CHECKING:
 # agent driving otelq — and the DuckDB/extension pin governance of ADR-003 — can
 # report exactly which build it is talking to. The trailing marker lets
 # release-please bump this line alongside pyproject.toml (see release-please.yml).
-__version__ = "0.4.0"  # x-release-please-version
+__version__ = "0.5.0"  # x-release-please-version
 
 # Public surface of this single-file module. The CLI entry is `main`; the rest
 # is the API the test suite pins. The trailing group is deliberately exported
