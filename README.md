@@ -177,14 +177,14 @@ This is a dump from running `uv run otelq.py --help` within the project root:
 usage: otelq [-h] [--version] [--dir DIR]
              [--format {table,json,jsonl,csv,compact}] [--all] [--no-cache]
              [--verbose] [--since SINCE] [--regex REGEX]
-             [--session-id SESSION_ID]
-             {summary,sql,errors,slow,trace,logs,metric,history,triage,collector-config,doctor,troubleshoot,help}
+             [--session-id SESSION_ID] [--all-worktrees | --worktree ID]
+             {summary,sql,errors,slow,trace,logs,metric,history,triage,collector-config,doctor,troubleshoot,set_resource_attributes,help}
              ...
 
 Query OTLP telemetry captured by the dev OTel Collector.
 
 positional arguments:
-  {summary,sql,errors,slow,trace,logs,metric,history,triage,collector-config,doctor,troubleshoot,help}
+  {summary,sql,errors,slow,trace,logs,metric,history,triage,collector-config,doctor,troubleshoot,set_resource_attributes,help}
     summary             counts and time span per signal
     sql                 run an ad-hoc SQL query
     errors              error spans and ERROR/FATAL logs
@@ -204,6 +204,10 @@ positional arguments:
                         Collector
     doctor              check that --dir satisfies the telemetry contract
     troubleshoot        print the capture → query loop and common fixes
+    set_resource_attributes
+                        write git-derived otelq.worktree.id/branch into
+                        ./.env.local (opt-in worktree tagging; source it
+                        before launching the app)
     help                show help for otelq or a command
 
 options:
@@ -226,6 +230,10 @@ options:
                         tag this and consecutive related invocations with a
                         shared id (default: a generated UUIDv7); echoed in the
                         header and session footer
+  --all-worktrees       include every worktree's telemetry (disable default
+                        worktree scoping)
+  --worktree ID         scope errors/slow/logs/metric to this
+                        otelq.worktree.id (plus untagged rows)
 
 timestamps: ALL timestamps — printed by otelq and written into a
   `sql` query — are UTC. Write `sql` timestamp literals bare
@@ -261,6 +269,16 @@ time window (filters by each record's own event-time):
 row limits:
   errors / slow / logs / metric cap output with --top N and print a
   one-line notice to stderr when the result was truncated.
+
+worktree scoping (opt-in; engages only when telemetry carries
+  otelq.worktree.id tags — otherwise every command is unchanged):
+  errors / slow / logs / metric default to the CURRENT worktree
+  (plus untagged rows) and print a `Worktree scope:` header line.
+  --all-worktrees   include every worktree (disable scoping)
+  --worktree ID     scope to a specific otelq.worktree.id
+  (both GLOBAL, mutually exclusive; `summary`, `trace`, and `sql`
+  are never scoped). Run `set_resource_attributes` to write the
+  git-derived tags into ./.env.local for the launcher to source.
 
 regex filtering (summary/errors/slow/trace/logs/metric only):
   --regex PATTERN  keep only rows matching PATTERN in some cell.
