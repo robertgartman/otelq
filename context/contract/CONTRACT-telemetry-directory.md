@@ -11,12 +11,13 @@ must_not_contain:
   - business_context
   - behavioral_explanations
   - decision_rationale
-version: "1.1"
+version: "1.2"
 created: 2026-06-23
-last_updated: 2026-07-04
+last_updated: 2026-08-12
 related_documents:
   - ADR-004-collector-in-docker-bind-mount
   - ADR-009-query-history-triage-store
+  - ADR-012-exit-codes-as-public-contract
   - SPEC-otelq-cli
   - SPEC-otelq-incremental-cache
 ---
@@ -43,6 +44,13 @@ The producer and consumer agree on a single **telemetry root** directory:
 
 All paths below are relative to the telemetry root.
 
+**Root ownership (v1.2).** The telemetry root itself is **producer-owned**. The
+producer creates it; the consumer **must not**. A consumer invocation that
+resolves a root which does not exist **must** fail rather than create it (see
+[SPEC-otelq-cli](../spec/SPEC-otelq-cli.md) FR-38 and
+[ADR-012](../adr/ADR-012-exit-codes-as-public-contract.md)). The consumer creates
+only its own `.otelq-` subtrees, and only inside a root that already exists.
+
 ### Directory layout
 
 | Path | Producer | Owner | Description |
@@ -65,7 +73,9 @@ All paths below are relative to the telemetry root.
 The subtrees named with the `.otelq-` prefix — currently `.otelq-cache/` and
 `.otelq-history/` (v1.1) — are **owned and managed exclusively by the
 consumer**. The producer **must not** create, write, read, or delete anything
-inside them.
+inside them. The consumer **must** create them only inside an existing telemetry
+root (v1.2, see Root ownership above); it never brings the root into being as a
+side effect of provisioning them.
 
 | Path | Owner | Description |
 |------|-------|-------------|
@@ -159,7 +169,16 @@ The producer rotates each active file by size:
 
 ## Versioning
 
-This is interface **version 1.1**.
+This is interface **version 1.2**.
+
+**v1.2 (clarifying, backward-compatible).** States explicitly that the telemetry
+root is **producer-owned** — the consumer creates only its own `.otelq-`
+subtrees, and only inside a root that already exists. This makes contractual a
+rule the v1.1 ownership table already implied. No filename, extension, framing,
+or mapping changed. Producers are unaffected. The consumer behavior that
+previously created a missing root is corrected under
+[ADR-012](../adr/ADR-012-exit-codes-as-public-contract.md) /
+[SPEC-otelq-cli](../spec/SPEC-otelq-cli.md) FR-38.
 
 **v1.1 (additive, backward-compatible).** Adds the consumer-owned
 `.otelq-history/` subtree (see

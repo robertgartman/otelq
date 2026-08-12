@@ -63,7 +63,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, TypedDict, cast
 
 # duckdb is imported lazily inside the three functions that actually open a
 # connection (connect/build_connection) or catch its errors (cmd_sql), so commands
@@ -478,6 +478,122 @@ _NO_TELEMETRY_MSG = (
 
 class NoTelemetryError(Exception):
     """Raised when a command's required signal has no captured files."""
+
+
+# --- Failure taxonomy (ADR-012 / FR-37) -------------------------------------
+# otelq's exit code is a PUBLIC compatibility surface:
+#   0  an answer was produced (any verdict it carries is affirmative)
+#   1  an answer was produced and the verdict is negative (`doctor` on an
+#      unhealthy store; reserved for future assertion-style commands)
+#   2  NO answer was produced
+# Everything below serves tier 2. The reason vocabulary is CLOSED and
+# additive-only: a token's spelling, meaning, and exit code are frozen once
+# published, because an automated gate branches on them.
+REASON_STORE_NOT_FOUND = "store_not_found"
+REASON_STORE_UNREADABLE = "store_unreadable"
+REASON_QUERY_ERROR = "query_error"
+REASON_USAGE_ERROR = "usage_error"
+REASON_INTERNAL_ERROR = "internal_error"
+
+_MACHINE_FORMATS = frozenset({"json", "jsonl", "compact"})
+
+
+class OtelqFailure(SystemExit):
+    """otelq produced no answer (exit 2), tagged with an FR-37 reason token.
+
+    Subclasses SystemExit so it unwinds like the plain `raise SystemExit(...)`
+    it replaces — including through the `except SystemExit` guards in triage,
+    which must keep degrading gracefully rather than crashing. `main` catches it
+    and renders it; nothing else should.
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(2)
+        self.reason = reason
+        self.message = message
+
+    def __str__(self) -> str:
+        return f"otelq: {self.reason}: {self.message}"
+
+
+def _fail(reason: str, message: str) -> NoReturn:
+    """Abort with an FR-37 reason token. Rendering happens once, in `main`."""
+    raise OtelqFailure(reason, message)
+
+
+def _emit_failure(reason: str, message: str, fmt: str, telemetry_dir: Path) -> None:
+    """Render a failure to STDERR only (FR-37/INV-7).
+
+    stdout is never touched: a caller piping stdout into a parser must receive
+    rows or nothing — never an error object wearing the shape of data. Under a
+    machine --format a single-line JSON object follows the human line, so a gate
+    can attribute the failure without scraping prose.
+    """
+    print(f"otelq: {reason}: {message}", file=sys.stderr)
+    if fmt in _MACHINE_FORMATS:
+        payload = {
+            "otelq_version": __version__,
+            "ok": False,
+            "reason": reason,
+            "store": {"dir": str(telemetry_dir)},
+        }
+        print(json.dumps(payload, separators=(",", ":")), file=sys.stderr)
+
+
+def _prescan_output_context(argv: Sequence[str] | None) -> tuple[str, Path]:
+    """Recover --format/--dir from raw argv for failures raised BEFORE parsing.
+
+    A usage error means there is no Namespace to consult, yet the caller still
+    chose an output format and a store. Scanned leniently: an unparseable argv
+    is exactly the case in play, so anything unrecognised falls back to the
+    documented defaults.
+    """
+    fmt, telemetry_dir = "compact", DEFAULT_DIR
+    tokens = list(argv) if argv is not None else sys.argv[1:]
+    for flag, value in zip(tokens, tokens[1:]):
+        if flag == "--format" and value in _MACHINE_FORMATS:
+            fmt = value
+        elif flag == "--dir":
+            telemetry_dir = Path(value)
+    return fmt, telemetry_dir
+
+
+def _require_store(telemetry_dir: Path) -> None:
+    """Gate every store-reading command on a telemetry root that already exists.
+
+    FR-38 / CONTRACT-telemetry-directory v1.2: the root is PRODUCER-owned. otelq
+    creates only its own `.otelq-*` subtrees, and only inside a root that is
+    already there. Before ADR-012 a mistyped --dir was materialised as a side
+    effect of provisioning those subtrees and reported as an empty store, so the
+    typo concealed itself from the second run onward.
+
+    An ABSENT root is `store_not_found`; a root that exists but cannot serve as
+    one (a regular file) is `store_unreadable`. Neither is the FR-18 friendly
+    path: absent is *unavailable*, which is not the same as present-and-empty.
+    """
+    if not telemetry_dir.exists():
+        _fail(
+            REASON_STORE_NOT_FOUND,
+            f"telemetry directory '{telemetry_dir}' does not exist — start the "
+            "collector that owns it, or point --dir at the right store "
+            "(otelq never creates it)",
+        )
+    if not telemetry_dir.is_dir():
+        _fail(REASON_STORE_UNREADABLE, f"--dir '{telemetry_dir}' is not a directory")
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    """argparse parser whose usage errors carry an FR-37 reason token.
+
+    argparse would print `otelq: error: ...` and exit 2 on its own; routing it
+    through OtelqFailure keeps every exit-2 path — parse or runtime — emitting
+    one uniform, greppable token. Subparsers inherit this class automatically
+    (`add_subparsers` defaults `parser_class` to `type(self)`).
+    """
+
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        _fail(REASON_USAGE_ERROR, message)
 
 
 def stream_of(signal: str) -> str:
@@ -1634,8 +1750,9 @@ def _parse_since(since: str | None) -> timedelta | None:
     units = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
     unit = units.get(since[-1].lower())
     if unit is None or not since[:-1].isdigit():
-        raise SystemExit(
-            f"otelq: invalid --since '{since}' (use e.g. 30s, 10m, 2h, 1d)"
+        _fail(
+            REASON_USAGE_ERROR,
+            f"invalid --since '{since}' (use e.g. 30s, 10m, 2h, 1d)",
         )
     return timedelta(**{unit: int(since[:-1])})
 
@@ -1931,14 +2048,14 @@ def _resolve_regex_arg(args: argparse.Namespace) -> re.Pattern[str] | None:
         return None
     if args.command not in _HEADER_COMMANDS:
         supported = ", ".join(sorted(_HEADER_COMMANDS))
-        raise SystemExit(
-            f"otelq: --regex is not supported for '{args.command}' "
-            f"(only: {supported})"
+        _fail(
+            REASON_USAGE_ERROR,
+            f"--regex is not supported for '{args.command}' (only: {supported})",
         )
     try:
         return re.compile(pattern_text)
     except re.error as exc:
-        raise SystemExit(f"otelq: invalid --regex pattern: {exc}")
+        _fail(REASON_USAGE_ERROR, f"invalid --regex pattern: {exc}")
 
 
 def run_command(
@@ -1962,7 +2079,7 @@ def run_command(
     # (exit non-zero, no traceback), mirroring doctor's is_dir() guard. A missing
     # dir is left alone — it routes to the normal friendly no-telemetry path.
     if args.dir.exists() and not args.dir.is_dir():
-        raise SystemExit(f"otelq: --dir '{args.dir}' is not a directory")
+        _fail(REASON_STORE_UNREADABLE, f"--dir '{args.dir}' is not a directory")
     plan = plan_range(args)
     verbose = bool(getattr(args, "verbose", False))
     if verbose:
@@ -2448,11 +2565,11 @@ def _execute_sql(
         base = Path.cwd() if cwd is None else cwd
         worktree_id = _worktree_id_from_env_files(base)
         if not worktree_id:
-            raise SystemExit(
-                "otelq: query references $WORKTREE_ID but no otelq.worktree.id "
-                "is set in .env.local / .env — run "
-                "`otelq set_resource_attributes` (or set "
-                "OTEL_RESOURCE_ATTRIBUTES) first"
+            _fail(
+                REASON_USAGE_ERROR,
+                "query references $WORKTREE_ID but no otelq.worktree.id is set "
+                "in .env.local / .env — run `otelq set_resource_attributes` "
+                "(or set OTEL_RESOURCE_ATTRIBUTES) first",
             )
         return conn.execute(query, {_RESERVED_SQL_PARAM: worktree_id})
     return conn.execute(query)
@@ -2480,11 +2597,11 @@ def cmd_sql(
         # raise AttributeError (not a duckdb.Error). Route it to the same
         # friendly SQL-error path as any other bad SQL (EC-4).
         if result is None:
-            raise SystemExit("otelq: SQL error: empty query")
+            _fail(REASON_QUERY_ERROR, "empty query")
         columns = [d[0] for d in result.description] if result.description else []
         rows = result.fetchall()
     except duckdb.Error as exc:
-        raise SystemExit(f"otelq: SQL error: {exc}")
+        _fail(REASON_QUERY_ERROR, f"{exc}")
     return columns, rows
 
 
@@ -2591,9 +2708,10 @@ def _resolve_trace_id(conn: duckdb.DuckDBPyConnection, wanted: str) -> str:
         ).fetchall()
     ]
     if len(matches) > 1:
-        raise SystemExit(
-            f"otelq: trace id prefix '{wanted}' is ambiguous "
-            f"(matches {matches[0]}, {matches[1]}, …); use more characters"
+        _fail(
+            REASON_USAGE_ERROR,
+            f"trace id prefix '{wanted}' is ambiguous "
+            f"(matches {matches[0]}, {matches[1]}, …); use more characters",
         )
     if len(matches) == 1:
         return matches[0]
@@ -2984,7 +3102,7 @@ def _non_negative_int(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         prog="otelq",
         description="Query OTLP telemetry captured by the dev OTel Collector.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4167,9 +4285,16 @@ def _dispatch(args: argparse.Namespace) -> int:
         print(render_troubleshooting())
         return 0
     if args.command == "doctor":
+        # Exempt from the FR-38 store gate: diagnosing the store IS doctor's
+        # job, so an absent directory is an ANSWER (a FAIL row, exit 1 — the
+        # verdict tier of ADR-012), not a failure to answer. It reads with
+        # is_dir() and creates nothing.
         rows, ok = doctor_report(args.dir)
         print(format_output(["check", "status", "detail"], rows, args.format))
         return 0 if ok else 1
+    # Everything below this line reads (and may provision `.otelq-*` inside)
+    # the telemetry root, so the root must already exist — FR-38.
+    _require_store(args.dir)
     if args.command == "history":
         columns, rows = _history_report(args.dir, args.top)
         if not rows and not (history_dir(args.dir) / _HISTORY_QUERIES).exists():
@@ -4224,6 +4349,10 @@ def _help_for(parser: argparse.ArgumentParser, topic: str | None) -> int:
         return 0
     try:
         parser.parse_args([topic, "-h"])
+    except OtelqFailure:
+        # An unknown topic. Let it reach `main`, which owns FR-37 rendering —
+        # swallowing the code here would exit 2 with nothing said.
+        raise
     except SystemExit as exc:  # argparse exits after printing help/usage
         return exc.code if isinstance(exc.code, int) else 0
     return 0
@@ -4231,14 +4360,36 @@ def _help_for(parser: argparse.ArgumentParser, topic: str | None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
-    # Bare `otelq` and `otelq help [topic]` are usability affordances handled
-    # before dispatch (FR-22); every other command flows through _dispatch.
-    if args.command is None:
-        parser.print_help()
-        return 0
-    if args.command == "help":
-        return _help_for(parser, args.topic)
+    args: argparse.Namespace | None = None
+    try:
+        args = parser.parse_args(argv)
+        # A BARE `otelq` is not a request for help (FR-39): it is the shape a
+        # caller produces when its argument variable fails to expand. Answering
+        # it on stdout with exit 0 would hand an automated caller a success code
+        # alongside output that answers no question it asked. The help still
+        # renders — on stderr, where diagnostics belong. Explicitly requested
+        # help (`otelq help`, `-h`) keeps stdout and exit 0, because there the
+        # help IS the answer.
+        if args.command is None:
+            parser.print_help(sys.stderr)
+            _fail(REASON_USAGE_ERROR, "no command given (see the help above)")
+        if args.command == "help":
+            return _help_for(parser, args.topic)
+        return _run(args)
+    except OtelqFailure as exc:
+        # Single rendering point for every exit-2 path, parse-time or runtime
+        # (FR-37). When the failure predates parsing there is no Namespace, so
+        # the output context is recovered from raw argv.
+        fmt, telemetry_dir = (
+            _prescan_output_context(argv)
+            if args is None
+            else (str(args.format), Path(args.dir))
+        )
+        _emit_failure(exc.reason, exc.message, fmt, telemetry_dir)
+        return 2
+
+
+def _run(args: argparse.Namespace) -> int:
     t0 = time.monotonic_ns()
     try:
         code = _dispatch(args)

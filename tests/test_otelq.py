@@ -964,6 +964,9 @@ def test_bug1_metrics_gauge_and_sum_queryable_cache_equals_nocache(
 def test_bug2_slow_top_negative_rejected_at_parse() -> None:
     # BUG-2: `slow --top -1` must be rejected by argparse (exit 2, "must be >= 0"),
     # NOT reach DuckDB as LIMIT -1 (an uncaught BinderException traceback).
+    # ADR-012/FR-37: the parser now raises OtelqFailure carrying the message
+    # (rendered once by `main`), so at THIS layer the text is on the exception —
+    # stderr still gets the usage line.
     import io as _io
     from contextlib import redirect_stderr
 
@@ -972,7 +975,9 @@ def test_bug2_slow_top_negative_rejected_at_parse() -> None:
     with pytest.raises(SystemExit) as exc, redirect_stderr(err):
         parser.parse_args(["slow", "--top", "-1"])
     assert exc.value.code == 2
-    assert "must be >= 0" in err.getvalue()
+    assert "must be >= 0" in str(exc.value)
+    assert str(exc.value).startswith("otelq: usage_error: ")
+    assert "usage: otelq slow" in err.getvalue()
     assert parser.parse_args(["slow", "--top", "0"]).top == 0  # zero is valid
     with pytest.raises(SystemExit):  # a non-int still errors
         parser.parse_args(["slow", "--top", "abc"])
@@ -1007,12 +1012,10 @@ def test_bug3_logs_grep_is_literal_substring(temp_telemetry: Path) -> None:
 def test_bug4_dir_pointing_at_file_is_friendly(tmp_path: Path) -> None:
     # BUG-4: --dir pointing at a regular file exits non-zero with an "is not a
     # directory" message and NO traceback (not a deep NotADirectoryError).
+    # ADR-012/FR-37: that failure is now `store_unreadable` and exit 2.
     f = tmp_path / "notadir"
     f.write_text("hi", encoding="utf-8")
-    with pytest.raises(SystemExit) as exc:  # clean SystemExit, not a traceback
-        otelq.main(["--dir", str(f), "summary"])
-    assert "is not a directory" in str(exc.value)
-    assert exc.value.code != 0
+    assert otelq.main(["--dir", str(f), "summary"]) == 2
 
 
 def test_bug5_empty_sql_query_is_friendly(synth_conn: duckdb.DuckDBPyConnection) -> None:
@@ -1021,7 +1024,7 @@ def test_bug5_empty_sql_query_is_friendly(synth_conn: duckdb.DuckDBPyConnection)
     for q in ("", "   ", "\n\t"):
         with pytest.raises(SystemExit) as exc:
             otelq.cmd_sql(synth_conn, Namespace(query=q))
-        assert "otelq: SQL error" in str(exc.value)
+        assert "otelq: query_error" in str(exc.value)  # FR-37 reason token
     cols, rows = otelq.cmd_sql(synth_conn, Namespace(query="SELECT 1 AS one"))
     assert cols == ["one"] and rows == [(1,)]  # a valid query still works
 
@@ -1854,17 +1857,21 @@ def test_readme_help_dump_matches_live_help() -> None:
     assert dumped.split() == live.split()
 
 
-def test_bare_otelq_prints_full_help() -> None:
-    # FR-22: a bare `otelq` (no command) prints the full help and exits 0,
-    # rather than the terse argparse "required: command" error.
+def test_bare_otelq_is_usage_error() -> None:
+    # FR-39 (ADR-012): a bare `otelq` still renders the full help — but on
+    # STDERR, and as a usage error. Help is an answer only when help was the
+    # question; a bare invocation asked nothing, and is the shape a caller
+    # produces when its argument variable fails to expand.
     import io as _io
-    from contextlib import redirect_stdout
+    from contextlib import redirect_stderr, redirect_stdout
 
-    buf = _io.StringIO()
-    with redirect_stdout(buf):
-        assert otelq.main([]) == 0
-    out = buf.getvalue()
-    assert "usage: otelq" in out and "summary" in out and "GLOBAL flags" in out
+    out_buf, err_buf = _io.StringIO(), _io.StringIO()
+    with redirect_stdout(out_buf), redirect_stderr(err_buf):
+        assert otelq.main([]) == 2
+    err = err_buf.getvalue()
+    assert out_buf.getvalue() == ""
+    assert "usage: otelq" in err and "summary" in err and "GLOBAL flags" in err
+    assert "otelq: usage_error: " in err
 
 
 def test_help_command_prints_general_help() -> None:
@@ -2052,10 +2059,15 @@ def test_f4_trace_prefix_resolves_and_flags_ambiguity(temp_telemetry: Path) -> N
     # An exact id still works.
     exact = _json.loads(_strip_header(_run(temp_telemetry, "--all", "trace", tid_a1)))
     assert [r["span_name"].strip() for r in exact] == ["span-a1"]
-    # An ambiguous prefix is a friendly SystemExit, not a silent pick.
-    with pytest.raises(SystemExit) as exc:
-        otelq.main(["--dir", str(temp_telemetry), "--all", "trace", "aaaa"])
-    assert "ambiguous" in str(exc.value)
+    # An ambiguous prefix is a friendly failure (FR-37 usage_error), not a
+    # silent pick.
+    import io as _io
+    from contextlib import redirect_stderr
+
+    err = _io.StringIO()
+    with redirect_stderr(err):
+        assert otelq.main(["--dir", str(temp_telemetry), "--all", "trace", "aaaa"]) == 2
+    assert "ambiguous" in err.getvalue()
 
 
 def test_p5_format_json_compact_and_jsonl() -> None:
@@ -2595,23 +2607,32 @@ def test_ac50_regex_matches_any_cell(temp_telemetry: Path) -> None:
 
 def test_ac51_malformed_regex_is_a_real_error(temp_telemetry: Path) -> None:
     # FR-32/EC-30: a malformed pattern is a real error, not a raw traceback.
-    with pytest.raises(SystemExit) as exc:
-        otelq.main(["--dir", str(temp_telemetry), "--regex", "(", "logs"])
-    assert "invalid --regex pattern" in str(exc.value)
+    import io as _io
+    from contextlib import redirect_stderr
+
+    err = _io.StringIO()
+    with redirect_stderr(err):
+        assert otelq.main(["--dir", str(temp_telemetry), "--regex", "(", "logs"]) == 2
+    assert "invalid --regex pattern" in err.getvalue()
+    assert "otelq: usage_error: " in err.getvalue()
 
 
 def test_ac52_regex_rejected_outside_supported_commands(temp_telemetry: Path) -> None:
     # FR-32/EC-31: --regex is rejected as a real error for sql/doctor/
     # collector-config/troubleshoot, not silently ignored.
+    import io as _io
+    from contextlib import redirect_stderr
+
     for argv in (
         ["sql", "SELECT 1"],
         ["doctor"],
         ["collector-config"],
         ["troubleshoot"],
     ):
-        with pytest.raises(SystemExit) as exc:
-            otelq.main(["--dir", str(temp_telemetry), "--regex", "x", *argv])
-        assert "not supported for" in str(exc.value)
+        err = _io.StringIO()
+        with redirect_stderr(err):
+            assert otelq.main(["--dir", str(temp_telemetry), "--regex", "x", *argv]) == 2
+        assert "not supported for" in err.getvalue()
 
 
 def test_ac53_regex_matches_pre_render_raw_value(temp_telemetry: Path) -> None:
@@ -3655,8 +3676,7 @@ def test_ac8_all_worktrees_flag(
 def test_worktree_flag_removed(temp_telemetry: Path) -> None:
     # FR-7 regression: the --worktree scope-redirect flag was removed; argparse
     # must reject it rather than silently accept an unknown option.
-    with pytest.raises(SystemExit):
-        otelq.main(["--dir", str(temp_telemetry), "--worktree", "B", "errors"])
+    assert otelq.main(["--dir", str(temp_telemetry), "--worktree", "B", "errors"]) == 2
 
 
 # ---- undefined identity (FR-8 / AC-9) ---------------------------------------
@@ -3751,3 +3771,183 @@ def test_ac14_identity_independent_of_dir(
     out = _run(store, "errors")  # --dir points at a store carrying A/B/untagged
     assert _services(out) == {"svc-b", "svc-u"}
     assert "Worktree scope: B" in _header_of(out)
+
+
+# ---------------------------------------------------------------------------
+# ADR-012 — the exit code is a public compatibility surface.
+#
+# FR-17 (amended), FR-37, FR-38, FR-39, INV-5, INV-7.  These assert the REAL
+# process status, so otelq is launched as a subprocess: `main()`'s return value
+# is an implementation detail, and the thing a test gate actually branches on is
+# `$?`.  A regression that turns exit 2 back into 0 or 1 must fail here.
+# ---------------------------------------------------------------------------
+
+_OTELQ_PY = Path(otelq.__file__).resolve()
+
+
+def _cli(*argv: str, cwd: Path | None = None) -> _subprocess.CompletedProcess[str]:
+    """Run otelq as a real process and capture (exit code, stdout, stderr)."""
+    return _subprocess.run(
+        [sys.executable, str(_OTELQ_PY), *argv],
+        capture_output=True,
+        text=True,
+        cwd=str(cwd) if cwd is not None else None,
+        timeout=300,
+    )
+
+
+def _reason_line(stderr: str) -> str:
+    """The single `otelq: <reason>: <message>` line FR-37 requires on stderr.
+    Matched rather than assumed-first: a usage line or full help may precede it."""
+    hits = [
+        ln
+        for ln in stderr.splitlines()
+        if _re.match(r"^otelq: [a-z_]+: ", ln)
+    ]
+    assert len(hits) == 1, f"expected exactly one reason line, got {hits!r}"
+    return hits[0]
+
+
+def _reason(stderr: str) -> str:
+    return _reason_line(stderr).split(": ")[1]
+
+
+def test_ac71_missing_store_dir_exits_2_and_creates_nothing(tmp_path: Path) -> None:
+    # FR-38/FR-37/INV-1/INV-7: a --dir that does not exist is a FAILURE to
+    # answer, not an empty store — and otelq must not materialise it. Before
+    # ADR-012 this exited 0 AND created the directory, so a typo'd path was
+    # self-concealing: the second run found a real, empty, otelq-owned store.
+    missing = tmp_path / "nope" / ".telemetry"
+    proc = _cli("--dir", str(missing), "logs")
+    assert proc.returncode == 2, proc.stderr
+    assert proc.stdout == ""
+    assert _reason(proc.stderr) == "store_not_found"
+    assert str(missing) in proc.stderr
+    assert not missing.exists()
+    assert not missing.parent.exists()
+
+
+def test_ac72_existing_empty_store_stays_friendly_exit_0(temp_telemetry: Path) -> None:
+    # FR-38 vs FR-18: FR-38 governs an ABSENT root only. A root that exists and
+    # is merely empty keeps the fail-friendly contract untouched — exit 0 with a
+    # human sentence on stderr. This is the regression guard for the fear that
+    # ADR-012 broke fail-friendly.
+    proc = _cli("--dir", str(temp_telemetry), "logs")
+    assert proc.returncode == 0, proc.stderr
+    assert "no telemetry captured" in proc.stderr
+    assert not [ln for ln in proc.stderr.splitlines() if _re.match(r"^otelq: [a-z_]+: ", ln)]
+
+
+def test_ac73_malformed_sql_exits_2_with_reason(temp_telemetry: Path) -> None:
+    # FR-17/FR-37/INV-7: malformed SQL formerly exited 1 — the code ADR-012
+    # reserves for a VERDICT. Pinned to exactly 2 so a regression to 1 fails:
+    # a consumer must never read "your SQL is broken" as "the assertion is false".
+    proc = _cli("--dir", str(temp_telemetry), "sql", "SELECT FROM WHERE")
+    assert proc.returncode == 2, proc.stderr
+    assert proc.returncode != 1
+    assert proc.stdout == ""
+    assert _reason(proc.stderr) == "query_error"
+
+
+def test_ac74_machine_format_emits_json_failure_object(temp_telemetry: Path) -> None:
+    # FR-37: under a machine --format the failure is additionally machine
+    # readable. It goes to STDERR, never stdout — a caller piping stdout to a
+    # parser must receive rows or nothing, never an error shaped like data.
+    for fmt in ("json", "jsonl", "compact"):
+        proc = _cli("--format", fmt, "--dir", str(temp_telemetry), "sql", "SELEKT 1")
+        assert proc.returncode == 2, proc.stderr
+        assert proc.stdout == ""
+        objs = [
+            _json.loads(ln)
+            for ln in proc.stderr.splitlines()
+            if ln.startswith("{") and ln.rstrip().endswith("}")
+        ]
+        assert len(objs) == 1, f"{fmt}: expected one JSON failure object"
+        obj = objs[0]
+        assert obj["ok"] is False
+        assert obj["reason"] == _reason(proc.stderr) == "query_error"
+        assert obj["otelq_version"] == otelq.__version__
+        assert obj["store"]["dir"] == str(temp_telemetry.resolve())
+
+
+def test_ac74_human_format_omits_json_failure_object(temp_telemetry: Path) -> None:
+    # FR-37: the JSON object is for machine formats only — `table`/`csv` readers
+    # get the human line and nothing else.
+    for fmt in ("table", "csv"):
+        proc = _cli("--format", fmt, "--dir", str(temp_telemetry), "sql", "SELEKT 1")
+        assert proc.returncode == 2, proc.stderr
+        assert proc.stdout == ""
+        assert _reason(proc.stderr) == "query_error"
+        assert not [ln for ln in proc.stderr.splitlines() if ln.startswith("{")]
+
+
+def test_ac75_bare_invocation_is_usage_error_on_stderr() -> None:
+    # FR-39/INV-7: a bare `otelq` is the shape produced when a caller's argument
+    # variable fails to expand. Answering it with help on STDOUT and exit 0 hands
+    # an automated caller a success code plus output that answers no question it
+    # asked. Help still renders — on stderr, where diagnostics belong.
+    proc = _cli()
+    assert proc.returncode == 2, proc.stderr
+    assert proc.stdout == ""
+    assert "usage: otelq" in proc.stderr
+    assert _reason(proc.stderr) == "usage_error"
+
+
+def test_ac75_explicit_help_stays_on_stdout_exit_0() -> None:
+    # FR-22: help that WAS the question is an answer — stdout, exit 0. This is
+    # the other half of FR-39 and must not regress along with it.
+    for argv in (["help"], ["help", "slow"], ["--help"]):
+        proc = _cli(*argv)
+        assert proc.returncode == 0, proc.stderr
+        assert "usage: otelq" in proc.stdout
+        assert not [ln for ln in proc.stderr.splitlines() if _re.match(r"^otelq: [a-z_]+: ", ln)]
+    assert "--top" in _cli("help", "slow").stdout
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["bogusverb"], id="unknown-subcommand"),
+        pytest.param(["--bogusflag", "logs"], id="unknown-flag"),
+        pytest.param(["logs", "--format", "json"], id="global-flag-after-subcommand"),
+        pytest.param(["--since", "10x", "logs"], id="malformed-since"),
+        pytest.param(["help", "not-a-command"], id="unknown-help-topic"),
+    ],
+)
+def test_ac76_parse_failures_are_usage_error_exit_2(argv: list[str], temp_telemetry: Path) -> None:
+    # FR-17/FR-37: every way of failing to be understood lands on one code and
+    # one token, so a stale caller gets an unambiguous signal rather than output
+    # it might mistake for data.
+    proc = _cli("--dir", str(temp_telemetry), *argv)
+    assert proc.returncode == 2, proc.stderr
+    assert proc.stdout == ""
+    assert _reason(proc.stderr) == "usage_error"
+
+
+def test_ac77_failures_never_exit_1(temp_telemetry: Path, tmp_path: Path) -> None:
+    # INV-5: exit 1 is the VERDICT tier. No failure-to-answer may occupy it,
+    # because that is exactly the conflation ADR-012 exists to remove.
+    invocations: list[list[str]] = [
+        ["--dir", str(tmp_path / "absent"), "logs"],
+        ["--dir", str(temp_telemetry), "sql", "SELEKT 1"],
+        ["--dir", str(temp_telemetry), "bogusverb"],
+        ["--dir", str(temp_telemetry), "--since", "10x", "logs"],
+        [],
+    ]
+    for argv in invocations:
+        proc = _cli(*argv)
+        assert proc.returncode == 2, f"{argv} -> {proc.returncode}: {proc.stderr}"
+    for argv in (["--dir", str(temp_telemetry), "logs"], ["help"]):
+        assert _cli(*argv).returncode == 0
+
+
+def test_ac77_doctor_keeps_verdict_exit_1(tmp_path: Path) -> None:
+    # FR-26/INV-5: `doctor` is asked "is this store healthy?" — "no" is an
+    # ANSWER, so it keeps exit 1 and is exempt from FR-38. It must still create
+    # nothing (INV-1).
+    missing = tmp_path / "absent"
+    proc = _cli("--dir", str(missing), "doctor")
+    assert proc.returncode == 1, proc.stderr
+    assert "FAIL" in proc.stdout
+    assert str(missing) in proc.stdout
+    assert not missing.exists()
