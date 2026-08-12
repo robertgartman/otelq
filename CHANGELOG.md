@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.0](https://github.com/robertgartman/otelq/compare/v0.5.0...v1.0.0) (2026-08-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* malformed SQL now exits 2, not 1 — 1 meant both "your store is unhealthy" (doctor) and "your SQL is broken". A nonexistent --dir now exits 2 instead of 0, and is no longer created, so a typo can no longer conceal itself by materialising an empty store on the next run. A bare `otelq` now prints help to stderr and exits 2 rather than stdout and 0.
+
+### Features
+
+* add initial project configuration and .gitignore ([e1fa779](https://github.com/robertgartman/otelq/commit/e1fa77926fa94f97e088052dc69b34d282e16564))
+* make the exit code a public compatibility surface ([2525be8](https://github.com/robertgartman/otelq/commit/2525be8d57d2c035472aa79ce9382eea942e37f1))
+
 ## [0.5.0](https://github.com/robertgartman/otelq/compare/v0.4.0...v0.5.0) (2026-07-08)
 
 
