@@ -265,7 +265,8 @@ This is a dump from running `uv run otelq.py --help` within the project root:
 usage: otelq [-h] [--version] [--dir DIR]
              [--format {table,json,jsonl,csv,compact}] [--all] [--no-cache]
              [--verbose] [--since SINCE] [--regex REGEX]
-             [--session-id SESSION_ID] [--all-worktrees]
+             [--session-id SESSION_ID] [--resource-attr KEY[=VALUE]]
+             [--all-worktrees]
              {summary,sql,errors,slow,trace,logs,metric,history,triage,collector-config,doctor,troubleshoot,set_resource_attributes,help}
              ...
 
@@ -318,6 +319,11 @@ options:
                         tag this and consecutive related invocations with a
                         shared id (default: a generated UUIDv7); echoed in the
                         header and session footer
+  --resource-attr KEY[=VALUE]
+                        keep only rows whose OTel Resource attribute KEY
+                        equals VALUE (exact match); omit =VALUE to match any
+                        non-empty value. Repeatable (AND).
+                        summary/errors/slow/trace/logs/metric only
   --all-worktrees       include every worktree's telemetry (disable default
                         worktree scoping)
 
@@ -391,6 +397,19 @@ sql views (for `otelq sql "<query>"`):
   reveals extra columns (span_attributes/log_attributes/
   metric_attributes, resource_attributes, scope_attributes, ...)
   carrying whatever custom OTel tags an app actually emits.
+  resource_attr(attrs, 'key') — an otelq-DEFINED macro (NOT an
+  OpenTelemetry concept and NOT a DuckDB builtin) returning the
+  string value of an OTel Resource attribute, or NULL when it is
+  absent, empty, or the column is NULL/unparseable. Use it instead
+  of hand-writing json_extract_string over resource_attributes: it
+  is exact-match, needs no escaping for dotted keys, and never
+  raises on a malformed row, e.g.
+    sql "SELECT * FROM logs
+         WHERE resource_attr(resource_attributes, 'smoke.run_id')
+               = 'abc123'"
+  The built-in commands take --resource-attr KEY=VALUE for the same
+  job (repeatable, AND); `sql` is never rewritten, so here you write
+  the macro yourself.
   IMPORTANT — isolate your `sql` to this worktree: unlike the built-in
   commands, `sql` is NEVER auto-scoped, so on a shared Collector it
   sees EVERY concurrent worktree's rows. Scope a query to THIS
@@ -400,10 +419,10 @@ sql views (for `otelq sql "<query>"`):
   THIS worktree's id from .env.local at query time (never rewriting
   your text), so the snippet is identical across worktrees, e.g.
     sql "SELECT * FROM logs WHERE
-         (NULLIF(json_extract_string(resource_attributes,
-         '$."otelq.worktree.id"'), '') IS NULL
-         OR NULLIF(json_extract_string(resource_attributes,
-         '$."otelq.worktree.id"'), '') = $WORKTREE_ID)"
+         (resource_attr(resource_attributes, 'otelq.worktree.id')
+          IS NULL
+          OR resource_attr(resource_attributes, 'otelq.worktree.id')
+             = $WORKTREE_ID)"
   Run `set_resource_attributes` to print THIS worktree's exact id and
   a ready-to-paste copy of that predicate — no need to hand-build it.
   traces   start_time_unix_nano (event-time),

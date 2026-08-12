@@ -759,6 +759,38 @@ _METRIC_VIEW_PARTS: tuple[tuple[str, str, str], ...] = (
     ("metrics_exp_histogram", "exp_histogram", '"sum"'),
 )
 
+# The one canonical way otelq reads an OTel Resource attribute (FR-41).
+#
+# Everything goes through it: the --resource-attr filter (FR-40), the worktree
+# predicate, and the clause otelq prints for users to paste into `sql`. Reaching
+# a resource attribute by hand otherwise means knowing three otelq-internal
+# facts — the column name, that it holds JSON, and which JSON function reads it.
+#
+# `json_valid` guard: json_extract_string RAISES on malformed input, so without
+# it a single corrupt row would fail an entire query. NULLIF folds an empty
+# value into "absent", which is what the worktree convention already meant by an
+# empty tag (worktree-scoping FR-11) and keeps one behavior for every key.
+_RESOURCE_ATTR_MACRO = "resource_attr"
+_RESOURCE_ATTR_MACRO_SQL = f"""
+CREATE OR REPLACE MACRO {_RESOURCE_ATTR_MACRO}(attrs, key) AS
+    NULLIF(json_extract_string(CASE WHEN json_valid(attrs) THEN attrs END, key), '')
+"""
+
+
+def create_resource_attr_macro(conn: duckdb.DuckDBPyConnection) -> None:
+    """Define the `resource_attr(attrs, key)` macro on a connection (FR-41)."""
+    conn.execute(_RESOURCE_ATTR_MACRO_SQL)
+
+
+def _resource_attr_sql(key: str, column: str = "resource_attributes") -> str:
+    """The extraction expression for `key`, as SQL text with the key inlined.
+
+    Used where a ready-to-paste snippet is needed (the worktree clause otelq
+    prints). Query paths that take a caller-supplied key bind it instead — see
+    `_resource_attr_predicate` — so an arbitrary key never reaches SQL text.
+    """
+    return f"{_RESOURCE_ATTR_MACRO}({column}, {_sql_str(key)})"
+
 
 def create_unified_metrics_view(conn: duckdb.DuckDBPyConnection) -> None:
     """Create the `metrics` view as the union of whichever metric tables exist.
@@ -1652,6 +1684,7 @@ def _finalize_relations(
     # expose the identical set, keeping cached == --no-cache (FR-11). Empty
     # in-window relations are kept, not dropped.
     create_unified_metrics_view(conn)
+    create_resource_attr_macro(conn)  # FR-41
 
 
 def build_hot(
@@ -1728,6 +1761,7 @@ def connect(telemetry_dir: Path) -> duckdb.DuckDBPyConnection:
         # relations resolve, even over an empty/absent dir (embedded probe).
         _seed_absent_relations(conn, telemetry_dir, tmp_dir, present, "")
         create_unified_metrics_view(conn)
+        create_resource_attr_macro(conn)  # FR-41
     return conn
 
 
@@ -1986,6 +2020,7 @@ def _format_response_header(
     regex: str | None = None,
     regex_removed: int | None = None,
     worktree_banner: str | None = None,
+    resource_attrs: list[_ResourceAttrFilter] | None = None,
 ) -> str:
     """Render the FR-29 response header: a fixed plain-text block naming the
     command, format, OpenTelemetry signal(s), UTC time range, and the FR-33
@@ -1996,7 +2031,9 @@ def _format_response_header(
     was filtered away — unlike post-hoc `grep` on rendered output. When worktree
     scoping engaged (FR-6), one `Worktree scope:` line names the active scope and
     how many other-worktree rows were hidden; absent otherwise, so untagged
-    output is byte-identical (INV-2)."""
+    output is byte-identical (INV-2). When `--resource-attr` (FR-40) was
+    supplied, one `Resource filter applied:` line lists every term in the order
+    given."""
     lo, hi = time_range
     from_str = _iso_utc(lo) if lo is not None else "n/a"
     to_str = _iso_utc(hi) if hi is not None else "n/a"
@@ -2009,6 +2046,11 @@ def _format_response_header(
     ]
     if worktree_banner is not None:
         lines.append(worktree_banner)
+    if resource_attrs:
+        # FR-29/FR-40: a reader must see WHAT was filtered without re-deriving
+        # it from the invocation.
+        rendered = ", ".join(f.render() for f in resource_attrs)
+        lines.append(f"Resource filter applied: {rendered}")
     if regex is not None:
         lines.append(f"Regex filter applied: {regex}")
         lines.append(f"Rows removed by regex: {regex_removed}")
@@ -2102,7 +2144,7 @@ def run_command(
                 if regex is not None:
                     rows, regex_removed = _apply_regex_filter(regex, rows)
                 time_range = _result_time_range(conn, args.command, columns, rows)
-                services = _maybe_service_rows(conn, args.command)
+                services = _maybe_service_rows(conn, args.command, _resource_attr_predicate(args))
                 banner = _worktree_banner(conn, args)
                 return columns, rows, time_range, regex_removed, services, banner
     # Fell through: the hot window held no answer and this command may widen to a
@@ -2121,7 +2163,7 @@ def run_command(
         if regex is not None:
             rows, regex_removed = _apply_regex_filter(regex, rows)
         time_range = _result_time_range(conn, args.command, columns, rows)
-        services = _maybe_service_rows(conn, args.command)
+        services = _maybe_service_rows(conn, args.command, _resource_attr_predicate(args))
         banner = _worktree_banner(conn, args)
         return columns, rows, time_range, regex_removed, services, banner
 
@@ -2222,14 +2264,16 @@ _DEFAULT_TOP = 50
 def _worktree_id_sql(column: str = "resource_attributes") -> str:
     """SQL that extracts a normalized `otelq.worktree.id` from a JSON
     `resource_attributes` column: the string value, with empty coerced to NULL
-    so an empty tag reads as untagged (FR-11)."""
-    path = f'$."{WORKTREE_ID_KEY}"'
-    return f"NULLIF(json_extract_string({column}, '{path}'), '')"
+    so an empty tag reads as untagged (FR-11).
+
+    Goes through the generic `resource_attr()` macro (SPEC-otelq-cli FR-41) —
+    the worktree key is not a privileged path, it is one resource attribute
+    among any others, read the one canonical way."""
+    return _resource_attr_sql(WORKTREE_ID_KEY, column)
 
 
 def _worktree_branch_sql(column: str = "resource_attributes") -> str:
-    path = f'$."{WORKTREE_BRANCH_KEY}"'
-    return f"NULLIF(json_extract_string({column}, '{path}'), '')"
+    return _resource_attr_sql(WORKTREE_BRANCH_KEY, column)
 
 
 def _worktree_scope_clause(column: str = "resource_attributes") -> str:
@@ -2338,6 +2382,117 @@ def _worktree_predicate(args: argparse.Namespace) -> tuple[str, list[str]]:
     return f"({expr} IS NULL OR {expr} = ?)", [scope.scope_id]
 
 
+# --- generic resource-attribute filtering (FR-40) ----------------------------
+
+# The commands `--resource-attr` filters. All six signal-bearing commands, so
+# one flag scopes the whole correlation spine regardless of signal — including
+# `summary` and `trace`, which worktree scoping deliberately skips. That
+# asymmetry is intentional: worktree scoping is IMPLICIT and must not surprise,
+# whereas this filter is EXPLICIT and silently ignoring it would be worse than
+# any narrowing it causes.
+_RESOURCE_ATTR_COMMANDS = _HEADER_COMMANDS
+
+
+class _ResourceAttrFilter(NamedTuple):
+    """One `--resource-attr` term. `value is None` is the presence-only form."""
+
+    key: str
+    value: str | None
+
+    def render(self) -> str:
+        return self.key if self.value is None else f"{self.key}={self.value}"
+
+
+def _parse_resource_attr_args(args: argparse.Namespace) -> list[_ResourceAttrFilter]:
+    """Validate and parse `--resource-attr` (FR-40).
+
+    A real error for a malformed term or an unsupported command, never a silent
+    no-op: an explicit filter that is quietly ignored would hand the caller a
+    result set it believes is scoped when it is not.
+    """
+    raw: list[str] = list(getattr(args, "resource_attr", None) or [])
+    if not raw:
+        return []
+    if args.command not in _RESOURCE_ATTR_COMMANDS:
+        supported = ", ".join(sorted(_RESOURCE_ATTR_COMMANDS))
+        hint = (
+            f" — in `sql`, filter with {_RESOURCE_ATTR_MACRO}(resource_attributes, "
+            "'<key>') instead"
+            if args.command == "sql"
+            else ""
+        )
+        _fail(
+            REASON_USAGE_ERROR,
+            f"--resource-attr is not supported for '{args.command}' "
+            f"(only: {supported}){hint}",
+        )
+    filters: list[_ResourceAttrFilter] = []
+    for term in raw:
+        key, sep, value = term.partition("=")
+        if not key:
+            _fail(
+                REASON_USAGE_ERROR,
+                f"invalid --resource-attr '{term}': expected <key> or <key>=<value>",
+            )
+        if sep and not value:
+            # An empty stored value reads as ABSENT (FR-41), so asking for one
+            # could only ever match nothing. Reject it rather than hand back a
+            # silently empty result the caller would read as "no such run".
+            _fail(
+                REASON_USAGE_ERROR,
+                f"invalid --resource-attr '{term}': empty value — an empty "
+                f"attribute reads as absent; use '{key}' alone to match any "
+                "non-empty value",
+            )
+        filters.append(_ResourceAttrFilter(key, value if sep else None))
+    return filters
+
+
+def _resource_attr_predicate(args: argparse.Namespace) -> tuple[str, list[str]]:
+    """The conjunctive WHERE fragment for `--resource-attr`, or ('', []).
+
+    Both the attribute key and its value are BOUND, never interpolated, so an
+    arbitrary caller-supplied key cannot reach the SQL text. Equality is exact:
+    a value that is a strict substring of another row's value must not match it.
+    """
+    filters: list[_ResourceAttrFilter] = list(getattr(args, "_resource_attrs", None) or [])
+    if not filters:
+        return "", []
+    parts: list[str] = []
+    params: list[str] = []
+    for flt in filters:
+        expr = f"{_RESOURCE_ATTR_MACRO}(resource_attributes, ?)"
+        if flt.value is None:
+            parts.append(f"{expr} IS NOT NULL")
+            params.append(flt.key)
+        else:
+            parts.append(f"{expr} = ?")
+            params.extend((flt.key, flt.value))
+    return "(" + " AND ".join(parts) + ")", params
+
+
+def _where_of(flt: tuple[str, list[str]]) -> tuple[str, list[str]]:
+    """Render a (fragment, params) pair as a ` WHERE ...` clause, or ('', [])."""
+    frag, params = flt
+    return (f" WHERE {frag}", list(params)) if frag else ("", [])
+
+
+def _scope_predicate(args: argparse.Namespace) -> tuple[str, list[str]]:
+    """Every WHERE fragment a signal command must apply, ANDed in a fixed order.
+
+    Single choke point so each command splices one fragment and one param list
+    rather than juggling two; worktree scoping and `--resource-attr` compose
+    conjunctively (FR-40).
+    """
+    frags: list[str] = []
+    params: list[str] = []
+    for frag, prm in (_worktree_predicate(args), _resource_attr_predicate(args)):
+        if frag:
+            frags.append(frag)
+            params.extend(prm)
+    return " AND ".join(frags), params
+
+
 def _worktree_banner(
     conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
 ) -> str | None:
@@ -2389,23 +2544,29 @@ def _limited(
     return rows
 
 
-def _summary_traces(conn: duckdb.DuckDBPyConnection) -> list[Row]:
+def _summary_traces(
+    conn: duckdb.DuckDBPyConnection, flt: tuple[str, list[str]] = ("", [])
+) -> list[Row]:
     """Two duration buckets; both rows present even when one is empty (FR-3)."""
     bucket = (
         f"CASE WHEN duration_time_unix_nano > {_TRACE_SLOW_NS} "
         f"THEN '>1s' ELSE '=<1s' END"
     )
+    where, params = _where_of(flt)
     got = {
         r[0]: r[1:]
         for r in conn.execute(
             f"SELECT {bucket} AS b, {_summary_agg('start_time_unix_nano')} "
-            f"FROM traces GROUP BY b"
+            f"FROM traces{where} GROUP BY b",
+            params,
         ).fetchall()
     }
     return [("traces", b, *got.get(b, _SUMMARY_ZERO)) for b in (">1s", "=<1s")]
 
 
-def _summary_logs(conn: duckdb.DuckDBPyConnection) -> list[Row]:
+def _summary_logs(
+    conn: duckdb.DuckDBPyConnection, flt: tuple[str, list[str]] = ("", [])
+) -> list[Row]:
     """One row per canonical level (all six present, zeros included), plus an
     UNSET row only when out-of-range severities exist (FR-3). Level is derived
     from severity_number, not severity_text (FR-2)."""
@@ -2414,11 +2575,13 @@ def _summary_logs(conn: duckdb.DuckDBPyConnection) -> list[Row]:
         for name, lo, hi in _LOG_LEVELS
     )
     level = f"CASE {cases} ELSE 'UNSET' END"
+    where, params = _where_of(flt)
     got = {
         r[0]: r[1:]
         for r in conn.execute(
             f"SELECT {level} AS lvl, {_summary_agg('time_unix_nano')} "
-            f"FROM logs GROUP BY lvl"
+            f"FROM logs{where} GROUP BY lvl",
+            params,
         ).fetchall()
     }
     rows: list[Row] = [
@@ -2429,14 +2592,18 @@ def _summary_logs(conn: duckdb.DuckDBPyConnection) -> list[Row]:
     return rows
 
 
-def _summary_metrics(conn: duckdb.DuckDBPyConnection) -> list[Row]:
+def _summary_metrics(
+    conn: duckdb.DuckDBPyConnection, flt: tuple[str, list[str]] = ("", [])
+) -> list[Row]:
     """One row per metric type (all four present, zeros included), each scoped to
     that type over the unified `metrics` view (FR-3). `details` is the type."""
+    where, params = _where_of(flt)
     got = {
         r[0]: r[1:]
         for r in conn.execute(
             f"SELECT metric_type AS t, {_summary_agg('time_unix_nano')} "
-            f"FROM metrics GROUP BY t"
+            f"FROM metrics{where} GROUP BY t",
+            params,
         ).fetchall()
     }
     return [
@@ -2454,12 +2621,15 @@ def cmd_summary(
     # types) still appear for a present signal.
     columns = ["signal", "details", "count", "earliest", "latest", "services"]
     rows: list[Row] = []
+    # summary is unscoped by worktree (INV-3) but DOES honor an explicit
+    # --resource-attr filter (FR-40): the caller asked for one run's map.
+    flt = _resource_attr_predicate(args)
     if _has_rows(conn, "traces"):
-        rows += _summary_traces(conn)
+        rows += _summary_traces(conn, flt)
     if _has_rows(conn, "logs"):
-        rows += _summary_logs(conn)
+        rows += _summary_logs(conn, flt)
     if _has_rows(conn, "metrics"):
-        rows += _summary_metrics(conn)
+        rows += _summary_metrics(conn, flt)
     if not rows:  # no signal has data -> friendly empty-telemetry path (FR-18)
         raise NoTelemetryError(_NO_TELEMETRY_MSG)
     return columns, rows
@@ -2484,9 +2654,11 @@ _SUMMARY_SERVICE_LABEL = "** List of services in telemetry data **"
 
 
 def _summary_by_service(
-    conn: duckdb.DuckDBPyConnection,
+    conn: duckdb.DuckDBPyConnection, flt: tuple[str, list[str]] = ("", [])
 ) -> tuple[list[str], list[Row]]:
-    """`summary`'s service census (FR-4), always GLOBAL (never scoped, INV-3).
+    """`summary`'s service census (FR-4), never narrowed by WORKTREE scoping
+    (INV-3) — but an explicit `--resource-attr` filter (FR-40) does apply, since
+    the caller asked for one run's census rather than the whole store's.
 
     When worktree telemetry is present, group by
     (otelq.worktree.id, otelq.worktree.branch, service_name) with untagged rows
@@ -2494,6 +2666,9 @@ def _summary_by_service(
     shape byte-for-byte (INV-2). Ordered by count desc then the grouping keys for
     determinism (byte-identical cached vs --no-cache). All three relations resolve
     under expose-empty (FR-1)."""
+    frag, fparams = flt
+    arm = f" WHERE {frag}" if frag else ""
+    params = [p for _ in range(3) for p in fparams]  # one binding per union arm
     if _worktree_tags_present(conn):
         wid = _worktree_id_sql()
         wbr = _worktree_branch_sql()
@@ -2502,30 +2677,34 @@ def _summary_by_service(
             f"COALESCE({wid}, '{_WORKTREE_UNTAGGED_LABEL}') AS worktree_id, "
             f"COALESCE({wbr}, '') AS worktree_branch, "
             f"count(*) AS n FROM ("
-            "  SELECT service_name, resource_attributes FROM traces"
-            "  UNION ALL SELECT service_name, resource_attributes FROM logs"
-            "  UNION ALL SELECT service_name, resource_attributes FROM metrics"
-            ") GROUP BY 1, 2, 3 ORDER BY n DESC, service_name, worktree_id, worktree_branch"
+            f"  SELECT service_name, resource_attributes FROM traces{arm}"
+            f"  UNION ALL SELECT service_name, resource_attributes FROM logs{arm}"
+            f"  UNION ALL SELECT service_name, resource_attributes FROM metrics{arm}"
+            ") GROUP BY 1, 2, 3 ORDER BY n DESC, service_name, worktree_id, worktree_branch",
+            params,
         ).fetchall()
         return _SUMMARY_SERVICE_WORKTREE_COLUMNS, rows
     rows = conn.execute(
         "SELECT service_name, count(*) AS n FROM ("
-        "  SELECT service_name FROM traces"
-        "  UNION ALL SELECT service_name FROM logs"
-        "  UNION ALL SELECT service_name FROM metrics"
-        ") GROUP BY service_name ORDER BY n DESC, service_name"
+        f"  SELECT service_name, resource_attributes FROM traces{arm}"
+        f"  UNION ALL SELECT service_name, resource_attributes FROM logs{arm}"
+        f"  UNION ALL SELECT service_name, resource_attributes FROM metrics{arm}"
+        ") GROUP BY service_name ORDER BY n DESC, service_name",
+        params,
     ).fetchall()
     return _SUMMARY_SERVICE_COLUMNS, rows
 
 
 def _maybe_service_rows(
-    conn: duckdb.DuckDBPyConnection, command: str
+    conn: duckdb.DuckDBPyConnection,
+    command: str,
+    flt: tuple[str, list[str]] = ("", []),
 ) -> tuple[list[str], list[Row]] | None:
     """`summary`'s service census as (columns, rows) — the columns vary with the
     worktree master switch (FR-4) — or `None` for every other command. Computed
     here (not in `cmd_summary`) so it stays out of the command's own single-result
     contract and the direct-call summary tests."""
-    return _summary_by_service(conn) if command == "summary" else None
+    return _summary_by_service(conn, flt) if command == "summary" else None
 
 
 def _sql_named_parameters(
@@ -2625,7 +2804,7 @@ def cmd_errors(
     columns = ["kind", "timestamp", "service_name", "label", "detail", "trace_id"]
     # Worktree scoping (FR-5): AND the mine-or-untagged predicate onto each arm's
     # own WHERE; the param repeats once per arm, in union order.
-    pred, pred_params = _worktree_predicate(args)
+    pred, pred_params = _scope_predicate(args)
     scope = f" AND {pred}" if pred else ""
     arms: list[str] = []
     params: list[str] = []
@@ -2664,7 +2843,7 @@ def cmd_slow(
 ) -> CommandResult:
     _require(conn, "traces")
     columns = ["timestamp", "service_name", "span_name", "duration_ms", "trace_id"]
-    pred, pred_params = _worktree_predicate(args)  # FR-5
+    pred, pred_params = _scope_predicate(args)  # FR-5
     where = f" WHERE {pred}" if pred else ""
     rows = _limited(
         conn,
@@ -2723,12 +2902,18 @@ def cmd_trace(
 ) -> CommandResult:
     _require(conn, "traces")
     trace_id = _resolve_trace_id(conn, args.trace_id)
+    # `trace` is never narrowed by WORKTREE scoping (worktree FR-10), but an
+    # explicit --resource-attr filter does apply (FR-40) — an explicitly
+    # requested filter that is silently dropped is worse than a narrowed tree,
+    # and the header discloses it (FR-29).
+    frag, fparams = _resource_attr_predicate(args)
+    extra = f" AND {frag}" if frag else ""
     spans = conn.execute(
         f"SELECT span_id, parent_span_id, name AS span_name, service_name, "
         f"duration_time_unix_nano // {_NS_PER_MS} AS duration_ms, status_code, "
         f"start_time_unix_nano AS timestamp "
-        f"FROM traces WHERE trace_id = ? ORDER BY start_time_unix_nano",
-        [trace_id],
+        f"FROM traces WHERE trace_id = ?{extra} ORDER BY start_time_unix_nano",
+        [trace_id, *fparams],
     ).fetchall()
     if not spans:
         raise NoTelemetryError(f"no spans found for trace_id '{args.trace_id}'")
@@ -2782,7 +2967,7 @@ def cmd_logs(
         # both sides keeping it case-insensitive.
         where.append("contains(lower(body), lower(?))")
         params.append(args.grep)
-    pred, pred_params = _worktree_predicate(args)  # FR-5
+    pred, pred_params = _scope_predicate(args)  # FR-5
     if pred:
         where.append(pred)
         params.extend(pred_params)
@@ -2816,7 +3001,7 @@ def cmd_metric(
         "value",
         "metric_unit",
     ]
-    pred, pred_params = _worktree_predicate(args)  # FR-5
+    pred, pred_params = _scope_predicate(args)  # FR-5
     scope = f" AND {pred}" if pred else ""
     rows = _limited(
         conn,
@@ -3178,6 +3363,19 @@ def build_parser() -> argparse.ArgumentParser:
               reveals extra columns (span_attributes/log_attributes/
               metric_attributes, resource_attributes, scope_attributes, ...)
               carrying whatever custom OTel tags an app actually emits.
+              resource_attr(attrs, 'key') — an otelq-DEFINED macro (NOT an
+              OpenTelemetry concept and NOT a DuckDB builtin) returning the
+              string value of an OTel Resource attribute, or NULL when it is
+              absent, empty, or the column is NULL/unparseable. Use it instead
+              of hand-writing json_extract_string over resource_attributes: it
+              is exact-match, needs no escaping for dotted keys, and never
+              raises on a malformed row, e.g.
+                sql "SELECT * FROM logs
+                     WHERE resource_attr(resource_attributes, 'smoke.run_id')
+                           = 'abc123'"
+              The built-in commands take --resource-attr KEY=VALUE for the same
+              job (repeatable, AND); `sql` is never rewritten, so here you write
+              the macro yourself.
               IMPORTANT — isolate your `sql` to this worktree: unlike the built-in
               commands, `sql` is NEVER auto-scoped, so on a shared Collector it
               sees EVERY concurrent worktree's rows. Scope a query to THIS
@@ -3187,10 +3385,10 @@ def build_parser() -> argparse.ArgumentParser:
               THIS worktree's id from .env.local at query time (never rewriting
               your text), so the snippet is identical across worktrees, e.g.
                 sql "SELECT * FROM logs WHERE
-                     (NULLIF(json_extract_string(resource_attributes,
-                     '$.\"otelq.worktree.id\"'), '') IS NULL
-                     OR NULLIF(json_extract_string(resource_attributes,
-                     '$.\"otelq.worktree.id\"'), '') = $WORKTREE_ID)"
+                     (resource_attr(resource_attributes, 'otelq.worktree.id')
+                      IS NULL
+                      OR resource_attr(resource_attributes, 'otelq.worktree.id')
+                         = $WORKTREE_ID)"
               Run `set_resource_attributes` to print THIS worktree's exact id and
               a ready-to-paste copy of that predicate — no need to hand-build it.
               traces   start_time_unix_nano (event-time),
@@ -3283,6 +3481,17 @@ def build_parser() -> argparse.ArgumentParser:
     # worktree ONLY when the telemetry carries otelq.worktree.id tags (FR-1).
     # --all-worktrees opts out of that filtering; to target one specific worktree,
     # filter in `sql` on otelq.worktree.id (FR-7 / FR-9).
+    # --resource-attr is a GLOBAL, REPEATABLE flag: it filters on the OTel
+    # Resource attribute that correlates one run's traces, logs and metrics.
+    # See SPEC-otelq-cli FR-11/FR-40.
+    parser.add_argument(
+        "--resource-attr",
+        action="append",
+        metavar="KEY[=VALUE]",
+        help="keep only rows whose OTel Resource attribute KEY equals VALUE "
+        "(exact match); omit =VALUE to match any non-empty value. Repeatable "
+        "(AND). summary/errors/slow/trace/logs/metric only",
+    )
     parser.add_argument(
         "--all-worktrees",
         action="store_true",
@@ -4274,6 +4483,7 @@ def _dispatch(args: argparse.Namespace) -> int:
     args._session_supplied = session_supplied
     args.session_id = resolve_session_id(args)
     regex = _resolve_regex_arg(args)
+    args._resource_attrs = _parse_resource_attr_args(args)  # FR-40
     if args.command == "collector-config":
         print(render_collector_config())
         return 0
@@ -4325,6 +4535,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                 args.regex,
                 regex_removed,
                 worktree_banner,
+                getattr(args, "_resource_attrs", None),
             )
         )
     print(format_output(columns, rows, args.format))

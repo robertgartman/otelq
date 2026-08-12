@@ -16,6 +16,7 @@ last_updated: 2026-08-12
 related_documents:
   - PRD-otelq
   - SPEC-otelq-incremental-cache
+  - SPEC-otelq-worktree-scoping
   - CONTRACT-telemetry-directory
   - ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0
   - ADR-009-query-history-triage-store
@@ -310,7 +311,8 @@ configuration that produces the raw files.
   is the **payload** that follows the response header of FR-29 on stdout; FR-10
   governs that payload, not the header itself.
 - **FR-11 — Global flags precede the subcommand.** `--format`, `--dir`,
-  `--all`, `--no-cache`, `--since`, `--regex`, and `--session-id` are global
+  `--all`, `--no-cache`, `--since`, `--regex`, `--resource-attr` (FR-40), and
+  `--session-id` are global
   flags and **must** be accepted *before* the subcommand. Supplying a global flag *after* the
   subcommand **must** be rejected as an unrecognized argument (a hard parse
   error), not silently accepted. Subcommand-specific flags and positionals
@@ -593,6 +595,13 @@ configuration that produces the raw files.
     **must not** appear when `--regex` is not supplied — the header's line
     count is otherwise fixed, but this pair is the one deliberate exception,
     mirroring the `compact`-only format-line suffix.
+  - When one or more `--resource-attr` filters (FR-40) are supplied, the header
+    **must** insert a single additional line after `Time range` and before the
+    `IMPORTANT` line: `Resource filter applied: <k>=<v>[, <k>=<v>…]`, listing
+    every filter in the order given (a presence-only filter renders as a bare
+    `<k>`). The line **must not** appear when no `--resource-attr` is supplied.
+    A reader **must** be able to see what was filtered without re-deriving it
+    from the invocation.
 
 ### Query history and triage
 
@@ -663,6 +672,88 @@ configuration that produces the raw files.
   investigations. A row with **no** session id belongs to **no** session: it
   **must** still count toward frequency/recency ranking evidence, and **must
   not** contribute terminal, transition, or session-opening evidence.
+
+### Resource-attribute correlation
+
+> An OpenTelemetry **Resource** attribute identifies the producing entity, so it
+> is the correlation spine that ties one run's traces, logs, and metrics
+> together. These requirements expose it generically. otelq **must not** bless,
+> special-case, or document any particular attribute *name* as meaningful —
+> `service.namespace`, `deployment.environment`, and any consumer-chosen key are
+> all just keys. (`otelq.worktree.id` is otelq's own key, governed by
+> [SPEC-otelq-worktree-scoping](SPEC-otelq-worktree-scoping.md); it is read
+> through the very same mechanism, not a privileged path.)
+
+- **FR-40 — `--resource-attr` correlation filter.** A `--resource-attr` global
+  flag (FR-11) **must** filter results by an OTel **Resource** attribute, in two
+  forms:
+
+  | Form | Meaning |
+  |------|---------|
+  | `--resource-attr <key>=<value>` | The attribute `key` is present and its value is **exactly** `value` |
+  | `--resource-attr <key>` | The attribute `key` is present with any non-empty value |
+
+  Rules:
+  - The flag **must** be **repeatable**, and repeats **must** combine
+    **conjunctively** (AND). Order does not affect the result set.
+  - Matching **must** be **exact string equality**. Substring, prefix, and
+    case-insensitive matching **must not** be offered as the default or implied
+    by it — a value that is a strict substring of another row's value **must
+    not** match it. (A run id that prefixes another run's id must never select
+    the wrong run.)
+  - A `key` **must** be usable verbatim, with no caller-side escaping or
+    quoting, including the dotted keys OTel conventionally uses
+    (`service.namespace`, `smoke.run_id`). A dotted key **must** address the
+    literal flat attribute of that name, **never** a nested path traversal.
+  - The flag **must** apply identically to all six signal-bearing commands —
+    `summary`, `errors`, `slow`, `trace`, `logs`, `metric` — so one flag scopes
+    the whole correlation spine regardless of signal. Supplying it to any other
+    command (`sql`, `doctor`, `collector-config`, `troubleshoot`, `history`,
+    `triage`, `set_resource_attributes`) **must** be a real error
+    (`usage_error`, exit `2`, FR-37), never a silent no-op; for `sql` the message
+    **must** name the FR-41 macro as the supported route.
+  - A malformed argument — an empty key, or `<key>=` with an empty value —
+    **must** be rejected as `usage_error` (exit `2`), not silently treated as a
+    never-match. An attribute whose stored value is the empty string **must**
+    read as *absent* (consistent with FR-41), which is why an empty value cannot
+    be asked for.
+  - The filter composes conjunctively with `--since`/`--all`, `--regex`,
+    `--top`, the per-command filters (`--service`, `--level`, `--grep`), and
+    with worktree scoping. It **must** be disclosed in the response header
+    (FR-29).
+  - A row whose `resource_attributes` are absent, empty, or unparseable
+    **must** be treated as not matching, and **must not** raise (FR-41).
+
+- **FR-41 — `resource_attr()` SQL macro.** otelq **must** define a DuckDB macro
+  on the query connection:
+
+  ```sql
+  resource_attr(<attributes-column>, '<key>')
+  ```
+
+  returning the string value of Resource attribute `key`, or `NULL` when the
+  attribute is absent, its value is the empty string, or the column is NULL or
+  not valid JSON. It **must never** raise on a malformed value.
+
+  This macro is the **single canonical way** to read a resource attribute
+  anywhere in otelq: the FR-40 predicate, the worktree predicate and the
+  ready-to-paste worktree clause
+  ([SPEC-otelq-worktree-scoping](SPEC-otelq-worktree-scoping.md) FR-9/FR-13) all
+  **must** be expressed through it, so one mechanism has one behavior.
+
+  It **must** be available to `sql`, giving an ad-hoc query the same
+  storage-independence FR-40 gives the built-in commands — `sql` remains
+  **verbatim** and unrewritten (worktree-scoping FR-9), so the caller opts in by
+  writing the macro. `sql` is otherwise the only route by which a caller could
+  filter on a resource attribute, and doing so by hand requires knowing the
+  column name, that it holds JSON, and which JSON function to call — knowledge
+  this macro exists to remove.
+
+  Because it is **otelq-defined** — neither an OpenTelemetry concept nor a
+  DuckDB builtin — `--help` **must** document it in the `sql` views/cheat-sheet
+  section, stating plainly that it is an otelq affordance and what it returns.
+  Its name, arity, and return semantics are a compatibility surface: a consumer
+  embeds it in stored queries, so they **must not** change incidentally.
 
 ### Machine-attributable failure (ADR-012)
 
@@ -1338,6 +1429,68 @@ configuration that produces the raw files.
   nothing.
   *Verification hints: `test_ac77_failures_never_exit_1`,
   `test_ac77_doctor_keeps_verdict_exit_1`.*
+- **AC-78** (Verifies FR-40, FR-41): Given a corpus whose rows carry
+  `smoke.run_id` values `abc123` and `abc123xtra`, when
+  `--resource-attr smoke.run_id=abc123` runs, then exactly the `abc123` rows are
+  returned — byte-identical to what
+  `sql "… WHERE resource_attr(resource_attributes, 'smoke.run_id') = 'abc123'"`
+  returns — and the `abc123xtra` rows are **excluded**. A strict substring never
+  matches.
+  *Verification hint: `test_ac78_resource_attr_is_exact_not_substring`; assert the
+  flag path and the macro path return the same rows.*
+- **AC-79** (Verifies FR-40): Given a dotted key (`smoke.run_id`) and a row whose
+  attributes are the flat `{"smoke.run_id": "abc"}` plus a decoy row whose
+  attributes are the nested `{"smoke": {"run_id": "abc"}}`, when
+  `--resource-attr smoke.run_id=abc` runs, then only the **flat** row is
+  returned — a dotted key is a literal attribute name, not a path traversal, and
+  the caller escapes nothing.
+  *Verification hint: `test_ac79_dotted_key_is_literal_not_a_path`.*
+- **AC-80** (Verifies FR-40): Given rows tagged with two different attributes,
+  when `--resource-attr a=1 --resource-attr b=2` is supplied, then only rows
+  carrying **both** are returned (conjunctive), and reversing the flag order
+  returns the identical set.
+  *Verification hint: `test_ac80_repeated_flags_are_conjunctive`.*
+- **AC-81** (Verifies FR-40): Given one corpus carrying traces, logs, and metrics
+  all tagged with the same `smoke.run_id`, when the filter is applied to
+  `summary`, `errors`, `slow`, `trace`, `logs`, and `metric` in turn, then each
+  returns only that run's rows — one flag, the whole correlation spine.
+  *Verification hint: `test_ac81_filter_applies_across_all_six_commands`,
+  looping the six commands.*
+- **AC-82** (Verifies FR-40, FR-37): Given `--resource-attr` supplied to a
+  command that does not support it (`sql`, `doctor`, `collector-config`,
+  `troubleshoot`), when it runs, then it exits `2` with `otelq: usage_error:`
+  and, for `sql`, a message naming `resource_attr(...)` as the supported route —
+  never a silent no-op.
+  *Verification hint: `test_ac82_resource_attr_rejected_where_unsupported`.*
+- **AC-83** (Verifies FR-40, FR-37): Given a malformed `--resource-attr`
+  argument — an empty key, or `key=` with an empty value — when it runs, then it
+  exits `2` with `otelq: usage_error:`; and given `--resource-attr key` with no
+  `=`, then rows carrying any non-empty value for `key` are returned while rows
+  where it is absent or empty are not.
+  *Verification hint: `test_ac83_malformed_pair_is_usage_error`,
+  `test_ac83_presence_form_matches_any_nonempty_value`.*
+- **AC-84** (Verifies FR-40, FR-29): Given one or more `--resource-attr` filters,
+  when a signal-bearing command runs, then the response header carries exactly
+  one `Resource filter applied:` line listing every filter in the order given;
+  and given none, then no such line appears.
+  *Verification hint: `test_ac84_header_discloses_resource_filter`.*
+- **AC-85** (Verifies FR-41): Given rows whose `resource_attributes` are
+  respectively valid JSON, `NULL`, the empty string, and unparseable text, when
+  `resource_attr(resource_attributes, 'k')` is evaluated over all of them, then
+  it returns the value for the valid row and `NULL` for the rest **without
+  raising** — one malformed row can never fail the query.
+  *Verification hint: `test_ac85_resource_attr_macro_never_raises`.*
+- **AC-86** (Verifies FR-41): Given the worktree key, when
+  `resource_attr(resource_attributes, 'otelq.worktree.id')` is evaluated, then it
+  returns exactly what worktree scoping's own extraction returns, and the
+  ready-to-paste clause printed by `set_resource_attributes` is expressed with
+  the macro rather than raw `json_extract_string` — one mechanism, one behavior.
+  *Verification hint: `test_ac86_worktree_extraction_goes_through_the_macro`.*
+- **AC-87** (Verifies FR-41): Given `otelq --help`, when its `sql` section is
+  read, then it documents `resource_attr(...)` as an **otelq-defined** helper
+  (not OpenTelemetry, not a DuckDB builtin) and states what it returns.
+  *Verification hint: `test_ac87_help_documents_the_macro_as_otelq_specific`.*
+
 
 ### Examples
 

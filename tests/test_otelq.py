@@ -3951,3 +3951,300 @@ def test_ac77_doctor_keeps_verdict_exit_1(tmp_path: Path) -> None:
     assert "FAIL" in proc.stdout
     assert str(missing) in proc.stdout
     assert not missing.exists()
+
+
+# ---------------------------------------------------------------------------
+# R2 — generic resource-attribute correlation filter.
+#
+# FR-40 (--resource-attr) and FR-41 (the resource_attr() SQL macro).  An OTel
+# Resource attribute is the correlation spine tying one run's traces, logs and
+# metrics together; before this, reaching it meant knowing otelq's storage
+# layout (a column named resource_attributes, holding JSON, read with
+# json_extract_string).  No attribute NAME is privileged here — otelq.worktree.id
+# goes through the very same mechanism as any consumer-chosen key.
+# ---------------------------------------------------------------------------
+
+
+def _tag_resource(obj: dict[str, Any], **attrs: str) -> dict[str, Any]:
+    """Append arbitrary resource attributes onto an OTLP-JSON dict in place.
+
+    Keys arrive as Python identifiers, so `__` stands in for `.` — the dotted
+    keys OTel actually uses (smoke__run_id -> smoke.run_id)."""
+    for key in ("resourceSpans", "resourceLogs", "resourceMetrics"):
+        for entry in obj.get(key, []):
+            bag = entry["resource"].setdefault("attributes", [])
+            for name, value in attrs.items():
+                bag.append(
+                    {"key": name.replace("__", "."), "value": {"stringValue": value}}
+                )
+    return obj
+
+
+def _write_attr_corpus(d: Path, base: datetime) -> None:
+    """Three cohorts distinguished only by resource attributes:
+
+      svc-hit   smoke.run_id=abc123       <- the run under test
+      svc-pre   smoke.run_id=abc123xtra   <- a PREFIX collision; must never match
+      svc-none  (no smoke.run_id at all)
+
+    Each contributes one error span, one ERROR log and one gauge point, so a
+    single filter can be checked across every signal.
+    """
+    cohorts = (("svc-hit", "abc123"), ("svc-pre", "abc123xtra"), ("svc-none", None))
+    spans: list[dict[str, Any]] = []
+    logs: list[dict[str, Any]] = []
+    metrics: list[dict[str, Any]] = []
+    for svc, run in cohorts:
+        tags = {"smoke__run_id": run} if run is not None else {}
+        spans.append(
+            _tag_resource(
+                make_span(
+                    base,
+                    trace_id=f"t-{svc}",
+                    span_id=f"s-{svc}",
+                    service=svc,
+                    status_code=2,
+                    status_msg="boom",
+                    duration_ms=10,
+                ),
+                **tags,
+            )
+        )
+        logs.append(
+            _tag_resource(
+                make_log(base, service=svc, severity="ERROR", sevnum=17, body=f"fail {svc}"),
+                **tags,
+            )
+        )
+        metrics.append(
+            _tag_resource(make_gauge(base, name="m.pool", service=svc, value=1.0), **tags)
+        )
+    write_jsonl(d / "traces.jsonl", spans)
+    write_jsonl(d / "logs.jsonl", logs)
+    write_jsonl(d / "metrics.jsonl", metrics)
+
+
+def _attr_conn() -> duckdb.DuckDBPyConnection:
+    """Bare in-memory logs table for exercising the macro directly, including
+    the values that must NOT raise: NULL, empty, and unparseable."""
+    conn = duckdb.connect(":memory:")
+    conn.execute("CREATE TABLE logs (body VARCHAR, resource_attributes VARCHAR)")
+    conn.executemany(
+        "INSERT INTO logs VALUES (?, ?)",
+        [
+            ("flat", '{"smoke.run_id": "abc"}'),
+            ("nested", '{"smoke": {"run_id": "abc"}}'),
+            ("prefix", '{"smoke.run_id": "abcXTRA"}'),
+            ("blank", '{"smoke.run_id": ""}'),
+            ("absent", "{}"),
+            ("null", None),
+            ("corrupt", "not json at all"),
+            ("worktree", '{"otelq.worktree.id": "/repo/A"}'),
+        ],
+    )
+    otelq.create_resource_attr_macro(conn)
+    return conn
+
+
+def test_ac78_resource_attr_is_exact_not_substring(temp_telemetry: Path) -> None:
+    # FR-40/AC2.1+AC2.3: exact equality, and identical to what the macro returns
+    # by hand. `abc123xtra` must NOT match `abc123` — the D9 poller's
+    # LIKE '%run_id%' bug is precisely a run id that prefixes another run's id
+    # selecting the wrong run.
+    base = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+    _write_attr_corpus(temp_telemetry, base)
+    via_flag = _services(
+        _run(temp_telemetry, "--all", "--resource-attr", "smoke.run_id=abc123", "errors")
+    )
+    assert via_flag == {"svc-hit"}
+    via_macro = _json.loads(
+        _strip_header(
+            _run(
+                temp_telemetry,
+                "--all",
+                "sql",
+                "SELECT DISTINCT service_name FROM logs "
+                "WHERE resource_attr(resource_attributes, 'smoke.run_id') = 'abc123'",
+            )
+        )
+    )
+    assert {r["service_name"] for r in via_macro} == {"svc-hit"}
+
+
+def test_ac79_dotted_key_is_literal_not_a_path(temp_telemetry: Path) -> None:
+    # FR-40/AC2.2: a dotted key addresses the flat attribute of that name. The
+    # `nested` decoy proves it is not a JSON path traversal, and the caller
+    # escapes nothing.
+    conn = _attr_conn()
+    cols, rows = otelq.cmd_sql(
+        conn,
+        Namespace(
+            query="SELECT body FROM logs "
+                  "WHERE resource_attr(resource_attributes, 'smoke.run_id') = 'abc'"
+        ),
+    )
+    assert cols == ["body"]
+    assert [r[0] for r in rows] == ["flat"]
+
+
+def test_ac80_repeated_flags_are_conjunctive(temp_telemetry: Path) -> None:
+    # FR-40: repeats AND together, and order does not change the result set.
+    base = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+    logs = [
+        _tag_resource(make_log(base, service="both", body="b"), a="1", b="2"),
+        _tag_resource(make_log(base, service="only-a", body="a"), a="1"),
+        _tag_resource(make_log(base, service="only-b", body="b"), b="2"),
+    ]
+    write_jsonl(temp_telemetry / "logs.jsonl", logs)
+    forward = _services(
+        _run(temp_telemetry, "--all", "--resource-attr", "a=1", "--resource-attr", "b=2", "logs")
+    )
+    reverse = _services(
+        _run(temp_telemetry, "--all", "--resource-attr", "b=2", "--resource-attr", "a=1", "logs")
+    )
+    assert forward == {"both"} == reverse
+
+
+def test_ac81_filter_applies_across_all_six_commands(temp_telemetry: Path) -> None:
+    # FR-40/AC2.4: one flag, the whole correlation spine — traces, logs and
+    # metrics alike, including the two commands worktree scoping deliberately
+    # skips (summary, trace), because this filter is EXPLICIT.
+    base = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+    _write_attr_corpus(temp_telemetry, base)
+    flag = ("--resource-attr", "smoke.run_id=abc123")
+    for argv in (("errors",), ("slow",), ("logs",), ("metric", "m.pool")):
+        assert _services(_run(temp_telemetry, "--all", *flag, *argv)) == {"svc-hit"}, argv
+    # summary: the filtered corpus must not report the excluded cohorts' rows.
+    summary = _strip_header(_run(temp_telemetry, "--all", *flag, "summary"))
+    assert "svc-pre" not in summary and "svc-none" not in summary
+    # trace: the filter narrows a span lookup too, rather than being ignored.
+    kept = _json.loads(
+        _strip_header(_run(temp_telemetry, "--all", *flag, "trace", trace_hex("t-svc-hit")))
+    )
+    assert [r["service_name"].strip() for r in kept] == ["svc-hit"]
+    # A trace outside the filtered run yields no spans, which is the friendly
+    # empty path (stderr + exit 0, stdout empty) — not a silent full tree.
+    assert _run(temp_telemetry, "--all", *flag, "trace", trace_hex("t-svc-pre")) == ''
+
+
+def test_ac82_resource_attr_rejected_where_unsupported(temp_telemetry: Path) -> None:
+    # FR-40/FR-37: silently ignoring an explicit filter is the worst outcome.
+    # For `sql` the error must name the macro, since that IS the supported route.
+    import io as _io
+    from contextlib import redirect_stderr
+
+    for argv in (["sql", "SELECT 1"], ["doctor"], ["collector-config"], ["troubleshoot"]):
+        err = _io.StringIO()
+        with redirect_stderr(err):
+            code = otelq.main(
+                ["--dir", str(temp_telemetry), "--resource-attr", "k=v", *argv]
+            )
+        assert code == 2, argv
+        assert "otelq: usage_error: " in err.getvalue(), argv
+    err = _io.StringIO()
+    with redirect_stderr(err):
+        otelq.main(["--dir", str(temp_telemetry), "--resource-attr", "k=v", "sql", "SELECT 1"])
+    assert "resource_attr(" in err.getvalue()
+
+
+def test_ac83_malformed_pair_is_usage_error(temp_telemetry: Path) -> None:
+    # FR-40: an empty key, or an explicitly empty value, is a real error — not a
+    # silent never-match. An empty stored value reads as ABSENT (FR-41), so an
+    # empty value is not a thing that can be asked for.
+    import io as _io
+    from contextlib import redirect_stderr
+
+    for bad in ("=v", "", "k="):
+        err = _io.StringIO()
+        with redirect_stderr(err):
+            code = otelq.main(
+                ["--dir", str(temp_telemetry), "--resource-attr", bad, "logs"]
+            )
+        assert code == 2, bad
+        assert "otelq: usage_error: " in err.getvalue(), bad
+
+
+def test_ac83_presence_form_matches_any_nonempty_value(temp_telemetry: Path) -> None:
+    # FR-40: `--resource-attr key` (no `=`) means present-with-any-value.
+    base = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+    logs = [
+        _tag_resource(make_log(base, service="has", body="x"), smoke__run_id="anything"),
+        _tag_resource(make_log(base, service="blank", body="x"), smoke__run_id=""),
+        make_log(base, service="absent", body="x"),
+    ]
+    write_jsonl(temp_telemetry / "logs.jsonl", logs)
+    assert _services(
+        _run(temp_telemetry, "--all", "--resource-attr", "smoke.run_id", "logs")
+    ) == {"has"}
+
+
+def test_ac84_header_discloses_resource_filter(temp_telemetry: Path) -> None:
+    # FR-29/FR-40/AC2.5: a reader must see what was filtered without
+    # re-deriving it from the invocation.
+    base = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+    _write_attr_corpus(temp_telemetry, base)
+    header = _header_of(
+        _run(
+            temp_telemetry,
+            "--all",
+            "--resource-attr",
+            "smoke.run_id=abc123",
+            "--resource-attr",
+            "service.namespace",
+            "logs",
+        )
+    )
+    assert "Resource filter applied: smoke.run_id=abc123, service.namespace" in header
+    assert "Resource filter applied" not in _header_of(_run(temp_telemetry, "--all", "logs"))
+
+
+def test_ac85_resource_attr_macro_never_raises() -> None:
+    # FR-41: NULL, empty and unparseable attributes all read as absent. One
+    # malformed row must never fail the whole query — the raw json_extract_string
+    # this replaces RAISES on invalid JSON.
+    conn = _attr_conn()
+    _, rows = otelq.cmd_sql(
+        conn,
+        Namespace(
+            query="SELECT body, resource_attr(resource_attributes, 'smoke.run_id') AS v "
+                  "FROM logs ORDER BY body"
+        ),
+    )
+    got = {body: value for body, value in rows}
+    assert got["flat"] == "abc"
+    for absent in ("nested", "blank", "absent", "null", "corrupt", "worktree"):
+        assert got[absent] is None, absent
+
+
+def test_ac86_worktree_extraction_goes_through_the_macro() -> None:
+    # FR-41: otelq.worktree.id is NOT a privileged path — same macro, same
+    # behavior. The clause otelq hands users to paste into `sql` must no longer
+    # leak json_extract_string, which was the identical coupling R2 removes.
+    conn = _attr_conn()
+    _, rows = otelq.cmd_sql(
+        conn,
+        Namespace(
+            query="SELECT body FROM logs "
+                  "WHERE resource_attr(resource_attributes, 'otelq.worktree.id') = '/repo/A'"
+        ),
+    )
+    assert [r[0] for r in rows] == ["worktree"]
+    clause = otelq._worktree_scope_clause()
+    assert "resource_attr(" in clause
+    assert "json_extract_string" not in clause
+    assert "$WORKTREE_ID" in clause  # value binding is unchanged (FR-13)
+
+
+def test_ac87_help_documents_the_macro_as_otelq_specific() -> None:
+    # FR-41: the macro is otelq-defined — neither an OpenTelemetry concept nor a
+    # DuckDB builtin — so help must say so rather than letting a reader assume
+    # it is standard.
+    import io as _io
+    from contextlib import redirect_stdout
+
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        assert otelq.main(["help"]) == 0
+    text = buf.getvalue()
+    assert "resource_attr(" in text
+    assert "otelq" in text.lower()
