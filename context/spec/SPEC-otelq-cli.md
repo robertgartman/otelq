@@ -12,7 +12,7 @@ must_not_contain:
   - architectural_rationale
   - external_data_schemas
 created: 2026-06-23
-last_updated: 2026-07-07
+last_updated: 2026-08-12
 related_documents:
   - PRD-otelq
   - SPEC-otelq-incremental-cache
@@ -105,8 +105,9 @@ configuration that produces the raw files.
 - **Response header** — a fixed-format plain-text preamble that otelq prints to
   stdout before the rendered result of the six signal-bearing commands (see
   FR-29), naming the invoked command, the resolved format, the OpenTelemetry
-  signal(s) involved, the returned rows' time range, and the session id, so an
-  LLM consumer cannot mistake a rendered `timestamp` for local time.
+  signal(s) involved, the absolute telemetry directory being read, the returned
+  rows' time range, and the session id, so an LLM consumer cannot mistake a
+  rendered `timestamp` for local time or lose track of the result's data source.
 - **Session id** — an id (see FR-33) that tags the consecutive invocations of
   one investigation so they can be correlated: a caller-supplied `--session-id`,
   or, when omitted, a freshly generated UUIDv7. Echoed verbatim in the response
@@ -520,6 +521,7 @@ configuration that produces the raw files.
   ==========
   otelq <command> response, format <format>
   OpenTelemetry signal: <signal>
+  Reading data from: <directory>
   Time range: <from> - <to>
   IMPORTANT: all timestamps are UTC
   Session: <session-id>
@@ -540,6 +542,9 @@ configuration that produces the raw files.
     **must** be the set of signals actually represented among the returned rows,
     comma-joined in the fixed order `traces, logs, metrics` (only the present
     ones listed), or `n/a` when the result has zero rows.
+  - `<directory>` **must** be the absolute, normalized path of the telemetry
+    directory actually used by the invocation. A relative default or `--dir`
+    value **must** be resolved before it is shown.
   - `<from>` and `<to>` **must** be the minimum and maximum `timestamp` value
     among the command's returned rows, rendered with the same corrected-UTC
     formatting used elsewhere in the output (FR-16); both **must** render as
@@ -993,12 +998,13 @@ configuration that produces the raw files.
 - **AC-38** (Verifies FR-29): Given any of `summary`/`errors`/`slow`/`trace`/
   `logs`/`metric`, when the command runs with any `--format`, then stdout begins
   with the fixed header (a `==========` line; `otelq <command> response, format
-  <format>`; `OpenTelemetry signal: <signal>`; `Time range: <from> - <to>`; the
-  UTC notice; a `----------` line) naming the invoked command and resolved
-  format, followed by the FR-10 rendering of the result; the header's `<from>`/
-  `<to>` equal the min/max `timestamp` among the returned rows.
+  <format>`; `OpenTelemetry signal: <signal>`; `Reading data from: <directory>`;
+  `Time range: <from> - <to>`; the UTC notice; the session id; a `----------`
+  line) naming the invoked command, resolved format, and absolute telemetry
+  directory, followed by the FR-10 rendering of the result; the header's
+  `<from>`/`<to>` equal the min/max `timestamp` among the returned rows.
   *Verification hint: run each of the six commands with `--format table` and
-  `--format json`; assert the header's exact five content lines and that the
+  `--format json`; assert the header's exact content lines and that the
   payload following it is unchanged from the pre-header rendering.*
 - **AC-39** (Verifies FR-29, INV-6): Given `sql`, `doctor`, `collector-config`, or
   `troubleshoot`, when the command runs, then stdout contains no response header.

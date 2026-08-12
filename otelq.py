@@ -1865,15 +1865,17 @@ def _format_response_header(
     fmt: str,
     rows: list[Row],
     time_range: TimeRange,
+    telemetry_dir: Path,
     session_id: str,
     regex: str | None = None,
     regex_removed: int | None = None,
     worktree_banner: str | None = None,
 ) -> str:
     """Render the FR-29 response header: a fixed plain-text block naming the
-    command, format, OpenTelemetry signal(s), UTC time range, and the FR-33
-    `Session` id, so an LLM consumer cannot mistake a rendered `timestamp` for
-    local time and can carry the session tag into follow-up calls. When
+    command, format, OpenTelemetry signal(s), absolute telemetry directory, UTC
+    time range, and the FR-33 `Session` id, so an LLM consumer cannot mistake a
+    rendered `timestamp` for local time, lose track of its data source, or fail
+    to carry the session tag into follow-up calls. When
     `--regex` (FR-32) was supplied, two extra lines report the verbatim
     pattern and how many rows it removed, so a caller is never blind to what
     was filtered away — unlike post-hoc `grep` on rendered output. When worktree
@@ -1888,6 +1890,7 @@ def _format_response_header(
         "==========",
         f"otelq {command} response, format {fmt}{shape_hint}",
         f"OpenTelemetry signal: {_result_signal(command, rows)}",
+        f"Reading data from: {telemetry_dir.resolve()}",
         f"Time range: {from_str} - {to_str}",
     ]
     if worktree_banner is not None:
@@ -4196,6 +4199,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                 args.format,
                 rows,
                 time_range,
+                args.dir,
                 args.session_id,
                 args.regex,
                 regex_removed,

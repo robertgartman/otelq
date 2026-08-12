@@ -2212,7 +2212,9 @@ def _run_fmt(dirpath: Path, fmt: str, *argv: str) -> str:
     return buf.getvalue()
 
 
-def test_ac38_response_header_shape_and_placement(temp_telemetry: Path) -> None:
+def test_ac38_response_header_shape_and_placement(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # AC-38: summary/errors/slow/trace/logs/metric print a fixed header before
     # the FR-10 rendering, for every --format; the payload after it is
     # unchanged from the header-less rendering of the same rows.
@@ -2220,16 +2222,19 @@ def test_ac38_response_header_shape_and_placement(temp_telemetry: Path) -> None:
     write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
     conn = otelq.connect(temp_telemetry)
     columns, rows = otelq.cmd_logs(conn, Namespace(service=None, level=None, grep=None))
+    monkeypatch.chdir(temp_telemetry.parent)
+    relative_dir = Path(temp_telemetry.name)
     for fmt in ("table", "json", "jsonl", "csv", "compact"):
-        out = _run_fmt(temp_telemetry, fmt, "logs")
+        out = _run_fmt(relative_dir, fmt, "logs")
         lines = out.splitlines()
         assert lines[0] == "=" * 10
         assert lines[1].startswith(f"otelq logs response, format {fmt}")
         assert lines[2] == "OpenTelemetry signal: logs"
-        assert lines[3].startswith("Time range: ") and " - " in lines[3]
-        assert lines[4] == "IMPORTANT: all timestamps are UTC"
-        assert lines[5].startswith("Session: ")  # FR-33 session id line
-        assert lines[6] == "-" * 10
+        assert lines[3] == f"Reading data from: {temp_telemetry.resolve()}"
+        assert lines[4].startswith("Time range: ") and " - " in lines[4]
+        assert lines[5] == "IMPORTANT: all timestamps are UTC"
+        assert lines[6].startswith("Session: ")  # FR-33 session id line
+        assert lines[7] == "-" * 10
         assert _strip_header(out) == otelq.format_output(columns, rows, fmt) + "\n"
 
 
@@ -2262,7 +2267,7 @@ def test_ac40_zero_row_time_range_is_na(temp_telemetry: Path) -> None:
     out = _run(temp_telemetry, "metric", "does.not.exist")
     lines = out.splitlines()
     assert lines[2] == "OpenTelemetry signal: metrics"
-    assert lines[3] == "Time range: n/a - n/a"
+    assert lines[4] == "Time range: n/a - n/a"
     assert _json.loads(_strip_header(out)) == []
 
 
@@ -2309,7 +2314,7 @@ def test_ac42_errors_zero_rows_signal_is_na(temp_telemetry: Path) -> None:
     out = _run(temp_telemetry, "errors")
     lines = out.splitlines()
     assert lines[2] == "OpenTelemetry signal: n/a"
-    assert lines[3] == "Time range: n/a - n/a"
+    assert lines[4] == "Time range: n/a - n/a"
     assert _json.loads(_strip_header(out)) == []
 
 
@@ -2432,7 +2437,7 @@ def test_ac45_timestamps_render_explicit_utc(temp_telemetry: Path) -> None:
     for fmt in ("table", "json", "jsonl", "csv", "compact"):
         out = _run_fmt(temp_telemetry, fmt, "logs")
         lines = out.splitlines()
-        from_str, to_str = lines[3].removeprefix("Time range: ").split(" - ")
+        from_str, to_str = lines[4].removeprefix("Time range: ").split(" - ")
         assert _UTC_TS_RE.match(from_str) and _UTC_TS_RE.match(to_str)
         payload = _strip_header(out)
         if fmt == "json":
@@ -2564,8 +2569,8 @@ def test_ac49_regex_filters_rows_and_reports_in_header(temp_telemetry: Path) -> 
     )
     out = _run(temp_telemetry, "--regex", "error", "logs")
     lines = out.splitlines()
-    assert lines[4] == "Regex filter applied: error"
-    assert lines[5] == "Rows removed by regex: 1"
+    assert lines[5] == "Regex filter applied: error"
+    assert lines[6] == "Rows removed by regex: 1"
     payload = _json.loads(_strip_header(out))
     assert len(payload) == 1 and payload[0]["body"] == "boom error here"
 
