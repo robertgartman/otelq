@@ -230,6 +230,36 @@ uvx otelq --dir .telemetry sql "DESCRIBE traces"
 uvx otelq --dir .telemetry sql "PRAGMA table_info('logs')"
 ```
 
+## Exit codes (scripting otelq)
+
+otelq's exit code is a stable contract. **Exit `0` means stdout is the answer to
+what you asked** — so a script never has to guess whether a query ran.
+
+| Exit | Meaning |
+|------|---------|
+| `0` | Answered. Includes zero rows and an empty-but-present store. |
+| `1` | Answered, verdict negative (`doctor` on an unhealthy store). |
+| `2` | **No answer**: bad flag, bare invocation, missing store, unreadable store, bad SQL. |
+
+On exit `2`, stdout is empty and stderr carries one
+`otelq: <reason>: <message>` line — `store_not_found`, `store_unreadable`,
+`query_error`, `usage_error`, `internal_error`. Under `--format json|jsonl|compact`
+a JSON object follows it on stderr, with `otelq_version`, `ok`, `reason`, `store.dir`.
+
+Do **not** write `otelq ... 2>/dev/null || echo 0` — that is the pattern this
+contract exists to kill. Branch on the exit code:
+
+```bash
+hits=$(uvx otelq --dir .telemetry --format compact \
+         sql "SELECT count(*) FROM logs WHERE severity_text = 'ERROR'") || {
+  echo "otelq failed — do not treat this as zero errors" >&2; exit 2; }
+```
+
+A count query returns a row whether the count is `0` or `500`; the *value* is
+the answer and exit `0` is your guarantee it is real. A missing `--dir` is exit
+`2`, not an empty store — and otelq never creates the directory, so a typo
+cannot hide.
+
 ## Not seeing data?
 
 ```

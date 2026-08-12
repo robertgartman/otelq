@@ -12,14 +12,15 @@ must_not_contain:
   - architectural_rationale
   - external_data_schemas
 created: 2026-06-23
-last_updated: 2026-07-07
+last_updated: 2026-08-12
 related_documents:
   - PRD-otelq
   - SPEC-otelq-incremental-cache
   - CONTRACT-telemetry-directory
   - ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0
   - ADR-009-query-history-triage-store
-ai_summary: "otelq CLI base behavior: the query relations/columns it exposes, its subcommands (incl. history/triage over the query-history store), global flags and argument order, and its friendly read-only failure handling."
+  - ADR-012-exit-codes-as-public-contract
+ai_summary: "otelq CLI base behavior: the query relations/columns it exposes, its subcommands (incl. history/triage over the query-history store), global flags and argument order, its exit-code contract, and its friendly read-only failure handling."
 semantic_tags:
   - otelq
   - cli
@@ -29,6 +30,7 @@ semantic_tags:
   - logs
   - metrics
   - observability
+  - exit-codes
 ---
 
 # SPEC — otelq CLI (Base Behavior)
@@ -376,12 +378,38 @@ configuration that produces the raw files.
   help text. The convention is pinned by a test against otelq's actual
   relations, so a future DuckDB upgrade that changes
   this literal-parsing behavior is caught rather than silently masked.
-- **FR-17 — Exit codes.** otelq **must** exit `0` on success, including when a
-  command produces zero result rows, prints a friendly "no telemetry" message
-  (FR-18, FR-19), or prints help (a bare `otelq` or `otelq help`, FR-22). A
-  non-zero exit **must** occur only on a real error — e.g. malformed SQL (FR-9),
-  a malformed `--since`/argument-order parse failure (FR-11, FR-15), or an unknown
-  `help` topic (FR-22).
+- **FR-17 — Exit codes.** *(Amended 2026-08-12 by
+  [ADR-012](../adr/ADR-012-exit-codes-as-public-contract.md), which makes the exit
+  code a public compatibility surface.)* otelq's exit code **must** carry a
+  three-tier taxonomy governed by one invariant: **exit `0` promises that stdout
+  is the answer to the question that was asked.**
+
+  | Exit | Meaning |
+  |------|---------|
+  | `0` | otelq produced an answer, and any verdict it carries is affirmative. |
+  | `1` | otelq produced an answer, and the verdict is **negative**. |
+  | `2` | otelq produced **no answer**. |
+
+  Exit `0` **must** cover: a command that produces zero result rows; the friendly
+  no-telemetry and named-gap paths (FR-18, FR-19); and help that was *explicitly*
+  requested (`otelq help`, `otelq help <valid topic>`, `-h`/`--help`, FR-22).
+
+  Exit `1` is the **verdict** tier: the command ran and answered a yes/no
+  question in the negative. `doctor` **must** continue to exit `1` when its
+  telemetry-contract validation fails (FR-26) — a store diagnosed as unhealthy is
+  an *answer*, not a failure to answer. No path that merely failed to produce an
+  answer may use `1`; in particular malformed SQL — which formerly exited `1` —
+  **must** now exit `2`.
+
+  Exit `2` **must** cover every case in which no answer was produced: a
+  malformed `--since` or argument-order parse failure (FR-11, FR-15), an unknown
+  subcommand or flag, an unknown `help` topic (FR-22), a bare invocation
+  (FR-39), a telemetry directory that does not exist (FR-38), a store that
+  cannot be read, malformed SQL (FR-9), and any otherwise-unhandled internal
+  error. Every exit-`2` path **must** additionally emit a reason token per FR-37.
+
+  stdout **must** carry only the answer. On any exit-`2` path stdout **must** be
+  empty; diagnostics go to stderr (FR-37).
 - **FR-18 — Friendly empty-telemetry message.** When a command's required
   signal(s) carry **no captured data** — and **no** other signal does either
   (nothing captured at all) — otelq **must** print a short, friendly message to
@@ -408,15 +436,18 @@ configuration that produces the raw files.
 - **FR-21 — Partial trailing line is skipped.** A partially-written trailing
   JSONL line (one that does not parse) **must** be skipped, and the run **must**
   still succeed; the line is re-read once complete on a later run.
-- **FR-22 — Help affordances.** Beyond the seven query verbs, otelq **must** keep
-  its help discoverable. A bare `otelq` (no command) **must** print the full
-  top-level help and exit `0` — not the terse argparse "required: command" error.
-  otelq **must** also accept a `help` meta-command: `otelq help` prints that same
-  top-level help, and `otelq help <command>` prints the named command's own help
-  (equivalent to `otelq <command> -h`). An unknown topic (`otelq help <unknown>`)
-  **must** be rejected as a real error (FR-17) carrying argparse's invalid-choice
-  message that names the valid commands. The `-h`/`--help` flags (top-level and
-  per-subcommand) remain available and unchanged.
+- **FR-22 — Help affordances.** *(Amended 2026-08-12 by
+  [ADR-012](../adr/ADR-012-exit-codes-as-public-contract.md): help is an answer
+  only when help was the question. A bare `otelq` formerly printed help to stdout
+  and exited `0`; it is now governed by FR-39.)* Beyond the seven query verbs,
+  otelq **must** keep its help discoverable. otelq **must** accept a `help`
+  meta-command: `otelq help` prints the top-level help and `otelq help <command>`
+  prints the named command's own help (equivalent to `otelq <command> -h`). These,
+  and the `-h`/`--help` flags (top-level and per-subcommand), are *explicitly
+  requested* help: they **must** print to **stdout** and exit `0`. An unknown
+  topic (`otelq help <unknown>`) **must** be rejected as a real error carrying
+  argparse's invalid-choice message that names the valid commands — stderr, exit
+  `2` (FR-17), never a silent fallback to general help.
 
 ### Output bounds, metadata, and safety
 
@@ -633,6 +664,70 @@ configuration that produces the raw files.
   **must** still count toward frequency/recency ranking evidence, and **must
   not** contribute terminal, transition, or session-opening evidence.
 
+### Machine-attributable failure (ADR-012)
+
+- **FR-37 — Reason tokens on failure.** Every exit-`2` path (FR-17) **must**
+  emit, on **stderr**, exactly one line of the form
+  `otelq: <reason>: <human message>`. Other stderr content (an argparse usage
+  line, the full help of FR-39) **may** precede it, so a consumer matches the
+  line rather than assuming it is first. The token vocabulary is **closed** and
+  drawn from:
+
+  | Reason | Emitted when |
+  |--------|--------------|
+  | `store_not_found` | The resolved telemetry directory does not exist (FR-38) |
+  | `store_unreadable` | The path exists but is not a usable store — not a directory, or its contents cannot be read |
+  | `query_error` | A query failed to execute — malformed SQL (FR-9), an empty query, or a reader/DuckDB error |
+  | `usage_error` | The invocation was not understood — bad or misplaced flag, unknown subcommand, unknown `help` topic, malformed `--since` or `--regex`, an ambiguous `trace` id prefix, bare invocation (FR-39) |
+  | `internal_error` | Any otherwise-unhandled error |
+
+  `predicate_unsatisfied` and `timeout` are **reserved** and **must not** be
+  emitted. Tokens are additive-only: a future token **may** be introduced, but an
+  existing token's spelling, meaning, and associated exit code **must not**
+  change.
+
+  When `--format` is a machine format (`json`, `jsonl`, `compact`), otelq **must
+  additionally** print a single-line JSON object to **stderr** carrying at least
+  `otelq_version`, `ok` (always `false`), `reason`, and `store.dir` (the resolved
+  absolute telemetry directory). It **must not** be printed for the human formats
+  (`table`, `csv`).
+
+  The failure object **must never** be written to **stdout**: a caller piping
+  stdout to a parser must receive rows or nothing, never an error wearing the
+  shape of data. On every exit-`2` path stdout **must** be empty.
+
+- **FR-38 — A missing telemetry root is a failure, and is never created.** When
+  the resolved telemetry directory (FR-12) does not exist, otelq **must** exit
+  `2` with reason `store_not_found`, naming the resolved absolute path. It
+  **must not** create that directory, and **must not** take the friendly
+  empty-telemetry path of FR-18 — a directory that is absent is *unavailable*,
+  which is a different condition from a directory that is present and empty.
+
+  otelq **must** create its own consumer-owned subtrees (`.otelq-cache/`,
+  `.otelq-history/`; see
+  [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md))
+  **only** inside a root that already exists. The telemetry root itself is
+  producer-owned. The cwd-relative default of FR-12 is unchanged — only the
+  response to its absence is.
+
+  This rule **must not** apply to commands that do not read a store — `--help`,
+  `help`, `--version`, `collector-config`, `troubleshoot`,
+  `set_resource_attributes` — nor to **`doctor`**, whose purpose is to diagnose
+  the store: `doctor` **must** continue to report a missing directory as a `FAIL`
+  row and exit `1` (a verdict, FR-26), not `2`.
+
+- **FR-39 — A bare invocation is a usage error.** `otelq` invoked with **no
+  arguments at all** **must** print the top-level help to **stderr** and exit `2`
+  with reason `usage_error` (FR-37). It **must not** print to stdout and **must
+  not** exit `0`.
+
+  Rationale, per [ADR-012](../adr/ADR-012-exit-codes-as-public-contract.md): a
+  bare invocation is the shape produced when a caller's argument variable fails to
+  expand. Answering it with help on stdout and exit `0` hands an automated caller
+  a success code alongside output that is not the answer to any question it
+  asked. Explicitly requested help (FR-22) keeps stdout and exit `0`, because
+  there the help *is* the answer.
+
 ## Edge Cases & Failure Modes
 
 - **EC-1 — Nothing captured.** No matching `*.jsonl` files exist (Collector down
@@ -829,11 +924,11 @@ configuration that produces the raw files.
   count(*) AS n FROM traces"` runs, then the query's own columns and rows are
   returned verbatim.
   *Verification hint: `test_sql_passthrough`.*
-- **AC-9** (Verifies FR-9, FR-17, INV-5, EC-4): Given a malformed SQL string, when
-  `sql` runs, then otelq exits non-zero with an `otelq: SQL error:` message and no
-  Python traceback.
+- **AC-9** (Verifies FR-9, FR-17, FR-37, INV-5, EC-4): Given a malformed SQL
+  string, when `sql` runs, then otelq exits **`2`** (not `1`) with an
+  `otelq: query_error:` message on stderr, empty stdout, and no Python traceback.
   *Verification hint: invoke `cmd_sql`/`main` with `"SELEKT 1"`; assert
-  `SystemExit` / non-zero and the message prefix.*
+  `SystemExit` / exit `2` and the `otelq: query_error:` prefix.*
 - **AC-10** (Verifies FR-10, INV-2): Given any result, when `--format json` is
   selected, then the output is a JSON array of objects keyed by the result
   columns; `--format csv` emits a header row plus CSV rows; `--format table` is
@@ -923,12 +1018,14 @@ configuration that produces the raw files.
   and emits no zero-count log/trace skeleton; an absent signal contributes no
   rows.
   *Verification hint: `test_summary_absent_signal_has_no_rows`.*
-- **AC-26** (Verifies FR-22, EC-13): Given the parser, when `main([])` or
-  `main(["help"])` runs, then each prints the top-level help (its `usage:` line
-  and the global-flags-first rule) and exits `0`; when `main(["help", "slow"])`
-  runs, it prints `slow`'s own help (its `--top` flag) and exits `0`; and
-  `main(["help", "not-a-command"])` exits `2` with an invalid-choice message.
-  *Verification hint: `test_bare_otelq_prints_full_help`,
+- **AC-26** (Verifies FR-22, FR-39, EC-13): Given the parser, when `main(["help"])`
+  runs, then it prints the top-level help (its `usage:` line and the
+  global-flags-first rule) to **stdout** and exits `0`; when `main(["help", "slow"])`
+  runs, it prints `slow`'s own help (its `--top` flag) to stdout and exits `0`;
+  `main(["help", "not-a-command"])` exits `2` with an invalid-choice message; and
+  `main([])` prints the same top-level help to **stderr** and exits **`2`**
+  (FR-39).
+  *Verification hint: `test_bare_otelq_is_usage_error`,
   `test_help_command_prints_general_help`,
   `test_help_command_topic_prints_subcommand_help`,
   `test_help_command_unknown_topic_errors`.*
@@ -990,7 +1087,7 @@ configuration that produces the raw files.
   order.
   *Verification hint: `test_p5_format_compact_columns_rows`,
   `test_p5_format_compact_via_cli`.*
-- **AC-38** (Verifies FR-29): Given any of `summary`/`errors`/`slow`/`trace`/
+- **AC-38** (Verifies FR-29, EC-23): Given any of `summary`/`errors`/`slow`/`trace`/
   `logs`/`metric`, when the command runs with any `--format`, then stdout begins
   with the fixed header (a `==========` line; `otelq <command> response, format
   <format>`; `OpenTelemetry signal: <signal>`; `Time range: <from> - <to>`; the
@@ -1174,12 +1271,12 @@ configuration that produces the raw files.
   run is recorded into history under that id, and the **last stdout line** is
   the full suggested follow-up (`… --session-id <anchor> logs …`).
   *Verification hint: `test_triage_markov_autoruns_and_suggests_next`.*
-- **AC-67** (Verifies FR-35): Given a confident successor whose template
+- **AC-67** (Verifies FR-35, EC-33): Given a confident successor whose template
   contains a `?` placeholder (a normalised SQL literal), when triage runs,
   then **no** auto-run happens and the suggestion line carrying the stored raw
   form (and the session id) is printed instead.
   *Verification hint: `test_triage_nonconcrete_candidate_suggests_instead_of_running`.*
-- **AC-68** (Verifies FR-35): Given no history store, when `triage` runs, then
+- **AC-68** (Verifies FR-35, EC-34): Given no history store, when `triage` runs, then
   a friendly stderr notice appears and stdout is empty (exit `0`); given a
   store whose evidence clears no threshold AND an anchor session that already
   ran `summary`, then the honest-refusal notice appears on stderr and stdout
@@ -1192,6 +1289,55 @@ configuration that produces the raw files.
   response), records that run into history, and does **not** print the
   refusal notice.
   *Verification hint: `test_triage_grounds_with_summary_when_session_unseeded`.*
+- **AC-71** (Verifies FR-38, FR-37, FR-17, INV-1, INV-7): Given a `--dir` naming
+  a path that does **not** exist, when any store-reading command runs as a
+  subprocess, then the process exits `2`, stdout is empty, stderr carries a line
+  `otelq: store_not_found: …` naming the resolved absolute path, and the path
+  **still does not exist** afterwards — otelq created neither the root nor any
+  `.otelq-*` subtree.
+  *Verification hint: `test_ac71_missing_store_dir_exits_2_and_creates_nothing`;
+  assert `not path.exists()` after the run.*
+- **AC-72** (Verifies FR-38, FR-18, FR-17): Given a telemetry directory that
+  **exists** but holds no captured data, when any command runs, then the friendly
+  no-telemetry message still appears on stderr and the process still exits `0` —
+  the FR-18 path is unchanged by FR-38, which governs only an *absent* root.
+  *Verification hint: `test_ac72_existing_empty_store_stays_friendly_exit_0`.*
+- **AC-73** (Verifies FR-17, FR-37, INV-7): Given a malformed SQL string, when
+  `sql` runs as a subprocess, then the process exits `2` — never `1` — stdout is
+  empty, and stderr carries a line beginning `otelq: query_error:`.
+  *Verification hint: `test_ac73_malformed_sql_exits_2_with_reason`; assert the
+  exit code is exactly `2` so a regression to `1` fails.*
+- **AC-74** (Verifies FR-37): Given any failing invocation under a machine
+  `--format` (`json`, `jsonl`, `compact`), when it runs, then stderr additionally
+  carries a single-line JSON object parseable by `json.loads`, whose `ok` is
+  `false`, whose `reason` equals the token on the human line, and which carries
+  `otelq_version` and `store.dir`; under `--format table` and `--format csv` no
+  such object is printed. In neither case does anything appear on stdout.
+  *Verification hint: `test_ac74_machine_format_emits_json_failure_object`,
+  `test_ac74_human_format_omits_json_failure_object`.*
+- **AC-75** (Verifies FR-39, FR-22, FR-17, INV-7): Given a bare `otelq` with no
+  arguments, when it runs as a subprocess, then stdout is **empty**, the
+  top-level help appears on stderr, and the process exits `2`; given
+  `otelq help`, `otelq help slow`, and `otelq --help`, then the help appears on
+  **stdout** and each exits `0`.
+  *Verification hint: `test_ac75_bare_invocation_is_usage_error_on_stderr`,
+  `test_ac75_explicit_help_stays_on_stdout_exit_0`.*
+- **AC-76** (Verifies FR-17, FR-37): Given the set of invocations that fail to
+  parse — an unknown subcommand, an unknown global flag, a global flag placed
+  after the subcommand (FR-11), a malformed `--since` (FR-15), and an unknown
+  `help` topic (FR-22) — when each runs, then every one exits `2` with empty
+  stdout and a stderr line beginning `otelq: usage_error:`.
+  *Verification hint: `test_ac76_parse_failures_are_usage_error_exit_2`,
+  parametrised over the five invocations.*
+- **AC-77** (Verifies FR-17, FR-26, INV-5): Given the full matrix of documented
+  invocations — successes, empty results, friendly-empty, explicit help, and
+  every failure mode above — when each runs, then **no** invocation exits `1`:
+  every failure is `2` and every success is `0`. Given instead `doctor` over a
+  directory that does not exist, then it exits `1` (a negative verdict, not a
+  failure to answer), reports a `FAIL` row naming the directory, and creates
+  nothing.
+  *Verification hints: `test_ac77_failures_never_exit_1`,
+  `test_ac77_doctor_keeps_verdict_exit_1`.*
 
 ### Examples
 
@@ -1214,10 +1360,12 @@ configuration that produces the raw files.
   prints "no telemetry captured — is the collector running …?" to stderr and
   exits 0. With only `metrics` captured, `errors` instead prints "no traces or
   logs telemetry captured (present: metrics) …", naming the gap.
-- **Help discoverability (FR-22).** `just otelq` (no command) and `just otelq help`
-  both print the full top-level help; `just otelq help slow` prints `slow`'s own
-  help (its `--top` flag). `just otelq help nope` exits non-zero with an
-  invalid-choice message naming the valid commands.
+- **Help discoverability (FR-22, FR-39).** `just otelq help` prints the full
+  top-level help on stdout and exits `0`; `just otelq help slow` prints `slow`'s
+  own help (its `--top` flag). `just otelq help nope` exits `2` with an
+  invalid-choice message naming the valid commands. A bare `just otelq` prints
+  that same top-level help on **stderr** and exits `2` — help is an answer only
+  when help was the question.
 
 ## Invariants
 
@@ -1236,8 +1384,15 @@ configuration that produces the raw files.
   message and exit `0`; a reader/DuckDB stack trace is never the user-facing
   result of "nothing captured" or "this signal is missing".
 - **INV-5** — Exit-code discipline: exit `0` covers every success including empty
-  results and the friendly "no telemetry" path; a non-zero exit is reserved for
-  real errors (malformed SQL, malformed `--since`, argument-order parse failure).
+  results, the friendly "no telemetry" path, and explicitly requested help; exit
+  `1` is the verdict tier — an answer that is negative, as `doctor` returns for
+  an unhealthy store — and is never used for a failure to answer; exit `2` covers
+  every case in which no answer was produced. (Amended by
+  [ADR-012](../adr/ADR-012-exit-codes-as-public-contract.md); see FR-17.)
+- **INV-7** — stdout is the answer: whenever otelq exits `0`, stdout holds the
+  answer to the question that was asked, and nothing else. Whenever otelq exits
+  `2`, stdout is empty and the reason is on stderr (FR-37). No diagnostic, error
+  object, or unrequested help ever appears on stdout.
 - **INV-6** — Header is additive, not substitutive: the FR-29 response header is
   prepended to stdout for its six governed commands but never changes the
   columns/rows a command returns (INV-3) nor the FR-10 rendering of the payload
