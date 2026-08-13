@@ -199,6 +199,29 @@ and the correlation filters themselves, which are
   and per-poll records would swamp the ranking evidence
   ([ADR-009](../adr/ADR-009-query-history-triage-store.md)).
 
+- **FR-13 — A timeout must say whether anything is arriving.** When a wait exits
+  `1` (FR-3), otelq **must** additionally report, per signal with captured data,
+  the newest record's age at the moment the budget expired — the same freshness
+  values `summary` reports
+  ([SPEC-otelq-cli](SPEC-otelq-cli.md) FR-47).
+  - Without it a timeout is ambiguous between the two failures a caller must
+    tell apart: **the step under test never ran**, and **the producer ran but
+    the collector has not flushed**. The first is a defect in the system under
+    test; the second is a defect in the measurement. Acting on the wrong one
+    wastes the entire debugging cycle.
+  - The `Query window:` line ([SPEC-otelq-cli](SPEC-otelq-cli.md) FR-46)
+    **must not** be relied on to carry this: a window derived from wall-clock is
+    identical whether or not anything is arriving, so it cannot discriminate.
+  - The report **must** be a number, never a verdict (FR-47): otelq states the
+    lag and the caller decides what it means.
+  - A store with **no captured records at all** **must** be reported as such
+    rather than the line being omitted, so "no telemetry reaching the collector"
+    is distinguishable from "telemetry, but stale". Within a non-empty store,
+    individual signals with no data are omitted exactly as
+    [SPEC-otelq-cli](SPEC-otelq-cli.md) FR-47 requires.
+  - This **must not** alter the exit code, which stays `1` (INV-3), nor delay
+    the exit beyond the budget (FR-3).
+
 ## Edge Cases & Failure Modes
 
 - **EC-1 — Already satisfied.** The predicate holds at invocation: returns after
@@ -290,6 +313,14 @@ and the correlation filters themselves, which are
   `--since`, the queried window advances across polls rather than being frozen
   at the first.
   *Verification hint: `test_ac12_no_poll_or_sleep_past_deadline`.*
+
+- **AC-13** (Verifies FR-13, FR-3, INV-3): Given a store receiving records that
+  never satisfy the predicate, when the wait times out, then it exits `1` and
+  stderr reports the newest-record age per signal with captured data; and given
+  a store that is empty throughout, the same timeout reports that no records
+  were captured — so the two causes of an unsatisfied wait are distinguishable
+  from the timeout output alone, without a second invocation.
+  *Verification hint: `test_ac13_timeout_reports_per_signal_freshness`.*
 
 ## Invariants
 

@@ -133,6 +133,7 @@ __all__ = [
     "_seal_external_access",
     "_future_ceiling",
     "_fmt_ts",
+    "_SUMMARY_FRESHNESS_LABEL",
     "_SUMMARY_SERVICE_LABEL",
     "_history_normalize",
     "_history_raw",
@@ -1810,22 +1811,46 @@ def _assemble_hot(
     return present
 
 
+@dataclass(frozen=True)
+class BuildInfo:
+    """What the build actually did, carried out as data so the answer can
+    disclose it (FR-46/FR-47).
+
+    `lo`/`hi` are the event-time bounds actually applied to the query relations
+    — not a restatement of the flags, which do not determine them on their own.
+    `newest_by_signal` is the newest event-time per signal **before** the window
+    was applied: freshness is a question about the producer, not about the
+    window, so scoping it to the window would make it tautological. It must be
+    captured here because the built-ins cannot recompute it later — on the hot
+    path `_all_<signal>` are parquet-backed views and `_seal_external_access`
+    revokes the file access they need before any command runs."""
+
+    lo: datetime | None
+    hi: datetime | None
+    newest_by_signal: dict[str, datetime]
+
+
+_EMPTY_BUILD = BuildInfo(None, None, {})
+
+
 def _finalize_relations(
     conn: duckdb.DuckDBPyConnection, present: set[str], window: timedelta | None
-) -> None:
+) -> BuildInfo:
     """Create the final query relations (traces/logs/metrics_*) from _all_<signal>,
     restricted to the planned event-time window. `now` is the max observed
     event-time across the built relations, so the hot and cold paths apply the
-    identical window basis (SPEC INV-7)."""
+    identical window basis (SPEC INV-7). Returns the applied bounds and the
+    per-signal pre-window maxima for FR-46/FR-47 disclosure."""
     if not present:
-        return
-    maxes: list[datetime] = []
+        return _EMPTY_BUILD
+    newest: dict[str, datetime] = {}
     for s in present:
         v = _scalar(
             conn.execute(f"SELECT max({EVENT_TIME_COLUMNS[s]}) FROM _all_{s}")
         )
         if v is not None:
-            maxes.append(v)
+            newest[s] = v
+    maxes = list(newest.values())
     now_evt = max(maxes) if maxes else None
     if window is None or now_evt is None:
         lo = hi = None
@@ -1857,6 +1882,7 @@ def _finalize_relations(
     create_unified_metrics_view(conn)
     create_resource_attr_macro(conn)  # FR-41
     create_span_tree_views(conn)  # FR-43
+    return BuildInfo(lo, hi, newest)
 
 
 def build_hot(
@@ -1864,7 +1890,7 @@ def build_hot(
     telemetry_dir: Path,
     window: timedelta | None,
     tmp_dir: str,
-) -> None:
+) -> BuildInfo:
     """Ingest the delta if we win the writer lock, then build the query relations
     from the parquet cache (sealed ∪ pending). A run that loses the lock answers
     from the cache as last committed; if the cache is empty (a concurrent first
@@ -1882,12 +1908,11 @@ def build_hot(
     if not present:
         # Empty cache: a stateless cold scan reads the raw delta (and itself seeds
         # absent relations), so the query still answers (SPEC FR-12).
-        build_cold(conn, telemetry_dir, window, tmp_dir)
-        return
+        return build_cold(conn, telemetry_dir, window, tmp_dir)
     # Cache has data: seed the signals that sealed none empty so all documented
     # relations resolve on the hot path exactly as on the cold path (FR-1/FR-11).
     _seed_absent_relations(conn, telemetry_dir, tmp_dir, present, "_all_")
-    _finalize_relations(conn, present, window)
+    return _finalize_relations(conn, present, window)
 
 
 def build_cold(
@@ -1895,7 +1920,7 @@ def build_cold(
     telemetry_dir: Path,
     window: timedelta | None,
     tmp_dir: str,
-) -> None:
+) -> BuildInfo:
     """Stateless full raw scan, restricted to the window. The --no-cache path and
     the fallback for queries reaching older than the hot window."""
     present: set[str] = set()
@@ -1907,7 +1932,7 @@ def build_cold(
             _materialize(conn, f"_all_{signal}", signal, staged)
             present.add(signal)
     _seed_absent_relations(conn, telemetry_dir, tmp_dir, present, "_all_")
-    _finalize_relations(conn, present, window)
+    return _finalize_relations(conn, present, window)
 
 
 def connect(telemetry_dir: Path) -> duckdb.DuckDBPyConnection:
@@ -1942,12 +1967,22 @@ def connect(telemetry_dir: Path) -> duckdb.DuckDBPyConnection:
 
 
 class Plan:
-    __slots__ = ("route", "window", "use_cache")
+    __slots__ = ("route", "window", "use_cache", "origin")
 
-    def __init__(self, route: str, window: timedelta | None, use_cache: bool):
+    def __init__(
+        self,
+        route: str,
+        window: timedelta | None,
+        use_cache: bool,
+        origin: str = "default",
+    ):
         self.route = route  # "HOT" | "COLD" | "HOT_THEN_COLD"
         self.window = window  # None = unbounded
         self.use_cache = use_cache
+        # FR-46: WHICH rule produced the window. "30m" alone cannot tell a
+        # caller whether it asked for that or merely accepted a default, and
+        # those are different claims about the answer.
+        self.origin = origin
 
 
 def _parse_since(since: str | None) -> timedelta | None:
@@ -1974,10 +2009,13 @@ def plan_range(args: argparse.Namespace) -> Plan:
 
     if cmd == "trace" or all_flag:
         window: timedelta | None = None
+        origin = "--all" if all_flag else "command default"
     elif since is not None:
         window = since
+        origin = "--since"
     else:
         window = hot  # windowless commands default to the hot window (FR-9)
+        origin = "default"
 
     if no_cache or all_flag:
         route = "COLD"
@@ -1992,18 +2030,56 @@ def plan_range(args: argparse.Namespace) -> Plan:
         route = "HOT_THEN_COLD"
     else:
         route = "HOT"
-    return Plan(route, window, use_cache)
+    return Plan(route, window, use_cache, origin)
 
 
-def _human_window(window: timedelta | None) -> str:
-    """Render a plan window as the compact form the user typed (30s/10m/2h/1d)."""
-    if window is None:
-        return "all history"
+def _compact_window(window: timedelta) -> str:
+    """A window as the compact form the user types (30s/10m/2h/1d)."""
     seconds = int(window.total_seconds())
     for size, suffix in ((86400, "d"), (3600, "h"), (60, "m")):
         if seconds % size == 0:
-            return f"last {seconds // size}{suffix}"
-    return f"last {seconds}s"
+            return f"{seconds // size}{suffix}"
+    return f"{seconds}s"
+
+
+def _human_window(window: timedelta | None) -> str:
+    """Render a plan window for the --verbose plan line."""
+    if window is None:
+        return "all history"
+    return f"last {_compact_window(window)}"
+
+
+def _compact_age(delta: timedelta) -> str:
+    """Elapsed time as 4s / 1m02s / 3h12m / 41d15h, degrading to coarser units
+    as it grows so a long silence stays readable rather than rendering as a
+    four-digit hour count. A future event-time (producer clock
+    skew, EC-12) clamps to 0s rather than rendering a negative age; `doctor` is
+    where skew is diagnosed."""
+    seconds = int(delta.total_seconds())
+    if seconds <= 0:
+        return "0s"
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    if seconds < 172800:  # under 48h, hours still read naturally
+        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    return f"{seconds // 86400}d{(seconds % 86400) // 3600:02d}h"
+
+
+def _render_query_window(plan: Plan | None, info: BuildInfo | None) -> str:
+    """The FR-46 `Query window:` value: the bounds actually applied, plus the
+    rule that chose the width. Rendered even for an empty result — that is the
+    case it exists for, since `Rows time range:` is `n/a` there by construction
+    and so carries no evidence of what was searched."""
+    if plan is None:
+        return "n/a"
+    if plan.window is None:
+        return f"all history ({plan.origin})"
+    width = f"({_compact_window(plan.window)}, {plan.origin})"
+    if info is None or info.lo is None or info.hi is None:
+        return f"n/a - n/a {width}"
+    return f"{_iso_utc(info.lo)} - {_iso_utc(info.hi)} {width}"
 
 
 def _plan_summary(plan: Plan) -> str:
@@ -2015,7 +2091,9 @@ def _plan_summary(plan: Plan) -> str:
     )
 
 
-def build_connection(telemetry_dir: Path, plan: Plan) -> duckdb.DuckDBPyConnection:
+def build_connection(
+    telemetry_dir: Path, plan: Plan
+) -> tuple[duckdb.DuckDBPyConnection, BuildInfo]:
     import duckdb  # lazy; see TYPE_CHECKING note above
 
     conn = duckdb.connect(database=":memory:")
@@ -2023,10 +2101,10 @@ def build_connection(telemetry_dir: Path, plan: Plan) -> duckdb.DuckDBPyConnecti
     conn.execute("LOAD otlp")
     with tempfile.TemporaryDirectory(prefix="otelq-") as tmp_dir:
         if plan.route == "COLD" or not plan.use_cache:
-            build_cold(conn, telemetry_dir, plan.window, tmp_dir)
+            info = build_cold(conn, telemetry_dir, plan.window, tmp_dir)
         else:
             try:
-                build_hot(conn, telemetry_dir, plan.window, tmp_dir)
+                info = build_hot(conn, telemetry_dir, plan.window, tmp_dir)
             except duckdb.Error:
                 # A cache parquet vanished mid-read (a concurrent writer's
                 # eviction) or was torn — fall back to a stateless cold scan on a
@@ -2035,8 +2113,8 @@ def build_connection(telemetry_dir: Path, plan: Plan) -> duckdb.DuckDBPyConnecti
                 conn = duckdb.connect(database=":memory:")
                 conn.execute("INSTALL otlp FROM community")
                 conn.execute("LOAD otlp")
-                build_cold(conn, telemetry_dir, plan.window, tmp_dir)
-    return conn
+                info = build_cold(conn, telemetry_dir, plan.window, tmp_dir)
+    return conn, info
 
 
 def _seal_external_access(conn: duckdb.DuckDBPyConnection, command: str) -> None:
@@ -2062,6 +2140,43 @@ _HEADER_SIGNAL_ORDER = ("traces", "logs", "metrics")
 # cmd_errors tags each row "span" or "log" (FR-4); map that to the plural
 # Signal names the response header uses (FR-29).
 _ERRORS_KIND_SIGNAL = {"span": "traces", "log": "logs"}
+
+# FR-47: freshness is reported by `summary`, not by every response header, so an
+# ordinary query is not bloated by a diagnostic `summary` exists to answer.
+_SUMMARY_FRESHNESS_LABEL = "** Newest record per signal **"
+
+
+def _freshness_rows(info: BuildInfo) -> tuple[list[str], list[Row]]:
+    """Newest record per signal with its age (FR-47), collapsed onto the three
+    plural signal names the rest of the output uses. Taken from the PRE-window
+    maxima: an empty result from a dead producer and one from a producer whose
+    collector has not flushed are otherwise identical, and telling them apart is
+    the whole point — so this must not be scoped to the query window."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    family: dict[str, datetime] = {}
+    for signal, ts in info.newest_by_signal.items():
+        key = "metrics" if signal.startswith("metrics") else signal
+        current = family.get(key)
+        if current is None or ts > current:
+            family[key] = ts
+    rows: list[Row] = []
+    for name in _HEADER_SIGNAL_ORDER:
+        ts = family.get(name)
+        if ts is None:
+            continue  # an absent signal contributes no row (FR-3)
+        naive = ts.replace(tzinfo=None) if ts.tzinfo is not None else ts
+        rows.append((name, ts, _compact_age(now - naive)))
+    return ["signal", "newest", "age"], rows
+
+
+def _freshness_sentence(info: BuildInfo | None) -> str:
+    """One-line freshness for an `await` timeout (SPEC-otelq-await FR-13): a
+    number per signal, never a verdict — otelq states the lag and the caller
+    decides what it means."""
+    if info is None or not info.newest_by_signal:
+        return "no records captured"
+    _, rows = _freshness_rows(info)
+    return ", ".join(f"{r[0]} {r[2]} ago" for r in rows)
 
 
 def _result_time_range(
@@ -2198,6 +2313,7 @@ def _format_response_header(
     record_attrs: list[_ResourceAttrFilter] | None = None,
     waited: str | None = None,
     resolved_by: str = "",
+    query_window: str = "",
 ) -> str:
     """Render the FR-29 response header: a fixed plain-text block naming the
     command, format, OpenTelemetry signal(s), absolute telemetry directory, UTC
@@ -2222,7 +2338,10 @@ def _format_response_header(
         f"OpenTelemetry signal: {_result_signal(command, rows)}",
         f"OTEL source dir: {telemetry_dir.resolve()}",
         f"OTEL source resolved by: {resolved_by or RESOLVED_BY_FLAG}",
-        f"Time range: {from_str} - {to_str}",
+        f"Rows time range: {from_str} - {to_str}",
+        # FR-46: what was SEARCHED, beside what was RETURNED. The old single
+        # `Time range:` line asserted the former while carrying the latter.
+        f"Query window: {query_window or 'n/a'}",
     ]
     if worktree_banner is not None:
         lines.append(worktree_banner)
@@ -2313,7 +2432,14 @@ def run_command(
         print(_plan_summary(plan), file=sys.stderr)
     command = COMMANDS[args.command]
     fallback = plan.use_cache and plan.route == "HOT_THEN_COLD"
-    with closing(build_connection(args.dir, plan)) as conn:
+    conn, build_info = build_connection(args.dir, plan)
+    # FR-46/FR-47: stashed on args like _resolved_by/_worktree_scope, so the
+    # renderer can disclose the window and freshness without re-deriving either.
+    # Set BEFORE dispatch so it survives a NoTelemetryError — an await timeout
+    # over an empty store still needs to report that nothing was captured.
+    args._plan = plan
+    args._build_info = build_info
+    with closing(conn):
         _seal_external_access(conn, args.command)
         # Resolve worktree scope BEFORE dispatch so scoped commands see the
         # predicate on args; the banner is computed AFTER, over the same window.
@@ -2340,7 +2466,13 @@ def run_command(
             "otelq: hot window empty — widened to a full-history cold scan",
             file=sys.stderr,
         )
-    with closing(build_connection(args.dir, Plan("COLD", None, True))) as conn:
+    cold_plan = Plan("COLD", None, True, "command default")
+    conn, build_info = build_connection(args.dir, cold_plan)
+    # The widened scan is what actually answered, so it is what must be
+    # disclosed — reporting the abandoned hot window would misdescribe the answer.
+    args._plan = cold_plan
+    args._build_info = build_info
+    with closing(conn):
         _seal_external_access(conn, args.command)
         args._worktree_scope = _resolve_worktree_scope(conn, args)
         columns, rows = command(conn, args)
@@ -4907,6 +5039,9 @@ def _render_command_result(
                 getattr(args, "_record_attrs", None),
                 waited,
                 getattr(args, "_resolved_by", ""),
+                _render_query_window(
+                    getattr(args, "_plan", None), getattr(args, "_build_info", None)
+                ),
             )
         )
     print(format_output(columns, rows, args.format))
@@ -4919,6 +5054,14 @@ def _render_command_result(
         print()
         print(_SUMMARY_SERVICE_LABEL)
         print(format_output(service_columns, service_rows, args.format))
+    info = getattr(args, "_build_info", None)
+    if args.command == "summary" and info is not None:
+        # summary's third block (FR-47). Same plain-text delimiter convention as
+        # the service block, so a machine consumer can split all three.
+        fresh_columns, fresh_rows = _freshness_rows(info)
+        print()
+        print(_SUMMARY_FRESHNESS_LABEL)
+        print(format_output(fresh_columns, fresh_rows, args.format))
 
 
 # --- await: bounded waiting (SPEC-otelq-await / ADR-013) ---------------------
@@ -5108,6 +5251,16 @@ def _run_await(args: argparse.Namespace) -> int:
     print(
         f"otelq: {REASON_TIMEOUT}: not satisfied within {args.timeout} "
         f"(waited {waited_ms}ms over {_plural(polls, 'poll')})",
+        file=sys.stderr,
+    )
+    # FR-13: without this a timeout cannot distinguish "the step never ran" from
+    # "the producer ran but the collector has not flushed" — a defect in the
+    # system under test versus a defect in the measurement. The `Query window:`
+    # line cannot carry this: once it is wall-clock derived it reads identically
+    # either way.
+    print(
+        f"otelq: newest record: "
+        f"{_freshness_sentence(getattr(inner, '_build_info', None))}",
         file=sys.stderr,
     )
     return 1

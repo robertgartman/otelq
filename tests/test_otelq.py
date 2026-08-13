@@ -1202,7 +1202,8 @@ def _build(
     use_cache: bool = True,
 ) -> duckdb.DuckDBPyConnection:
     win = None if window_min is None else timedelta(minutes=window_min)
-    return otelq.build_connection(dirpath, otelq.Plan(route, win, use_cache))
+    conn, _info = otelq.build_connection(dirpath, otelq.Plan(route, win, use_cache))
+    return conn
 
 
 def _run_both(dirpath: Path, *argv: str) -> tuple[str, str]:
@@ -2249,10 +2250,11 @@ def test_ac38_response_header_shape_and_placement(
         assert lines[2] == "OpenTelemetry signal: logs"
         assert lines[3] == f"OTEL source dir: {temp_telemetry.resolve()}"
         assert lines[4].startswith("OTEL source resolved by: ")  # FR-45 provenance
-        assert lines[5].startswith("Time range: ") and " - " in lines[5]
-        assert lines[6] == "IMPORTANT: all timestamps are UTC"
-        assert lines[7].startswith("Session: ")  # FR-33 session id line
-        assert lines[8] == "-" * 10
+        assert lines[5].startswith("Rows time range: ") and " - " in lines[5]
+        assert lines[6].startswith("Query window: ")  # FR-46 effective window
+        assert lines[7] == "IMPORTANT: all timestamps are UTC"
+        assert lines[8].startswith("Session: ")  # FR-33 session id line
+        assert lines[9] == "-" * 10
         assert _strip_header(out) == otelq.format_output(columns, rows, fmt) + "\n"
 
 
@@ -2285,7 +2287,7 @@ def test_ac40_zero_row_time_range_is_na(temp_telemetry: Path) -> None:
     out = _run(temp_telemetry, "metric", "does.not.exist")
     lines = out.splitlines()
     assert lines[2] == "OpenTelemetry signal: metrics"
-    assert lines[5] == "Time range: n/a - n/a"
+    assert lines[5] == "Rows time range: n/a - n/a"
     assert _json.loads(_strip_header(out)) == []
 
 
@@ -2332,7 +2334,7 @@ def test_ac42_errors_zero_rows_signal_is_na(temp_telemetry: Path) -> None:
     out = _run(temp_telemetry, "errors")
     lines = out.splitlines()
     assert lines[2] == "OpenTelemetry signal: n/a"
-    assert lines[5] == "Time range: n/a - n/a"
+    assert lines[5] == "Rows time range: n/a - n/a"
     assert _json.loads(_strip_header(out)) == []
 
 
@@ -2455,7 +2457,7 @@ def test_ac45_timestamps_render_explicit_utc(temp_telemetry: Path) -> None:
     for fmt in ("table", "json", "jsonl", "csv", "compact"):
         out = _run_fmt(temp_telemetry, fmt, "logs")
         lines = out.splitlines()
-        from_str, to_str = lines[5].removeprefix("Time range: ").split(" - ")
+        from_str, to_str = lines[5].removeprefix("Rows time range: ").split(" - ")
         assert _UTC_TS_RE.match(from_str) and _UTC_TS_RE.match(to_str)
         payload = _strip_header(out)
         if fmt == "json":
@@ -2587,8 +2589,8 @@ def test_ac49_regex_filters_rows_and_reports_in_header(temp_telemetry: Path) -> 
     )
     out = _run(temp_telemetry, "--regex", "error", "logs")
     lines = out.splitlines()
-    assert lines[6] == "Regex filter applied: error"
-    assert lines[7] == "Rows removed by regex: 1"
+    assert lines[7] == "Regex filter applied: error"
+    assert lines[8] == "Rows removed by regex: 1"
     payload = _json.loads(_strip_header(out))
     assert len(payload) == 1 and payload[0]["body"] == "boom error here"
 
@@ -2741,7 +2743,7 @@ def test_ac57_summary_service_list_second_block(temp_telemetry: Path) -> None:
     # --format json: block 2 is rendered in the same format (an array of objects).
     out = _run(temp_telemetry, "summary")
     assert label in out
-    first, second = _strip_header(out).split("\n\n" + label + "\n", 1)
+    first, second, _fresh = _summary_blocks(out)
     assert {r["signal"] for r in _json.loads(first)} == {"traces", "logs"}
     svc = _json.loads(second)  # per-service totals across ALL signals, count desc
     assert svc == [
@@ -2751,7 +2753,7 @@ def test_ac57_summary_service_list_second_block(temp_telemetry: Path) -> None:
 
     # --format compact: block 2 is a compact object in the same shape as block 1.
     cout = _run_fmt(temp_telemetry, "compact", "summary")
-    csecond = _strip_header(cout).split("\n\n" + label + "\n", 1)[1]
+    csecond = _summary_blocks(cout)[1]
     assert _json.loads(csecond) == {
         "columns": ["service", "count"],
         "rows": [["busy-svc", 4], ["quiet-svc", 1]],
@@ -3603,10 +3605,17 @@ def test_metrics_view_exposes_resource_attributes(
 # ---- census grouping (FR-4 / AC-5) ------------------------------------------
 
 
+def _summary_blocks(out: str) -> tuple[str, str, str]:
+    """summary's three plain-text-delimited blocks: per-signal (FR-3), the
+    service census (FR-4), and per-signal freshness (FR-47)."""
+    body = _strip_header(out)
+    first, rest = body.split("\n\n" + otelq._SUMMARY_SERVICE_LABEL + "\n", 1)
+    second, third = rest.split("\n\n" + otelq._SUMMARY_FRESHNESS_LABEL + "\n", 1)
+    return first, second, third
+
+
 def _census_rows(out: str) -> list[dict[str, Any]]:
-    label = otelq._SUMMARY_SERVICE_LABEL
-    second = _strip_header(out).split("\n\n" + label + "\n", 1)[1]
-    return _json.loads(second)
+    return _json.loads(_summary_blocks(out)[1])
 
 
 def test_ac5_summary_census_groups_by_worktree(temp_telemetry: Path) -> None:
@@ -5018,3 +5027,158 @@ def test_ac104_resolution_is_disclosed_on_success_and_failure(tmp_path: Path) ->
     assert len(obj) == 1, bad.stderr
     assert obj[0]["store"]["dir"]
     assert "resolved_by" in obj[0]["store"]
+
+
+# ---- effective window + ingestion-freshness disclosure (FR-46/FR-47) --------
+# R6/R7. `Time range:` was row-derived but read as "the range I searched", and
+# rendered `n/a - n/a` on an empty result — uninformative exactly when the
+# window is the only thing that distinguishes "nothing matched" from "you
+# searched the wrong range". Freshness answers the other half: an empty result
+# from a dead producer and one from a producer whose collector has not flushed
+# are otherwise identical.
+
+
+def _window_field(out: str) -> str:
+    return _header_field(out, "Query window")
+
+
+def _window_bounds(out: str) -> tuple[datetime, datetime]:
+    body = _window_field(out).split(" (")[0]
+    lo, hi = body.split(" - ")
+    return (
+        datetime.fromisoformat(lo.replace("Z", "+00:00")),
+        datetime.fromisoformat(hi.replace("Z", "+00:00")),
+    )
+
+
+def test_ac105_default_window_is_disclosed_with_origin(temp_telemetry: Path) -> None:
+    # AC-105/FR-46: the default window is COMPUTED, not passed — so a caller
+    # that never wrote --since has no way to know what it searched unless the
+    # answer says. The origin token distinguishes a default from a request.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
+    out = _run(temp_telemetry, "logs")
+    assert _window_field(out).endswith(" (30m, default)"), _window_field(out)
+    lo, hi = _window_bounds(out)
+    assert hi - lo == timedelta(minutes=30)
+    # the row-derived line is now labelled for what it is, and the ambiguous
+    # bare label is gone from the header entirely.
+    assert _header_field(out, "Rows time range")
+    assert "\nTime range:" not in out
+
+
+def test_ac106_since_window_is_disclosed_with_origin(temp_telemetry: Path) -> None:
+    # AC-106/FR-46: an explicit --since reports the width it was given and is
+    # attributed to the flag rather than the default.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
+    out = _run(temp_telemetry, "--since", "10m", "logs")
+    assert _window_field(out).endswith(" (10m, --since)"), _window_field(out)
+    lo, hi = _window_bounds(out)
+    assert hi - lo == timedelta(minutes=10)
+
+
+def test_ac107_unbounded_windows_disclose_their_origin(temp_telemetry: Path) -> None:
+    # AC-107/FR-46: unbounded is a window too, and --all (a request) is not the
+    # same claim as `trace` (unbounded by definition) — a reader must not have
+    # to know otelq's per-command defaults to interpret the answer.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base, trace_id="t1")])
+    assert _window_field(_run(temp_telemetry, "--all", "slow")) == "all history (--all)"
+    out = _run(temp_telemetry, "trace", trace_hex("t1"))
+    assert _window_field(out) == "all history (command default)"
+
+
+def test_ac108_empty_result_still_discloses_the_window(temp_telemetry: Path) -> None:
+    # AC-108/FR-46: THE case the rename exists for. Rows time range is n/a
+    # precisely because there are no rows, so if the window were not disclosed
+    # separately an empty answer would carry no evidence of what produced it.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "metrics.jsonl", [make_gauge(base, name="db.pool")])
+    out = _run(temp_telemetry, "metric", "does.not.exist")
+    assert _header_field(out, "Rows time range") == "n/a - n/a"
+    lo, hi = _window_bounds(out)  # still populated
+    assert hi - lo == timedelta(minutes=30)
+    assert _json.loads(_strip_header(out)) == []
+
+
+def test_ac109_window_disclosure_matches_across_cache_paths(
+    temp_telemetry: Path,
+) -> None:
+    # AC-109/FR-11/INV-7: disclosure that could disagree with the query it
+    # describes is worse than none. The cached and uncached paths must report
+    # byte-identical bounds for the same invocation.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [make_log(base + timedelta(seconds=i), body=f"m{i}") for i in range(5)],
+    )
+    hot = _window_field(_run(temp_telemetry, "logs"))
+    cold = _window_field(_run(temp_telemetry, "--no-cache", "logs"))
+    assert hot == cold, f"hot={hot!r} cold={cold!r}"
+
+
+def test_ac110_summary_reports_newest_record_per_signal(
+    temp_telemetry: Path,
+) -> None:
+    # AC-110/FR-47: freshness lives in summary, not in every header — regular
+    # queries are not bloated by a diagnostic summary exists to answer.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base)])
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
+    out = _run(temp_telemetry, "summary")
+    assert "** Newest record per signal **" in out
+    block = out.split("** Newest record per signal **", 1)[1]
+    assert '"signal"' in block and '"newest"' in block and '"age"' in block
+    assert '"traces"' in block and '"logs"' in block
+    assert '"metrics"' not in block  # absent signal contributes no row (FR-3)
+
+
+def test_ac111_freshness_is_window_independent_and_unjudged(
+    temp_telemetry: Path,
+) -> None:
+    # AC-111/FR-47: THE discriminating case. Logs stopped two hours before
+    # traces, so logs fall outside the window and vanish from the windowed
+    # summary — the exact "did that producer die?" question. Freshness must
+    # still report them, or it answers a question about the window instead of
+    # about the producer.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="stale")])
+    write_jsonl(
+        temp_telemetry / "traces.jsonl", [make_span(base + timedelta(hours=2))]
+    )
+    out = _run(temp_telemetry, "summary")
+    block = out.split("** Newest record per signal **", 1)[1]
+    assert '"logs"' in block, "freshness must not be scoped to the query window"
+    assert "2026-06-22T12:00:00" in block  # the stale record's own event-time
+    # a number, never a verdict (FR-44): otelq states the lag, the caller
+    # decides what it means.
+    for verdict in ("STALE", "OK", "WARN", "FRESH"):
+        assert verdict not in block
+
+
+def test_ac13_timeout_reports_per_signal_freshness(temp_telemetry: Path) -> None:
+    # await AC-13/FR-13: a bare timeout cannot tell "the step never ran" from
+    # "the collector has not flushed" — and once the window is wall-clock
+    # derived it never will, because it reads the same either way. Freshness is
+    # the only thing that discriminates, so the timeout must carry it.
+    base = datetime.now(timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, service="s", body="x")])
+    _, proc = _await_cli(
+        "--dir", str(temp_telemetry), "--all", "await", "--timeout", "2s",
+        "--poll", "1s", "logs", "--grep", "NEVER-APPEARS",
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "newest record" in proc.stderr.lower(), proc.stderr
+    assert "logs" in proc.stderr
+
+    # and an empty store must say so, rather than omitting the line — "no
+    # telemetry at all" is a different diagnosis from "telemetry, but stale".
+    empty = temp_telemetry.parent / "empty-store"
+    empty.mkdir()
+    _, proc2 = _await_cli(
+        "--dir", str(empty), "--all", "await", "--timeout", "2s",
+        "--poll", "1s", "logs", "--grep", "NEVER-APPEARS",
+    )
+    assert proc2.returncode == 1, proc2.stderr
+    assert "no records captured" in proc2.stderr.lower(), proc2.stderr

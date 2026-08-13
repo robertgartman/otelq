@@ -165,6 +165,56 @@ fraction of the rows themselves; filter server-side (`--since` / `--regex` /
 `--top` / `--service` / `--level` / `--grep`) rather than fetching broadly and
 post-filtering; carry only {window, signal, trace_id, span_id} between steps.
 
+## What did it actually search, and is the data fresh?
+
+Two header lines answer different questions. **Do not confuse them:**
+
+```
+Rows time range: 2026-08-13T13:58:02.114Z - 2026-08-13T14:01:47.903Z
+Query window:    2026-08-13T13:32:11.000Z - 2026-08-13T14:02:11.000Z (30m, default)
+```
+
+- `Rows time range:` — the span of the rows you got back. It is `n/a - n/a`
+  when nothing matched.
+- `Query window:` — the range that was **searched**, and which rule chose the
+  width: `--since` (you asked), `default` (otelq's built-in window), `--all`, or
+  `command default`. It is populated **even when there are no rows** — an empty
+  answer is meaningless without knowing what was looked at.
+
+Unbounded queries say so: `all history (--all)`.
+
+**Before concluding "it didn't happen", check the window.** A default window
+applies when you pass no `--since`, so an empty result may simply mean the
+event is older than the range that was searched.
+
+### Is anything still arriving?
+
+`summary` ends with a freshness block:
+
+```
+** Newest record per signal **
+signal   newest                     age
+traces   2026-08-13T14:01:47.903Z   4s
+logs     2026-08-13T13:59:12.204Z   2m39s
+```
+
+This is **not** window-scoped — it reports the newest record per signal
+regardless of what you queried, which is exactly what distinguishes **"nothing
+happened"** from **"the collector has not flushed yet"**. An `await` that times
+out prints the same thing:
+
+```
+otelq: timeout: not satisfied within 30s (waited 30012ms over 30 polls)
+otelq: newest record: traces 2s ago, logs 4s ago
+```
+
+Traces arriving 2s ago while your predicate never matched means the step ran and
+your predicate is wrong. `no records captured` means nothing is reaching the
+collector at all — check the exporter, not your query.
+
+otelq reports the **age, never a verdict** — there is no `STALE` label, because
+which lag is acceptable is your decision, not otelq's.
+
 ## Timestamps are UTC
 
 **All timestamps are UTC** — every `timestamp` otelq prints, and every one you
