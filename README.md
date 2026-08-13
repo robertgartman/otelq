@@ -306,7 +306,12 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
   --version             print otelq's version and exit
-  --dir DIR             telemetry folder (default: <cwd>/.telemetry)
+  --dir DIR             telemetry folder; when omitted otelq resolves it
+                        itself — $OTELQ_DIR, else the nearest .telemetry/ at
+                        or above the working directory (from a linked git
+                        worktree, the main checkout's, since one Collector
+                        serves them all). The resolved dir and the rule that
+                        chose it are printed in the response header
   --format {table,json,jsonl,csv,compact}
                         output format (default: compact, the fewest-token
                         format for agents; pass --format table for a human-

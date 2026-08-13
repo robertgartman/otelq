@@ -20,6 +20,7 @@ related_documents:
   - SPEC-otelq-await
   - ADR-013-bounded-blocking-single-invocation
   - ADR-014-span-tree-traversal-in-core-sql
+  - ADR-011-worktree-telemetry-identity
   - CONTRACT-telemetry-directory
   - ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0
   - ADR-009-query-history-triage-store
@@ -97,11 +98,19 @@ configuration that produces the raw files.
   subcommand.
 - **Default telemetry dir** — the `.telemetry/` directory under the current
   working directory (`<cwd>/.telemetry`, per
-  [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md)),
-  used when `--dir` is not given. A cwd-relative default works both for
-  `uv run otelq.py` from a checkout (run from the repo root) and for an installed
-  copy (`uvx`/`pipx`) run from a project directory; a script-relative default
-  would resolve into the install location (e.g. site-packages).
+  [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md)).
+  A cwd-relative default works both for `uv run otelq.py` from a checkout (run
+  from the repo root) and for an installed copy (`uvx`/`pipx`) run from a project
+  directory; a script-relative default would resolve into the install location
+  (e.g. site-packages). `--dir` is therefore **never required** merely because
+  otelq was installed or run through `uvx`.
+- **Store resolution** — how otelq decides which telemetry directory to read when
+  `--dir` is not given (FR-45). The **resolved dir** is the directory chosen; the
+  **resolution mechanism** is which rule chose it. Both are disclosed (FR-29).
+- **Linked worktree** — a `git worktree` checkout that is not the repository's
+  main checkout. Its telemetry is written to the main checkout's store, because
+  one host runs one Collector on fixed ports
+  ([ADR-011](../adr/ADR-011-worktree-telemetry-identity.md)).
 - **Event-time** — a record's own timestamp: the value of its relation's
   event-time column (`start_time_unix_nano` for `traces`, `time_unix_nano`
   for `logs` and the metric relations), rendered in command output as the
@@ -111,9 +120,10 @@ configuration that produces the raw files.
 - **Response header** — a fixed-format plain-text preamble that otelq prints to
   stdout before the rendered result of the six signal-bearing commands (see
   FR-29), naming the invoked command, the resolved format, the OpenTelemetry
-  signal(s) involved, the absolute telemetry directory being read, the returned
-  rows' time range, and the session id, so an LLM consumer cannot mistake a
-  rendered `timestamp` for local time or lose track of the result's data source.
+  signal(s) involved, the absolute telemetry directory being read **and the rule
+  that chose it**, the returned rows' time range, and the session id, so an LLM
+  consumer cannot mistake a rendered `timestamp` for local time or lose track of
+  the result's data source.
 - **Session id** — an id (see FR-33) that tags the consecutive invocations of
   one investigation so they can be correlated: a caller-supplied `--session-id`,
   or, when omitted, a freshly generated UUIDv7. Echoed verbatim in the response
@@ -380,8 +390,10 @@ configuration that produces the raw files.
   error), not silently accepted. Subcommand-specific flags and positionals
   continue to follow the subcommand.
 - **FR-12 — `--dir`.** A `--dir <path>` global flag **must** select the
-  telemetry directory to read; when omitted, otelq **must** read the default
-  telemetry dir (see Definitions).
+  telemetry directory to read, overriding every other rule. When omitted, otelq
+  **must** resolve the directory itself per FR-45. `--dir` **must never** be
+  required merely because otelq is installed or invoked via `uvx`/`pipx`: the
+  default is cwd-relative, not script-relative (see Definitions).
 - **FR-13 — `--all`.** An `--all` global flag **must** widen the query to the
   full raw history. (The routing this triggers is specified in
   [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md) FR-9.)
@@ -615,7 +627,8 @@ configuration that produces the raw files.
   ==========
   otelq <command> response, format <format>
   OpenTelemetry signal: <signal>
-  Reading data from: <directory>
+  OTEL source dir: <directory>
+  OTEL source resolved by: <mechanism>
   Time range: <from> - <to>
   IMPORTANT: all timestamps are UTC
   Session: <session-id>
@@ -652,6 +665,12 @@ configuration that produces the raw files.
   - The header **must** include a `Session: <session-id>` line (immediately
     after the `IMPORTANT` line, before the closing `----------`) carrying the
     verbatim session id resolved for the invocation (FR-33).
+  - `OTEL source dir:` **must** carry the **absolute, resolved** telemetry
+    directory actually read, and `OTEL source resolved by:` **must** carry the
+    FR-45 mechanism that selected it. Both lines **must** be present on every
+    header, in that order, immediately after the signal line. Two invocations can
+    then be **proven** to have read the same store by comparing output, rather
+    than by trusting that two callers implement the same path rule.
   - The header **must not** change which rows are returned, their order, or the
     FR-10 rendering rules applied to the payload that follows it (INV-6).
   - When `--regex <pattern>` (FR-32) is supplied, the header **must** insert
@@ -854,6 +873,52 @@ configuration that produces the raw files.
   `Attribute filter applied: <k>=<v>[, …]` separately from FR-40's
   `Resource filter applied:` line.
 
+- **FR-45 — Store resolution.** When `--dir` is not given, otelq **must** resolve
+  the telemetry directory itself, taking the **first** rule that yields a
+  directory (rules 3 and 4 additionally require that it exist; rule 2 does not —
+  see below):
+
+  | # | Rule | Reported mechanism |
+  |---|------|--------------------|
+  | 1 | The `--dir` flag | `--dir flag` |
+  | 2 | The `OTELQ_DIR` environment variable | `OTELQ_DIR env variable` |
+  | 3 | Invoked inside a **linked git worktree** ⇒ the `.telemetry/` of the repository's **main checkout** | `git main checkout (worktree '<name>', default branch '<branch>')` |
+  | 4 | The nearest `.telemetry/` at, or above, the working directory | `CWD or an ancestor` |
+
+  Rules and their rationale:
+
+  - `--dir` **must** win unconditionally, including over `OTELQ_DIR`: an explicit
+    argument is the caller's most specific statement of intent.
+  - `OTELQ_DIR`, when set and non-empty, **must** be used even if it does not
+    exist — in which case FR-38 reports `store_not_found` against it. A typo in a
+    deliberately-set variable **must not** be silently papered over by falling
+    through to discovery, because two cooperating processes sharing that variable
+    would then read different stores, which is the failure this rule exists to
+    prevent.
+  - Rule 3 **must** take precedence over rule 4. A linked worktree may contain
+    its own `.telemetry/` — often an empty one — while the telemetry it produces
+    is written to the main checkout's store, because one host runs one Collector
+    on fixed ports (ADR-011). Preferring the local directory would answer
+    truthfully about an empty store while the data sits elsewhere: a correct
+    answer to the wrong question, which the caller has no signal to detect.
+  - Rule 3 **must** apply only in a **linked** worktree. In the main checkout it
+    is not a redirect, and rule 4 governs.
+  - Rule 4 **must** walk upward from the working directory and stop at the
+    **first** `.telemetry/` found, so a nested project cannot silently answer
+    from an ancestor project's store once it has one of its own.
+  - Resolution **must** be read-only: it **must not** create any directory it
+    inspects (FR-38, CONTRACT root ownership).
+  - When git plumbing is unavailable or the directory is not a repository, rule 3
+    **must** be skipped without error — discovery falls through to rule 4.
+
+  When no rule yields a directory, otelq **must** fail per FR-38
+  (`store_not_found`, exit `2`) with a message naming **every path tried**, so a
+  caller can see where otelq looked rather than guessing.
+
+  The resolved directory and the mechanism **must** be disclosed on every answer
+  (FR-29) and in the machine failure object (FR-37).
+
+
 ### Machine-attributable failure (ADR-012)
 
 - **FR-37 — Reason tokens on failure.** Every exit-`2` path (FR-17) **must**
@@ -886,16 +951,17 @@ configuration that produces the raw files.
 
   When `--format` is a machine format (`json`, `jsonl`, `compact`), otelq **must
   additionally** print a single-line JSON object to **stderr** carrying at least
-  `otelq_version`, `ok` (always `false`), `reason`, and `store.dir` (the resolved
-  absolute telemetry directory). It **must not** be printed for the human formats
-  (`table`, `csv`).
+  `otelq_version`, `ok` (always `false`), `reason`, `store.dir` (the resolved
+  absolute telemetry directory) and `store.resolved_by` (the FR-45 mechanism). It
+  **must not** be printed for the human formats (`table`, `csv`).
 
   The failure object **must never** be written to **stdout**: a caller piping
   stdout to a parser must receive rows or nothing, never an error wearing the
   shape of data. On every exit-`2` path stdout **must** be empty.
 
 - **FR-38 — A missing telemetry root is a failure, and is never created.** When
-  the resolved telemetry directory (FR-12) does not exist, otelq **must** exit
+  the resolved telemetry directory (FR-45, whichever rule chose it) does not
+  exist, otelq **must** exit
   `2` with reason `store_not_found`, naming the resolved absolute path. It
   **must not** create that directory, and **must not** take the friendly
   empty-telemetry path of FR-18 — a directory that is absent is *unavailable*,
@@ -1288,10 +1354,11 @@ configuration that produces the raw files.
 - **AC-38** (Verifies FR-29, EC-23): Given any of `summary`/`errors`/`slow`/`trace`/
   `logs`/`metric`, when the command runs with any `--format`, then stdout begins
   with the fixed header (a `==========` line; `otelq <command> response, format
-  <format>`; `OpenTelemetry signal: <signal>`; `Reading data from: <directory>`;
-  `Time range: <from> - <to>`; the UTC notice; the session id; a `----------`
-  line) naming the invoked command, resolved format, and absolute telemetry
-  directory, followed by the FR-10 rendering of the result; the header's
+  <format>`; `OpenTelemetry signal: <signal>`; `OTEL source dir: <directory>`;
+  `OTEL source resolved by: <mechanism>`; `Time range: <from> - <to>`; the UTC
+  notice; the session id; a `----------` line) naming the invoked command,
+  resolved format, absolute telemetry directory and the rule that chose it,
+  followed by the FR-10 rendering of the result; the header's
   `<from>`/`<to>` equal the min/max `timestamp` among the returned rows.
   *Verification hint: run each of the six commands with `--format table` and
   `--format json`; assert the header's exact content lines and that the
@@ -1660,6 +1727,45 @@ configuration that produces the raw files.
   **otelq-defined** derived relations and carries the worked example that
   separates a never-observed member from members split across traces.
   *Verification hint: `test_ac98_help_documents_span_relations_and_example`.*
+
+- **AC-99** (Verifies FR-45, FR-12): Given a store at `<cwd>/.telemetry`, when a
+  command runs with **no** `--dir`, then it reads that store and the header
+  reports `OTEL source resolved by: CWD or an ancestor`; and given the same
+  invocation from a **subdirectory** several levels down, then it resolves to the
+  same store by walking upward.
+  *Verification hint: `test_ac99_resolution_walks_up_from_cwd`.*
+- **AC-100** (Verifies FR-45): Given both `OTELQ_DIR` and a valid
+  `<cwd>/.telemetry`, when a command runs with no `--dir`, then `OTELQ_DIR` wins
+  and the mechanism is reported as `OTELQ_DIR env variable`; and given `--dir`
+  as well, then `--dir` wins over both and reports `--dir flag`.
+  *Verification hint: `test_ac100_resolution_precedence`.*
+- **AC-101** (Verifies FR-45, FR-38): Given `OTELQ_DIR` naming a directory that
+  does not exist, when a command runs, then it exits `2` with `store_not_found`
+  against **that** path — a typo in a deliberately-set variable is never papered
+  over by falling through to discovery, because two processes sharing the
+  variable would otherwise read different stores.
+  *Verification hint: `test_ac101_otelq_dir_typo_is_not_silently_ignored`.*
+- **AC-102** (Verifies FR-45): Given a repository whose **main checkout** holds
+  the telemetry and a **linked worktree** that holds its own *empty*
+  `.telemetry/`, when a command runs from the linked worktree with no `--dir`,
+  then it reads the **main checkout's** store — not the local empty one — and the
+  mechanism names the worktree and default branch; and when the same command runs
+  from the main checkout, then the mechanism is `CWD or an ancestor`, because
+  there is no redirect to make.
+  *Verification hint: `test_ac102_linked_worktree_resolves_to_main_checkout`;
+  create a real temp repo plus `git worktree add`.*
+- **AC-103** (Verifies FR-45, FR-38, FR-37, INV-1): Given a directory tree
+  containing no `.telemetry/` anywhere above the working directory and no
+  `OTELQ_DIR`, when a command runs, then it exits `2` with `store_not_found`, the
+  message names **every path tried**, and no directory is created.
+  *Verification hint: `test_ac103_unresolvable_store_names_paths_tried`.*
+- **AC-104** (Verifies FR-45, FR-29, FR-37): Given any resolution mechanism, when
+  a signal-bearing command succeeds, then the header carries both
+  `OTEL source dir:` (absolute) and `OTEL source resolved by:`; and when
+  resolution fails under a machine `--format`, then the JSON failure object
+  carries `store.dir` and `store.resolved_by`. Two invocations can therefore be
+  proven to have read the same store from output alone.
+  *Verification hint: `test_ac104_resolution_is_disclosed_on_success_and_failure`.*
 
 
 ### Examples

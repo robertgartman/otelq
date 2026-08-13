@@ -530,7 +530,9 @@ def _fail(reason: str, message: str) -> NoReturn:
     raise OtelqFailure(reason, message)
 
 
-def _emit_failure(reason: str, message: str, fmt: str, telemetry_dir: Path) -> None:
+def _emit_failure(
+    reason: str, message: str, fmt: str, telemetry_dir: Path, resolved_by: str = ""
+) -> None:
     """Render a failure to STDERR only (FR-37/INV-7).
 
     stdout is never touched: a caller piping stdout into a parser must receive
@@ -544,7 +546,7 @@ def _emit_failure(reason: str, message: str, fmt: str, telemetry_dir: Path) -> N
             "otelq_version": __version__,
             "ok": False,
             "reason": reason,
-            "store": {"dir": str(telemetry_dir)},
+            "store": {"dir": str(telemetry_dir), "resolved_by": resolved_by},
         }
         print(json.dumps(payload, separators=(",", ":")), file=sys.stderr)
 
@@ -557,7 +559,9 @@ def _prescan_output_context(argv: Sequence[str] | None) -> tuple[str, Path]:
     is exactly the case in play, so anything unrecognised falls back to the
     documented defaults.
     """
-    fmt, telemetry_dir = "compact", DEFAULT_DIR
+    env_dir = os.environ.get(_STORE_ENV_VAR, "").strip()
+    fmt = "compact"
+    telemetry_dir = Path(env_dir) if env_dir else DEFAULT_DIR
     tokens = list(argv) if argv is not None else sys.argv[1:]
     for flag, value in zip(tokens, tokens[1:]):
         if flag == "--format" and value in _MACHINE_FORMATS:
@@ -567,7 +571,94 @@ def _prescan_output_context(argv: Sequence[str] | None) -> tuple[str, Path]:
     return fmt, telemetry_dir
 
 
-def _require_store(telemetry_dir: Path) -> None:
+# --- store resolution (FR-45 / ADR-001 amendment) ----------------------------
+#
+# Handing every caller a path rule guarantees that some caller implements it
+# differently. Two scripts in one harness then read DIFFERENT stores, and a gate
+# that reads a different store than the assertion it guards produces a false
+# verdict with nothing reporting the divergence. otelq owns location — and
+# discloses BOTH the directory and the rule that chose it, so two invocations
+# can be proven to agree from output alone.
+_STORE_ENV_VAR = "OTELQ_DIR"
+_TELEMETRY_DIRNAME = ".telemetry"
+
+RESOLVED_BY_FLAG = "--dir flag"
+RESOLVED_BY_ENV = f"{_STORE_ENV_VAR} env variable"
+RESOLVED_BY_WALK = "CWD or an ancestor"
+
+
+class StoreResolution(NamedTuple):
+    """Which telemetry directory to read, and which rule chose it."""
+
+    path: Path
+    how: str
+    tried: tuple[Path, ...]
+
+
+def _main_checkout_store(cwd: Path) -> tuple[Path, str] | None:
+    """The main checkout's store when invoked from a LINKED git worktree.
+
+    One host runs one Collector on fixed ports, so every worktree of a
+    repository exports into the *main* checkout's directory (ADR-011). A linked
+    worktree may nonetheless carry its own `.telemetry/` — often an empty one —
+    and preferring it would answer truthfully about an empty store while the
+    data sits elsewhere: a correct answer to the wrong question, which the
+    caller has no signal to detect.
+
+    Returns None when git is unavailable, this is not a repository, or this IS
+    the main checkout (where there is no redirect to make).
+    """
+    common = _git_output(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd)
+    top = _git_toplevel(cwd)
+    if not common or not top:
+        return None
+    main_root = Path(common).parent
+    if main_root.resolve() == Path(top).resolve():
+        return None  # main checkout: rule 4 governs
+    store = main_root / _TELEMETRY_DIRNAME
+    if not store.is_dir():
+        return None
+    branch = _git_output(["rev-parse", "--abbrev-ref", "HEAD"], main_root) or "?"
+    how = (
+        f"git main checkout (worktree '{Path(top).name}', default branch '{branch}')"
+    )
+    return store, how
+
+
+def resolve_store(explicit: Path | None, cwd: Path | None = None) -> StoreResolution:
+    """Resolve the telemetry directory, first rule that yields one wins (FR-45).
+
+    Read-only throughout: nothing here creates a directory (FR-38).
+    """
+    base = Path.cwd() if cwd is None else cwd
+    if explicit is not None:
+        return StoreResolution(explicit, RESOLVED_BY_FLAG, (explicit,))
+
+    env_value = os.environ.get(_STORE_ENV_VAR, "").strip()
+    if env_value:
+        # Used even when it does not exist, so FR-38 reports store_not_found
+        # against it. Falling through would let a typo in a deliberately-set
+        # variable be papered over — and two processes sharing that variable
+        # would then read different stores, the divergence this rule prevents.
+        return StoreResolution(Path(env_value), RESOLVED_BY_ENV, (Path(env_value),))
+
+    tried: list[Path] = []
+    redirect = _main_checkout_store(base)
+    if redirect is not None:
+        store, how = redirect
+        return StoreResolution(store, how, (store,))
+
+    for candidate in (base, *base.parents):
+        store = candidate / _TELEMETRY_DIRNAME
+        tried.append(store)
+        if store.is_dir():
+            return StoreResolution(store, RESOLVED_BY_WALK, tuple(tried))
+    # Nothing found: report against the documented default, carrying every path
+    # tried so a caller can see where otelq looked rather than guessing.
+    return StoreResolution(base / _TELEMETRY_DIRNAME, "", tuple(tried))
+
+
+def _require_store(telemetry_dir: Path, tried: tuple[Path, ...] = ()) -> None:
     """Gate every store-reading command on a telemetry root that already exists.
 
     FR-38 / CONTRACT-telemetry-directory v1.2: the root is PRODUCER-owned. otelq
@@ -581,11 +672,16 @@ def _require_store(telemetry_dir: Path) -> None:
     path: absent is *unavailable*, which is not the same as present-and-empty.
     """
     if not telemetry_dir.exists():
+        where = (
+            " — tried: " + ", ".join(str(p) for p in tried)
+            if len(tried) > 1
+            else ""
+        )
         _fail(
             REASON_STORE_NOT_FOUND,
-            f"telemetry directory '{telemetry_dir}' does not exist — start the "
-            "collector that owns it, or point --dir at the right store "
-            "(otelq never creates it)",
+            f"telemetry directory '{telemetry_dir}' does not exist{where} — "
+            "start the collector that owns it, set OTELQ_DIR, or point --dir at "
+            "the right store (otelq never creates it)",
         )
     if not telemetry_dir.is_dir():
         _fail(REASON_STORE_UNREADABLE, f"--dir '{telemetry_dir}' is not a directory")
@@ -2101,6 +2197,7 @@ def _format_response_header(
     resource_attrs: list[_ResourceAttrFilter] | None = None,
     record_attrs: list[_ResourceAttrFilter] | None = None,
     waited: str | None = None,
+    resolved_by: str = "",
 ) -> str:
     """Render the FR-29 response header: a fixed plain-text block naming the
     command, format, OpenTelemetry signal(s), absolute telemetry directory, UTC
@@ -2123,7 +2220,8 @@ def _format_response_header(
         "==========",
         f"otelq {command} response, format {fmt}{shape_hint}",
         f"OpenTelemetry signal: {_result_signal(command, rows)}",
-        f"Reading data from: {telemetry_dir.resolve()}",
+        f"OTEL source dir: {telemetry_dir.resolve()}",
+        f"OTEL source resolved by: {resolved_by or RESOLVED_BY_FLAG}",
         f"Time range: {from_str} - {to_str}",
     ]
     if worktree_banner is not None:
@@ -3631,8 +3729,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dir",
         type=Path,
-        default=DEFAULT_DIR,
-        help=f"telemetry folder (default: {DEFAULT_DIR})",
+        default=None,
+        help="telemetry folder; when omitted otelq resolves it itself — "
+        f"$OTELQ_DIR, else the nearest {_TELEMETRY_DIRNAME}/ at or above the "
+        "working directory (from a linked git worktree, the main checkout's, "
+        "since one Collector serves them all). The resolved dir and the rule "
+        "that chose it are printed in the response header",
     )
     parser.add_argument(
         "--format",
@@ -4721,6 +4823,13 @@ def _dispatch(args: argparse.Namespace) -> int:
     # stored) and for triage's anchor lookup.
     args._session_supplied = session_supplied
     args.session_id = resolve_session_id(args)
+    # FR-45: resolve the store ONCE, before anything reads it, and stash both the
+    # path and the rule that chose it so the header (FR-29) and the failure
+    # object (FR-37) disclose the same resolution.
+    resolution = resolve_store(getattr(args, "dir", None))
+    args.dir = resolution.path
+    args._resolved_by = resolution.how
+    args._store_tried = resolution.tried
     regex = _resolve_regex_arg(args)
     args._resource_attrs = _parse_attr_args(  # FR-40
         args, "resource_attr", "--resource-attr", "resource_attributes"
@@ -4748,7 +4857,7 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0 if ok else 1
     # Everything below this line reads (and may provision `.otelq-*` inside)
     # the telemetry root, so the root must already exist — FR-38.
-    _require_store(args.dir)
+    _require_store(args.dir, getattr(args, "_store_tried", ()))
     if args.command == "history":
         columns, rows = _history_report(args.dir, args.top)
         if not rows and not (history_dir(args.dir) / _HISTORY_QUERIES).exists():
@@ -4797,6 +4906,7 @@ def _render_command_result(
                 getattr(args, "_resource_attrs", None),
                 getattr(args, "_record_attrs", None),
                 waited,
+                getattr(args, "_resolved_by", ""),
             )
         )
     print(format_output(columns, rows, args.format))
@@ -5043,12 +5153,15 @@ def main(argv: list[str] | None = None) -> int:
         # Single rendering point for every exit-2 path, parse-time or runtime
         # (FR-37). When the failure predates parsing there is no Namespace, so
         # the output context is recovered from raw argv.
-        fmt, telemetry_dir = (
-            _prescan_output_context(argv)
-            if args is None
-            else (str(args.format), Path(args.dir))
-        )
-        _emit_failure(exc.reason, exc.message, fmt, telemetry_dir)
+        if args is None:
+            fmt, telemetry_dir = _prescan_output_context(argv)
+            resolved_by = ""
+        else:
+            fmt = str(args.format)
+            resolved = getattr(args, "dir", None)
+            telemetry_dir = Path(resolved) if resolved else _prescan_output_context(argv)[1]
+            resolved_by = str(getattr(args, "_resolved_by", ""))
+        _emit_failure(exc.reason, exc.message, fmt, telemetry_dir, resolved_by)
         return 2
 
 

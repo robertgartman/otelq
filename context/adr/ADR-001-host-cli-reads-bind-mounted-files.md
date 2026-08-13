@@ -12,13 +12,14 @@ must_not_contain:
   - implementation_walkthroughs
   - reversible_decisions
 created: 2026-06-23
-last_updated: 2026-07-02
+last_updated: 2026-08-13
 related_documents:
   - ADR-002-pep723-uv-single-file-distribution
   - ADR-003-duckdb-otlp-extension-pin-governance
   - ADR-004-collector-in-docker-bind-mount
   - ADR-005-incremental-parquet-cache
   - ADR-008-unified-cache-first-read-and-retention
+  - ADR-011-worktree-telemetry-identity
   - CONTRACT-telemetry-directory
   - SPEC-otelq-cli
 supersedes: null
@@ -121,6 +122,9 @@ default would point into the install location, e.g. site-packages.)
   layouts.
   The behavioral details of the CLI are specified in
   [SPEC-otelq-cli](../spec/SPEC-otelq-cli.md).
+  *(Extended 2026-08-13 — see the amendment below: the cwd-relative default is
+  unchanged and still wins wherever it resolves absent an explicit override;
+  additional fallbacks apply only where it finds nothing.)*
 - **Re-reading on demand is the read model.** Because the CLI re-attaches to the
   files on every invocation rather than holding them open, the file producer
   (Collector) and the file consumer (CLI) never contend for a handle, and either
@@ -133,3 +137,63 @@ default would point into the install location, e.g. site-packages.)
   nothing in this path is a service, the tool can be shipped as a single file or
   package and run anywhere the bind-mount path is reachable; its distribution
   form is decided in [ADR-002](ADR-002-pep723-uv-single-file-distribution.md).
+
+
+## Amendment (2026-08-13) — locating the directory is otelq's job, not the caller's
+
+This amendment **extends** the locating responsibility recorded above; it
+reverses nothing. `<cwd>/.telemetry` remains the default and still wins wherever
+it resolves and no explicit override is given, so every invocation that works
+today continues to behave identically. What changes is only what happens when
+that path finds **nothing** — or when the caller deliberately points elsewhere.
+
+### Why extend it
+
+The original decision made otelq "responsible only for *locating* that
+directory", and a single cwd-relative default was sufficient while one checkout
+held one store. Two developments since made that insufficient:
+
+**Concurrent git worktrees share one store.** Only one Collector can bind the
+host's OTLP ports, so every worktree of a repository exports into the *same*
+bind-mounted directory — the one in the main checkout
+([ADR-011](ADR-011-worktree-telemetry-identity.md) exists precisely because of
+this). A cwd-relative default therefore resolves, from a linked worktree, to a
+path that is **not** where the telemetry is. otelq then answers truthfully about
+an empty directory while the data sits elsewhere — a correct answer to the wrong
+question, and one the caller has no signal to detect.
+
+**Automated consumers must be provably reading the same store.** When two
+scripts in one test harness each compute the path themselves, they can silently
+disagree — one honouring an override the other does not — and a gate that reads a
+different store than the assertion it guards produces a false verdict. Handing
+every caller a resolution rule guarantees some caller implements it differently.
+
+Both are location problems, and this ADR already assigns location to otelq.
+Leaving the rule in prose for callers to re-implement was the gap.
+
+### The extension
+
+otelq resolves the telemetry directory itself, first hit winning:
+
+1. an explicit `--dir`;
+2. an `OTELQ_DIR` environment variable — one value two cooperating processes can
+   share, so they cannot diverge;
+3. discovery from the working directory: when invoked inside a **linked git
+   worktree**, the repository's main checkout (where the shared store lives);
+   otherwise the nearest `.telemetry/` at or above the working directory;
+4. failure that names every path tried.
+
+Discovery is **read-only and creates nothing** — the telemetry root stays
+producer-owned ([CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md)).
+
+### The constraint that keeps this honest
+
+Silent resolution trades a wrong answer for a surprising one unless it is
+**disclosed**. otelq therefore reports both the directory it read *and the
+mechanism that chose it* on every answer. A caller can then prove two invocations
+read the same store by comparing output, rather than by trusting that two
+implementations of a path rule agree. Resolution that could not be audited this
+way would be a regression, not an improvement.
+
+The behavioural detail — precedence, the disclosure lines, and the failure
+message — is specified in [SPEC-otelq-cli](../spec/SPEC-otelq-cli.md).
