@@ -12,11 +12,13 @@ must_not_contain:
   - architectural_rationale
   - external_data_schemas
 created: 2026-06-23
-last_updated: 2026-08-12
+last_updated: 2026-08-13
 related_documents:
   - PRD-otelq
   - SPEC-otelq-incremental-cache
   - SPEC-otelq-worktree-scoping
+  - SPEC-otelq-await
+  - ADR-013-bounded-blocking-single-invocation
   - CONTRACT-telemetry-directory
   - ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0
   - ADR-009-query-history-triage-store
@@ -312,8 +314,8 @@ configuration that produces the raw files.
   is the **payload** that follows the response header of FR-29 on stdout; FR-10
   governs that payload, not the header itself.
 - **FR-11 — Global flags precede the subcommand.** `--format`, `--dir`,
-  `--all`, `--no-cache`, `--since`, `--regex`, `--resource-attr` (FR-40), and
-  `--session-id` are global
+  `--all`, `--no-cache`, `--since`, `--regex`, `--resource-attr` (FR-40),
+  `--attr` (FR-42), and `--session-id` are global
   flags and **must** be accepted *before* the subcommand. Supplying a global flag *after* the
   subcommand **must** be rejected as an unrecognized argument (a hard parse
   error), not silently accepted. Subcommand-specific flags and positionals
@@ -606,7 +608,11 @@ configuration that produces the raw files.
     every filter in the order given (a presence-only filter renders as a bare
     `<k>`). The line **must not** appear when no `--resource-attr` is supplied.
     A reader **must** be able to see what was filtered without re-deriving it
-    from the invocation.
+    from the invocation. `--attr` (FR-42) **must** contribute an equivalent but
+    **separate** `Attribute filter applied:` line, so a reader can tell a
+    producer-level filter from a record-level one.
+  - Under `await` ([SPEC-otelq-await](SPEC-otelq-await.md) FR-7), the header
+    **must** additionally carry a `Waited: <n>ms (<p> polls)` line.
 
 ### Query history and triage
 
@@ -760,6 +766,35 @@ configuration that produces the raw files.
   Its name, arity, and return semantics are a compatibility surface: a consumer
   embeds it in stored queries, so they **must not** change incidentally.
 
+- **FR-42 — `--attr` signal-attribute filter.** An `--attr` global flag (FR-11)
+  **must** filter results by the attributes attached to the individual
+  **record** — the span, log record, or metric data point — as opposed to the
+  **Resource** attributes of its producer (FR-40). Its two forms, repeatability,
+  conjunctive combination, exact-equality semantics, dotted-key handling,
+  malformed-argument rejection, unsupported-command rejection, and header
+  disclosure **must** all match FR-40 exactly, so one rule governs both filters.
+
+  The attribute column is selected by the **signal being queried**, not by the
+  caller: `span_attributes` for traces, `log_attributes` for logs,
+  `metric_attributes` for metrics. A command spanning several signals
+  (`summary`, `errors`) **must** apply the filter to each signal against that
+  signal's own column. The caller therefore never names a column, and the same
+  `--attr step=pair-node` means the same thing whichever signal answers it.
+
+  Extraction **must** go through the FR-41 macro, which is generic over any
+  JSON attributes column — record attributes are not a second mechanism.
+
+  The distinction from FR-40 is load-bearing and **must not** be blurred: a
+  Resource attribute identifies the *producer* (and so is the correlation spine
+  for a whole run), while a record attribute distinguishes *one event from
+  another within* that producer. Matching a record attribute against Resource
+  attributes, or vice versa, would let a mis-instrumented producer read as a
+  false positive.
+
+  The header line of FR-29 **must** distinguish the two, rendering
+  `Attribute filter applied: <k>=<v>[, …]` separately from FR-40's
+  `Resource filter applied:` line.
+
 ### Machine-attributable failure (ADR-012)
 
 - **FR-37 — Reason tokens on failure.** Every exit-`2` path (FR-17) **must**
@@ -776,9 +811,17 @@ configuration that produces the raw files.
   | `query_error` | A query failed to execute — malformed SQL (FR-9), an empty query, or a reader/DuckDB error |
   | `usage_error` | The invocation was not understood — bad or misplaced flag, unknown subcommand, unknown `help` topic, malformed `--since` or `--regex`, an ambiguous `trace` id prefix, bare invocation (FR-39) |
   | `internal_error` | Any otherwise-unhandled error |
+  | `interrupted` | A bounded wait was signalled ([SPEC-otelq-await](SPEC-otelq-await.md) FR-11) |
+  | `timeout` | A bounded wait reached its deadline unsatisfied — exit `1`, a verdict (SPEC-otelq-await FR-6) |
 
-  `predicate_unsatisfied` and `timeout` are **reserved** and **must not** be
-  emitted. Tokens are additive-only: a future token **may** be introduced, but an
+  `predicate_unsatisfied` remains **reserved** and **must not** be emitted.
+
+  Every token above accompanies exit `2` except `timeout`, which is the one
+  token attached to a **verdict**: it accompanies exit `1` from `await`, so a
+  consumer can read every non-zero outcome with one rule. No other exit-`1`
+  path is required to carry a token.
+
+  Tokens are additive-only: a future token **may** be introduced, but an
   existing token's spelling, meaning, and associated exit code **must not**
   change.
 
@@ -1496,6 +1539,27 @@ configuration that produces the raw files.
   read, then it documents `resource_attr(...)` as an **otelq-defined** helper
   (not OpenTelemetry, not a DuckDB builtin) and states what it returns.
   *Verification hint: `test_ac87_help_documents_the_macro_as_otelq_specific`.*
+
+- **AC-88** (Verifies FR-42, FR-41): Given log records carrying a log attribute
+  `step` and spans carrying a span attribute `step`, when `--attr step=pair-node`
+  runs against `logs` and against `slow`, then each returns only its own signal's
+  matching records — the column is chosen by signal, never named by the caller.
+  *Verification hint: `test_ac88_attr_selects_the_signal_appropriate_column`.*
+- **AC-89** (Verifies FR-42, FR-40): Given a record whose **Resource**
+  attributes contain `k=v` and a different record whose **record** attributes
+  contain `k=v`, when `--attr k=v` runs, then only the record-attribute row
+  matches; and when `--resource-attr k=v` runs, then only the Resource row
+  matches. The two namespaces never cross.
+  *Verification hint: `test_ac89_record_and_resource_attributes_never_cross`.*
+- **AC-90** (Verifies FR-42, FR-29): Given both `--resource-attr` and `--attr`,
+  when a signal-bearing command runs, then the header carries two distinct
+  lines, `Resource filter applied:` and `Attribute filter applied:`, and both
+  filters are ANDed.
+  *Verification hint: `test_ac90_attr_and_resource_filters_are_disclosed_separately`.*
+- **AC-91** (Verifies FR-42, FR-37): Given `--attr` supplied to an unsupported
+  command, or with a malformed argument, when it runs, then it exits `2` with
+  `otelq: usage_error:` — identical handling to FR-40.
+  *Verification hint: `test_ac91_attr_validation_matches_resource_attr`.*
 
 
 ### Examples
