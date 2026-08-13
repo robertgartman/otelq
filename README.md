@@ -418,6 +418,39 @@ sql views (for `otelq sql "<query>"`):
   The built-in commands take --resource-attr KEY=VALUE for the same
   job (repeatable, AND); `sql` is never rewritten, so here you write
   the macro yourself.
+  span_edges / span_tree — otelq-DEFINED derived relations (NOT part
+  of the reader schema) that make span structure traversable.
+    span_edges  span_id, parent_span_id, trace_id — only edges whose
+                parent actually exists IN THE SAME trace.
+    span_tree   span_id, trace_id, root_id, depth, is_orphan —
+                root_id is the CONNECTED COMPONENT the span belongs
+                to; two spans are connected iff their root_id match.
+                is_orphan marks a span whose parent was named but
+                never exported (sampled away / still in flight / a
+                non-exporting service) — a broken link, as opposed
+                to a genuine root, which has an empty parent.
+  Sharing a trace_id is NOT the same as being connected: a dangling
+  parent leaves spans in one trace split across components. Use
+  root_id, not trace_id, to ask "did these actually connect?", e.g.
+  telling a step that never ran apart from a hop that lost trace
+  context:
+    sql "WITH want(service_name, name) AS (
+           VALUES ('svcA','span.one'),('svcB','span.two')),
+         hit AS (
+           SELECT w.service_name, w.name, st.root_id FROM want w
+           LEFT JOIN traces t ON t.service_name = w.service_name
+                             AND t.name = w.name
+           LEFT JOIN span_tree st ON st.span_id = t.span_id)
+         SELECT CASE
+           WHEN count(*) FILTER (WHERE root_id IS NULL) > 0
+                THEN 'missing'
+           WHEN (SELECT count(DISTINCT service_name || name)
+                 FROM hit GROUP BY root_id ORDER BY 1 DESC LIMIT 1)
+                = (SELECT count(*) FROM want) THEN 'connected'
+           ELSE 'disconnected' END FROM hit"
+  otelq reports structure, never a verdict on it — you write the
+  predicate, then gate it with the exit code (add `await` to wait for
+  it: exit 0 satisfied, 1 not, 2 error).
   IMPORTANT — isolate your `sql` to this worktree: unlike the built-in
   commands, `sql` is NEVER auto-scoped, so on a shared Collector it
   sees EVERY concurrent worktree's rows. Scope a query to THIS

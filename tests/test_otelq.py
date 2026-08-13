@@ -4637,3 +4637,224 @@ def test_ac12_no_poll_or_sleep_past_deadline(temp_telemetry: Path) -> None:
     )
     assert proc.returncode == 1, proc.stderr
     assert elapsed < 2 + 8, f"slept past the deadline: {elapsed}s"
+
+
+# ---------------------------------------------------------------------------
+# FR-43 / FR-44 — span-tree relations (ADR-014).
+#
+# otelq exposes STRUCTURE as relations; it never pronounces a verdict on it.
+# Whether a shape is acceptable is the caller's policy, composed in `sql` and
+# gated through the exit-code contract. A graph extension is not required for
+# this: an OTel span tree is a FOREST (every span has at most one parent), which
+# core recursive SQL traverses completely.
+# ---------------------------------------------------------------------------
+
+# The structural predicate otelq documents in --help, and the one AC-96 pins.
+# It distinguishes the two faults a caller most often needs to tell apart:
+#   MISSING      - a member was never observed at all
+#   DISCONNECTED - every member observed, but split across components
+# Those have different causes (a step never ran vs a hop lost trace context)
+# and different fixes, so collapsing them into one failure destroys the signal.
+_CHAIN_PREDICATE = """
+WITH want(service_name, name) AS (VALUES {members}),
+     hit AS (
+       SELECT w.service_name, w.name, st.root_id
+       FROM want w
+       LEFT JOIN traces t
+         ON t.service_name = w.service_name AND t.name = w.name
+       LEFT JOIN span_tree st ON st.span_id = t.span_id
+     ),
+     per_component AS (
+       SELECT root_id, count(DISTINCT service_name || ':' || name) AS covers
+       FROM hit WHERE root_id IS NOT NULL GROUP BY 1
+     )
+SELECT CASE
+         WHEN (SELECT count(*) FROM hit WHERE root_id IS NULL) > 0 THEN 'missing'
+         WHEN (SELECT max(covers) FROM per_component)
+              = (SELECT count(*) FROM want)                        THEN 'connected'
+         ELSE 'disconnected'
+       END AS verdict
+"""
+
+
+def _chain_verdict(store: Path, members: list[tuple[str, str]], *argv: str) -> str:
+    sql = _CHAIN_PREDICATE.format(
+        members=",".join(f"('{s}','{n}')" for s, n in members)
+    )
+    out = _run(store, "--all", *argv, "sql", sql)
+    return _json.loads(_strip_header(out))[0]["verdict"]
+
+
+def _tree_rows(store: Path, *argv: str) -> list[dict[str, Any]]:
+    out = _run(store, "--all", *argv, "sql",
+               "SELECT * FROM span_tree ORDER BY trace_id, depth, span_id")
+    return _json.loads(_strip_header(out))
+
+
+def _write_chain(store: Path, base: datetime, spans: list[tuple[str, str, str, str]]) -> None:
+    """spans: (trace_label, span_label, parent_label, service)."""
+    write_jsonl(
+        store / "traces.jsonl",
+        [
+            make_span(base, trace_id=tr, span_id=sp, parent=par, service=svc,
+                      name=f"{svc}.op", duration_ms=5)
+            for tr, sp, par, svc in spans
+        ],
+    )
+
+
+def test_ac92_span_tree_walks_a_healthy_chain(temp_telemetry: Path) -> None:
+    # FR-43: A -> B -> C in one trace is one component, depths 0/1/2, no orphans.
+    base = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+    _write_chain(temp_telemetry, base, [
+        ("T1", "a", "", "svcA"), ("T1", "b", "a", "svcB"), ("T1", "c", "b", "svcC"),
+    ])
+    rows = _tree_rows(temp_telemetry)
+    assert len(rows) == 3
+    assert len({r["root_id"] for r in rows}) == 1
+    assert {r["root_id"] for r in rows} == {span_hex("a")}
+    assert [r["depth"] for r in rows] == [0, 1, 2]
+    assert not any(r["is_orphan"] for r in rows)
+    edges = _json.loads(
+        _strip_header(
+            _run(temp_telemetry, "--all", "sql",
+                 "SELECT span_id, parent_span_id FROM span_edges ORDER BY span_id")
+        )
+    )
+    assert {(e["span_id"], e["parent_span_id"]) for e in edges} == {
+        (span_hex("b"), span_hex("a")),
+        (span_hex("c"), span_hex("b")),
+    }
+
+
+def test_ac93_dangling_parent_splits_the_component(temp_telemetry: Path) -> None:
+    # FR-43: the case a shared-trace_id check reports as a FALSE GREEN. All three
+    # spans carry one trace_id, but the middle link is dangling, so they are NOT
+    # one connected chain. is_orphan separates a broken link from a real root.
+    base = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+    _write_chain(temp_telemetry, base, [
+        ("T1", "a", "", "svcA"),
+        ("T1", "b", "a", "svcB"),
+        ("T1", "c", "never-exported", "svcC"),  # parent absent from the store
+    ])
+    rows = {r["span_id"]: r for r in _tree_rows(temp_telemetry)}
+    assert len({r["root_id"] for r in rows.values()}) == 2, "dangling link must split"
+    assert rows[span_hex("c")]["root_id"] == span_hex("c")
+    assert rows[span_hex("c")]["is_orphan"] is True
+    assert rows[span_hex("a")]["is_orphan"] is False  # genuine root, empty parent
+    assert rows[span_hex("b")]["root_id"] == span_hex("a")
+    # And the naive check really would have said "connected":
+    traces = _json.loads(
+        _strip_header(
+            _run(temp_telemetry, "--all", "sql",
+                 "SELECT count(DISTINCT trace_id) AS n FROM traces")
+        )
+    )
+    assert traces[0]["n"] == 1
+
+
+def test_ac94_components_never_cross_traces(temp_telemetry: Path) -> None:
+    # FR-43: two traces, and the second reuses the FIRST trace's span id as its
+    # parent value. Component membership must not follow that across traces.
+    base = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+    _write_chain(temp_telemetry, base, [
+        ("T1", "a", "", "svcA"), ("T1", "b", "a", "svcB"),
+        ("T2", "z", "a", "svcZ"),  # same parent LABEL, different trace
+    ])
+    rows = {r["span_id"]: r for r in _tree_rows(temp_telemetry)}
+    t1_roots = {rows[span_hex(s)]["root_id"] for s in ("a", "b")}
+    assert rows[span_hex("z")]["root_id"] not in t1_roots
+    assert rows[span_hex("z")]["is_orphan"] is True  # its parent isn't in ITS trace
+
+
+def test_ac95_span_relations_are_cache_invariant_and_empty_safe(
+    temp_telemetry: Path,
+) -> None:
+    # FR-43/FR-14/INV-3: identical cached vs --no-cache, and expose-empty holds.
+    base = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+    _write_chain(temp_telemetry, base, [
+        ("T1", "a", "", "svcA"), ("T1", "b", "a", "svcB"),
+    ])
+    assert _tree_rows(temp_telemetry) == _tree_rows(temp_telemetry, "--no-cache")
+
+    empty = temp_telemetry.parent / "empty-store"
+    empty.mkdir()
+    write_jsonl(empty / "logs.jsonl", [make_log(base, service="s", body="only logs")])
+    for rel in ("span_tree", "span_edges"):
+        out = _run(empty, "--all", "sql", f"SELECT count(*) AS n FROM {rel}")
+        assert _json.loads(_strip_header(out))[0]["n"] == 0, rel
+
+
+def test_ac96_caller_composes_the_structural_predicate(temp_telemetry: Path) -> None:
+    # FR-44: one caller-written predicate separates all three outcomes, with no
+    # verdict logic inside otelq. This is the query --help documents.
+    base = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+    members = [("svcA", "svcA.op"), ("svcB", "svcB.op"), ("svcC", "svcC.op")]
+
+    _write_chain(temp_telemetry, base, [
+        ("T1", "a", "", "svcA"), ("T1", "b", "a", "svcB"), ("T1", "c", "b", "svcC"),
+    ])
+    assert _chain_verdict(temp_telemetry, members) == "connected"
+
+    # Every member observed, but a hop lost trace context -> split components.
+    _write_chain(temp_telemetry, base, [
+        ("T1", "a", "", "svcA"), ("T1", "b", "a", "svcB"), ("T2", "c", "", "svcC"),
+    ])
+    assert _chain_verdict(temp_telemetry, members) == "disconnected"
+
+    # svcC never emitted at all.
+    _write_chain(temp_telemetry, base, [
+        ("T1", "a", "", "svcA"), ("T1", "b", "a", "svcB"),
+    ])
+    assert _chain_verdict(temp_telemetry, members) == "missing"
+
+
+def test_ac97_structural_predicate_gates_through_await(temp_telemetry: Path) -> None:
+    # FR-44: structure is gated by the EXISTING contract — no new command. The
+    # predicate returns a single scalar, so await's FR-2 truthiness rule applies.
+    base = datetime.now(timezone.utc)
+    _write_chain(temp_telemetry, base, [("T1", "a", "", "svcA")])
+    connected = (
+        "SELECT count(DISTINCT st.root_id) = 1 AND count(*) = 2 "
+        "FROM traces t JOIN span_tree st ON st.span_id = t.span_id"
+    )
+    unsatisfied = _cli(
+        "--dir", str(temp_telemetry), "--all",
+        "await", "--timeout", "3s", "--poll", "1s", "sql", connected,
+    )
+    assert unsatisfied.returncode == 1, unsatisfied.stderr
+    assert _reason(unsatisfied.stderr) == "timeout"
+
+    def writer() -> None:
+        _time.sleep(2.0)
+        write_jsonl(
+            temp_telemetry / "traces.jsonl",
+            [make_span(base, trace_id="T1", span_id="b", parent="a",
+                       service="svcB", name="svcB.op", duration_ms=5)],
+            append=True,
+        )
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    satisfied = _cli(
+        "--dir", str(temp_telemetry), "--all",
+        "await", "--timeout", "40s", "--poll", "1s", "sql", connected,
+    )
+    thread.join(timeout=5)
+    assert satisfied.returncode == 0, satisfied.stderr
+
+
+def test_ac98_help_documents_span_relations_and_example() -> None:
+    # FR-43/FR-44: otelq-DEFINED relations must be named as such, and the worked
+    # example must be present so the composition is discoverable, not merely
+    # possible.
+    import io as _io
+    from contextlib import redirect_stdout
+
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        assert otelq.main(["help"]) == 0
+    text = buf.getvalue()
+    assert "span_tree" in text and "span_edges" in text
+    assert "root_id" in text and "is_orphan" in text
+    assert "disconnected" in text and "missing" in text

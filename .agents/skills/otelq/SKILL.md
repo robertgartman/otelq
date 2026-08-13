@@ -289,6 +289,37 @@ uvx otelq --dir .telemetry sql "SELECT * FROM logs
   WHERE resource_attr(resource_attributes, 'smoke.run_id') = 'abc123'"
 ```
 
+## Did these spans actually connect? (`span_tree`)
+
+**Sharing a `trace_id` does not mean connected.** A dangling parent — a span
+whose parent was never exported — leaves spans in one trace split into separate
+components. Ask with `root_id`, not `trace_id`:
+
+```
+uvx otelq --dir .telemetry sql "SELECT span_id, root_id, depth, is_orphan FROM span_tree"
+```
+
+| Relation | Use |
+|---|---|
+| `span_edges` | `span_id, parent_span_id, trace_id` — only edges whose parent exists in the **same** trace |
+| `span_tree` | `span_id, trace_id, root_id, depth, is_orphan` — two spans connect iff their `root_id` match |
+
+`is_orphan` marks a span whose parent was **named but never exported** (sampled
+away, still in flight, or a non-exporting service) — a broken link, as distinct
+from a genuine root, which has an empty parent.
+
+When checking that a set of spans formed one chain, separate the two faults —
+they have different causes and different fixes:
+
+- **missing** — a member was never observed at all ⇒ that step never ran, or
+  isn't instrumented.
+- **disconnected** — every member observed, but split across `root_id`s ⇒ a hop
+  lost W3C trace context.
+
+otelq reports structure and never a verdict on it: write the predicate yourself,
+then gate it with the exit code, and wrap it in `await` if the answer may not
+have arrived yet. `otelq --help` carries a copy-pasteable version of that query.
+
 ## Exit codes (scripting otelq)
 
 otelq's exit code is a stable contract. **Exit `0` means stdout is the answer to

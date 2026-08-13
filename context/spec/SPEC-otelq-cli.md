@@ -19,6 +19,7 @@ related_documents:
   - SPEC-otelq-worktree-scoping
   - SPEC-otelq-await
   - ADR-013-bounded-blocking-single-invocation
+  - ADR-014-span-tree-traversal-in-core-sql
   - CONTRACT-telemetry-directory
   - ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0
   - ADR-009-query-history-triage-store
@@ -190,6 +191,64 @@ configuration that produces the raw files.
   [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md);
   this requirement fixes only the column names otelq surfaces and the
   enumerations it relies on.
+
+- **FR-43 — Span-tree relations.** otelq **must** additionally expose two
+  **derived** relations that make the parent/child structure of `traces`
+  traversable without the caller knowing the reader schema's conventions
+  ([ADR-014](../adr/ADR-014-span-tree-traversal-in-core-sql.md)):
+
+  - **`span_edges`** — one row per **resolvable** parent/child edge:
+    `span_id`, `parent_span_id`, `trace_id`. An edge **must** be included
+    **only** when the referenced parent exists **in the same trace**. A
+    `parent_span_id` that is empty, or that names a span not present in the
+    store, yields no row — such references are routine (the parent was sampled
+    away, is still in flight, or belongs to a service that does not export) and
+    **must not** be treated as an error.
+  - **`span_tree`** — one row per span: `span_id`, `trace_id`, `root_id`,
+    `depth`, `is_orphan`.
+    - `root_id` **must** identify the **connected component** the span belongs
+      to: the id of the span reached by following `span_edges` upward until no
+      further edge exists. A span that is its own component's top has
+      `root_id = span_id` and `depth = 0`.
+    - `depth` **must** be the number of edges from the span to its `root_id`.
+    - `is_orphan` **must** be true when the span names a `parent_span_id` that
+      does not resolve within its trace, and false for a genuine root (empty
+      `parent_span_id`). Both are component tops; only the orphan indicates a
+      **partial export or a broken link**, and conflating them would hide
+      exactly the fault a caller is looking for.
+
+  Component membership **must not** span trace ids: two spans in different
+  traces **must never** share a `root_id`, even if a `parent_span_id` value
+  coincidentally matches.
+
+  These relations **must** resolve identically on the cached and `--no-cache`
+  paths, and **must** be queryable by `sql` like any other relation. Under
+  expose-empty (FR-1) they **must** resolve (empty) rather than raise when
+  `traces` has no data.
+
+  Being **otelq-defined** rather than part of the upstream reader schema, they
+  **must** be documented as such in `--help` (the `sql` views section), together
+  with a worked example.
+
+- **FR-44 — Structure is exposed as relations, not verdicts.** otelq **must**
+  expose span structure as queryable relations and **must not** introduce a
+  command, flag, or output field that classifies a structure as pass/fail,
+  healthy/unhealthy, or connected/disconnected.
+
+  Whether a given shape is acceptable is a policy the caller owns: which spans
+  are expected, whether a missing member is fatal, and how a split trace should
+  be reported are all properties of the caller's system, not of telemetry. otelq
+  answers *how is this trace shaped*; the caller composes the predicate in `sql`
+  and gates it through the exit-code contract of
+  [ADR-012](../adr/ADR-012-exit-codes-as-public-contract.md) — optionally under
+  `await` ([SPEC-otelq-await](SPEC-otelq-await.md)) when the answer may not have
+  arrived yet.
+
+  To keep that composition discoverable rather than merely possible, `--help`
+  **must** carry a worked example distinguishing the two structural faults a
+  caller most often needs to tell apart: a member **never observed at all**
+  versus every member observed but **split across trace ids** (a hop that lost
+  trace context). These have different causes and different fixes.
 
 ### The seven commands
 
@@ -1560,6 +1619,47 @@ configuration that produces the raw files.
   command, or with a malformed argument, when it runs, then it exits `2` with
   `otelq: usage_error:` — identical handling to FR-40.
   *Verification hint: `test_ac91_attr_validation_matches_resource_attr`.*
+
+- **AC-92** (Verifies FR-43): Given a trace `A -> B -> C`, when `span_tree` is
+  queried, then all three rows share one `root_id` (`A`'s span id) with depths
+  `0, 1, 2`, and `is_orphan` is false throughout; and `span_edges` carries
+  exactly the two edges `B->A` and `C->B`.
+  *Verification hint: `test_ac92_span_tree_walks_a_healthy_chain`.*
+- **AC-93** (Verifies FR-43): Given a trace whose middle span names a
+  `parent_span_id` that is **not** in the store, when `span_tree` is queried,
+  then the trace resolves into **two** components with different `root_id`s, and
+  the span with the dangling reference has `is_orphan = true` while the genuine
+  root (empty `parent_span_id`) has `is_orphan = false`.
+  *Verification hint: `test_ac93_dangling_parent_splits_the_component`; this is
+  the case a shared-`trace_id` test reports as a false green.*
+- **AC-94** (Verifies FR-43): Given two different traces that happen to contain
+  the same `parent_span_id` value, when `span_tree` is queried, then no span in
+  one trace shares a `root_id` with any span in the other — component membership
+  never crosses a trace boundary.
+  *Verification hint: `test_ac94_components_never_cross_traces`.*
+- **AC-95** (Verifies FR-43, FR-14, INV-3): Given one corpus, when `span_tree`
+  and `span_edges` are queried with the cache and again with `--no-cache`, then
+  both return byte-identical rows; and given a store whose `traces` relation is
+  empty, then both resolve to zero rows rather than raising.
+  *Verification hint: `test_ac95_span_relations_are_cache_invariant_and_empty_safe`.*
+- **AC-96** (Verifies FR-44, FR-43): Given a member set and a corpus containing
+  (a) one healthy connected trace, (b) the same members split across two trace
+  ids, and (c) a corpus missing one member entirely, when the caller runs a
+  single `sql` predicate over `span_tree`, then it distinguishes all three —
+  every member present in one component, every member present but split, and a
+  member never observed — without otelq exposing any verdict of its own.
+  *Verification hint: `test_ac96_caller_composes_the_structural_predicate`,
+  using the very query `--help` documents.*
+- **AC-97** (Verifies FR-44): Given such a caller-composed predicate, when it is
+  run under `await` and the satisfying telemetry arrives mid-wait, then the
+  invocation exits `0`; and when it never arrives, then it exits `1` — structure
+  is gated entirely through the existing exit-code contract, with no new command.
+  *Verification hint: `test_ac97_structural_predicate_gates_through_await`.*
+- **AC-98** (Verifies FR-43, FR-44): Given `otelq --help`, when its `sql`
+  section is read, then it documents `span_tree` and `span_edges` as
+  **otelq-defined** derived relations and carries the worked example that
+  separates a never-observed member from members split across traces.
+  *Verification hint: `test_ac98_help_documents_span_relations_and_example`.*
 
 
 ### Examples
