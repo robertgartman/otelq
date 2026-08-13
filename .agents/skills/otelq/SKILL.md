@@ -11,22 +11,43 @@ code, then confirm from telemetry that it behaved as intended. If infrastructure
 ## Run
 
 ```
-uvx otelq --dir .telemetry --format compact summary
+uvx otelq --format compact summary
 ```
 
-`--dir .telemetry` is **required** — `uvx` runs otelq from an isolated build, so
-the default path won't resolve to your project. Point it at the Collector's
-output folder (the bind-mounted `.telemetry/` at the project root). Pin a
-version with `uvx otelq@<version> …`.
+**`--dir` is not required.** otelq resolves the store itself:
 
-## Git worktree warning (important)
+1. `--dir <path>` — wins over everything
+2. `$OTELQ_DIR` — one value two cooperating scripts can share, so they cannot
+   silently read different stores
+3. the nearest `.telemetry/` at or above your working directory — and from a
+   **linked git worktree**, the *main checkout's* store (see below)
 
-When running inside a git worktree, set `--dir` to the `.telemetry/` directory
-of the repository's **default branch worktree** (the canonical root checkout
-where the Collector persists telemetry), not the current worktree path.
+Every response header reports what it read and why:
 
-Concurrent development across git worktrees aggregates telemetry into that same
-default-branch `.telemetry/` directory.
+```
+OTEL source dir: /path/to/repo/.telemetry
+OTEL source resolved by: CWD or an ancestor
+```
+
+Compare those two lines across invocations to **prove** two commands read the
+same store. If nothing resolves, otelq exits `2` with `store_not_found` and
+names every path it tried — it never creates a store. Pin a version with
+`uvx otelq@<version> …`.
+
+## Git worktrees are handled for you
+
+One host runs one Collector on fixed ports, so **every worktree exports into the
+main checkout's `.telemetry/`**. Run otelq from a linked worktree and it reads
+the main checkout's store automatically, reporting:
+
+```
+OTEL source resolved by: git main checkout (worktree 'my-feature', default branch 'main')
+```
+
+This matters because a linked worktree often has its own *empty* `.telemetry/`.
+Reading that would report "no telemetry captured" — truthfully, about the wrong
+store — while your data sits in the main checkout. Pass `--dir` explicitly if you
+really do want the worktree's own directory.
 
 ## Start every investigation with `triage`
 
@@ -35,7 +56,7 @@ otelq records every telemetry query it runs (locally, in `.otelq-history/`
 under the telemetry dir), and `triage` acts on that history:
 
 ```
-uvx otelq --dir .telemetry --format compact triage
+uvx otelq --format compact triage
 ```
 
 What it does, in order:
@@ -177,7 +198,7 @@ typically ~40–60% fewer tokens on the same rows, identical data.
 (`--top`, `--service`, `--level`, `--grep`) go **after**:
 
 ```
-uvx otelq --dir .telemetry --since 10m --format compact errors --top 20
+uvx otelq --since 10m --format compact errors --top 20
 ```
 
 ## Filter inside otelq (`--regex` / `--grep`), not shell `| grep`
@@ -201,7 +222,7 @@ latest matching rows without first raising `--top`.
 Example:
 
 ```
-uvx otelq --dir .telemetry --regex "timeout|ECONNRESET" errors
+uvx otelq --regex "timeout|ECONNRESET" errors
 ```
 
 Case-sensitive by default (use inline `(?i)` for case-insensitive). Only
@@ -218,7 +239,7 @@ full history); cap rows with `--top N`. Full reference (incl. the `sql` view
 columns):
 
 ```
-uvx otelq --dir .telemetry --help
+uvx otelq --help
 ```
 
 `--help`'s `sql` column list is a curated subset. For the full live schema —
@@ -226,8 +247,8 @@ including `*_attributes` columns carrying whatever custom OTel tags an app
 actually emits — use standard DuckDB introspection:
 
 ```
-uvx otelq --dir .telemetry sql "DESCRIBE traces"
-uvx otelq --dir .telemetry sql "PRAGMA table_info('logs')"
+uvx otelq sql "DESCRIBE traces"
+uvx otelq sql "PRAGMA table_info('logs')"
 ```
 
 ## Wait for something to arrive (`await`)
@@ -236,7 +257,7 @@ Telemetry lands seconds after it is emitted (Collector batch + flush). Do **not*
 sleep-and-retry from the shell — otelq polls in-process, so the budget is real:
 
 ```
-uvx otelq --dir .telemetry --resource-attr smoke.run_id=abc123 \
+uvx otelq --resource-attr smoke.run_id=abc123 \
   await --timeout 60s --poll 1s logs --attr smoke.step=pair-node
 ```
 
@@ -263,8 +284,8 @@ An OTel **Resource** attribute is the spine that ties one run's traces, logs and
 metrics together. Filter on it directly — never by grepping the raw JSON:
 
 ```
-uvx otelq --dir .telemetry --resource-attr smoke.run_id=abc123 errors
-uvx otelq --dir .telemetry --resource-attr service.namespace=api --resource-attr deployment.environment=dev logs
+uvx otelq --resource-attr smoke.run_id=abc123 errors
+uvx otelq --resource-attr service.namespace=api --resource-attr deployment.environment=dev logs
 ```
 
 Repeatable (terms AND together), **exact** match, dotted keys need no escaping.
@@ -285,7 +306,7 @@ In `sql` (never rewritten, so filter yourself) use the otelq-defined macro —
 not `json_extract_string`, which needs escaping and raises on a malformed row:
 
 ```
-uvx otelq --dir .telemetry sql "SELECT * FROM logs
+uvx otelq sql "SELECT * FROM logs
   WHERE resource_attr(resource_attributes, 'smoke.run_id') = 'abc123'"
 ```
 
@@ -296,7 +317,7 @@ whose parent was never exported — leaves spans in one trace split into separat
 components. Ask with `root_id`, not `trace_id`:
 
 ```
-uvx otelq --dir .telemetry sql "SELECT span_id, root_id, depth, is_orphan FROM span_tree"
+uvx otelq sql "SELECT span_id, root_id, depth, is_orphan FROM span_tree"
 ```
 
 | Relation | Use |
@@ -340,7 +361,7 @@ Do **not** write `otelq ... 2>/dev/null || echo 0` — that is the pattern this
 contract exists to kill. Branch on the exit code:
 
 ```bash
-hits=$(uvx otelq --dir .telemetry --format compact \
+hits=$(uvx otelq --format compact \
          sql "SELECT count(*) FROM logs WHERE severity_text = 'ERROR'") || {
   echo "otelq failed — do not treat this as zero errors" >&2; exit 2; }
 ```
@@ -353,5 +374,5 @@ cannot hide.
 ## Not seeing data?
 
 ```
-uvx otelq --dir .telemetry troubleshoot
+uvx otelq troubleshoot
 ```

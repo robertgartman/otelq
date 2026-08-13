@@ -13,7 +13,7 @@ must_not_contain:
   - decision_rationale
 version: "1.2"
 created: 2026-06-23
-last_updated: 2026-08-12
+last_updated: 2026-08-13
 related_documents:
   - ADR-004-collector-in-docker-bind-mount
   - ADR-009-query-history-triage-store
@@ -39,6 +39,13 @@ The producer and consumer agree on a single **telemetry root** directory:
 
 - Default consumer-side location: the `.telemetry/` directory under the current
   working directory (`<cwd>/.telemetry/`); `--dir` overrides for other layouts.
+  How the consumer *finds* that directory when neither is given — an
+  `OTELQ_DIR` environment variable, then discovery from the working directory —
+  is consumer-internal behaviour, specified in
+  [SPEC-otelq-cli](../spec/SPEC-otelq-cli.md) and permitted by
+  [ADR-001](../adr/ADR-001-host-cli-reads-bind-mounted-files.md). It is **not**
+  part of this interface: the producer is unaffected by how the consumer arrives
+  at the path, and discovery **must not** create a root (v1.2 root ownership).
 - Default producer-side location: the container path `/.telemetry`, bind-mounted
   to the same host directory.
 

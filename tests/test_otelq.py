@@ -1909,13 +1909,18 @@ def test_help_command_unknown_topic_errors() -> None:
     assert "invalid choice" in buf.getvalue()
 
 
-def test_default_dir_is_cwd_relative() -> None:
+def test_default_dir_is_cwd_relative(tmp_path: Path) -> None:
     # FR-12 / ADR-001: the default telemetry dir is <cwd>/.telemetry, resolved from
     # the current working directory — NOT the script's install location. A
     # script-relative default put it under site-packages for `uvx ... otelq`.
+    # FR-45: `--dir` now parses to None when omitted, so "not given" is
+    # distinguishable from "given"; resolution supplies the path.
     assert otelq.DEFAULT_DIR == Path.cwd() / ".telemetry"
-    parsed = otelq.build_parser().parse_args(["summary"])
-    assert parsed.dir == Path.cwd() / ".telemetry"
+    assert otelq.build_parser().parse_args(["summary"]).dir is None
+    store = tmp_path / ".telemetry"
+    store.mkdir()
+    assert otelq.resolve_store(None, cwd=tmp_path).path == store
+    assert otelq.resolve_store(None, cwd=tmp_path).how == otelq.RESOLVED_BY_WALK
 
 
 # --- broken pipe: `otelq ... | head` must exit cleanly, not dump a traceback ---
@@ -2242,11 +2247,12 @@ def test_ac38_response_header_shape_and_placement(
         assert lines[0] == "=" * 10
         assert lines[1].startswith(f"otelq logs response, format {fmt}")
         assert lines[2] == "OpenTelemetry signal: logs"
-        assert lines[3] == f"Reading data from: {temp_telemetry.resolve()}"
-        assert lines[4].startswith("Time range: ") and " - " in lines[4]
-        assert lines[5] == "IMPORTANT: all timestamps are UTC"
-        assert lines[6].startswith("Session: ")  # FR-33 session id line
-        assert lines[7] == "-" * 10
+        assert lines[3] == f"OTEL source dir: {temp_telemetry.resolve()}"
+        assert lines[4].startswith("OTEL source resolved by: ")  # FR-45 provenance
+        assert lines[5].startswith("Time range: ") and " - " in lines[5]
+        assert lines[6] == "IMPORTANT: all timestamps are UTC"
+        assert lines[7].startswith("Session: ")  # FR-33 session id line
+        assert lines[8] == "-" * 10
         assert _strip_header(out) == otelq.format_output(columns, rows, fmt) + "\n"
 
 
@@ -2279,7 +2285,7 @@ def test_ac40_zero_row_time_range_is_na(temp_telemetry: Path) -> None:
     out = _run(temp_telemetry, "metric", "does.not.exist")
     lines = out.splitlines()
     assert lines[2] == "OpenTelemetry signal: metrics"
-    assert lines[4] == "Time range: n/a - n/a"
+    assert lines[5] == "Time range: n/a - n/a"
     assert _json.loads(_strip_header(out)) == []
 
 
@@ -2326,7 +2332,7 @@ def test_ac42_errors_zero_rows_signal_is_na(temp_telemetry: Path) -> None:
     out = _run(temp_telemetry, "errors")
     lines = out.splitlines()
     assert lines[2] == "OpenTelemetry signal: n/a"
-    assert lines[4] == "Time range: n/a - n/a"
+    assert lines[5] == "Time range: n/a - n/a"
     assert _json.loads(_strip_header(out)) == []
 
 
@@ -2449,7 +2455,7 @@ def test_ac45_timestamps_render_explicit_utc(temp_telemetry: Path) -> None:
     for fmt in ("table", "json", "jsonl", "csv", "compact"):
         out = _run_fmt(temp_telemetry, fmt, "logs")
         lines = out.splitlines()
-        from_str, to_str = lines[4].removeprefix("Time range: ").split(" - ")
+        from_str, to_str = lines[5].removeprefix("Time range: ").split(" - ")
         assert _UTC_TS_RE.match(from_str) and _UTC_TS_RE.match(to_str)
         payload = _strip_header(out)
         if fmt == "json":
@@ -2581,8 +2587,8 @@ def test_ac49_regex_filters_rows_and_reports_in_header(temp_telemetry: Path) -> 
     )
     out = _run(temp_telemetry, "--regex", "error", "logs")
     lines = out.splitlines()
-    assert lines[5] == "Regex filter applied: error"
-    assert lines[6] == "Rows removed by regex: 1"
+    assert lines[6] == "Regex filter applied: error"
+    assert lines[7] == "Rows removed by regex: 1"
     payload = _json.loads(_strip_header(out))
     assert len(payload) == 1 and payload[0]["body"] == "boom error here"
 
@@ -4858,3 +4864,157 @@ def test_ac98_help_documents_span_relations_and_example() -> None:
     assert "span_tree" in text and "span_edges" in text
     assert "root_id" in text and "is_orphan" in text
     assert "disconnected" in text and "missing" in text
+
+
+# ---------------------------------------------------------------------------
+# FR-45 — store resolution (ADR-001 amendment).
+#
+# Handing every caller a path rule guarantees some caller implements it
+# differently; two scripts in one harness then read DIFFERENT stores and nothing
+# reports the divergence. otelq owns location, and DISCLOSES both the directory
+# and the rule that chose it, so two invocations can be PROVEN to agree.
+# ---------------------------------------------------------------------------
+
+
+def _header_field(out: str, label: str) -> str:
+    for line in _header_of(out).splitlines():
+        if line.startswith(f"{label}: "):
+            return line.split(": ", 1)[1]
+    raise AssertionError(f"header has no {label!r} line:\n{_header_of(out)}")
+
+
+def _cli_env(*argv: str, cwd: Path, env: dict[str, str] | None = None
+             ) -> _subprocess.CompletedProcess[str]:
+    """Run otelq as a real process with an explicit cwd and environment."""
+    full = {**_os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+                "GIT_PREFIX", "OTELQ_DIR"):
+        full.pop(var, None)
+    full.update(env or {})
+    return _subprocess.run(
+        [sys.executable, str(_OTELQ_PY), *argv],
+        capture_output=True, text=True, cwd=str(cwd), timeout=300, env=full,
+    )
+
+
+def _seed(store: Path, service: str = "svc") -> Path:
+    store.mkdir(parents=True, exist_ok=True)
+    write_jsonl(
+        store / "logs.jsonl",
+        [make_log(datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc),
+                  service=service, body="hello")],
+    )
+    return store
+
+
+def test_ac99_resolution_walks_up_from_cwd(tmp_path: Path) -> None:
+    # FR-45 rule 4: no --dir needed, and it works from a nested subdirectory.
+    project = tmp_path / "proj"
+    store = _seed(project / ".telemetry")
+    nested = project / "a" / "b" / "c"
+    nested.mkdir(parents=True)
+    for cwd in (project, nested):
+        proc = _cli_env("--all", "--format", "json", "logs", cwd=cwd)
+        assert proc.returncode == 0, proc.stderr
+        assert _header_field(proc.stdout, "OTEL source dir") == str(store.resolve())
+        assert _header_field(proc.stdout, "OTEL source resolved by") == "CWD or an ancestor"
+
+
+def test_ac100_resolution_precedence(tmp_path: Path) -> None:
+    # FR-45: --dir beats OTELQ_DIR beats discovery. An explicit argument is the
+    # caller's most specific statement of intent.
+    project = tmp_path / "proj"
+    _seed(project / ".telemetry", "from-cwd")
+    env_store = _seed(tmp_path / "env-store", "from-env")
+    flag_store = _seed(tmp_path / "flag-store", "from-flag")
+
+    proc = _cli_env("--all", "--format", "json", "logs", cwd=project,
+                    env={"OTELQ_DIR": str(env_store)})
+    assert _header_field(proc.stdout, "OTEL source dir") == str(env_store.resolve())
+    assert _header_field(proc.stdout, "OTEL source resolved by") == "OTELQ_DIR env variable"
+
+    proc = _cli_env("--dir", str(flag_store), "--all", "--format", "json", "logs",
+                    cwd=project, env={"OTELQ_DIR": str(env_store)})
+    assert _header_field(proc.stdout, "OTEL source dir") == str(flag_store.resolve())
+    assert _header_field(proc.stdout, "OTEL source resolved by") == "--dir flag"
+
+
+def test_ac101_otelq_dir_typo_is_not_silently_ignored(tmp_path: Path) -> None:
+    # FR-45/FR-38: a deliberately-set variable that points nowhere must FAIL, not
+    # fall through to discovery — otherwise two processes sharing the variable
+    # would read different stores, the exact divergence this rule prevents.
+    project = tmp_path / "proj"
+    _seed(project / ".telemetry")
+    missing = tmp_path / "typo"
+    proc = _cli_env("--all", "logs", cwd=project, env={"OTELQ_DIR": str(missing)})
+    assert proc.returncode == 2, proc.stdout
+    assert _reason(proc.stderr) == "store_not_found"
+    assert str(missing) in proc.stderr
+    assert not missing.exists()
+
+
+def test_ac102_linked_worktree_resolves_to_main_checkout(tmp_path: Path) -> None:
+    # FR-45 rule 3: THE bug. One host runs one Collector, so every worktree
+    # exports into the MAIN checkout's store — while a linked worktree may carry
+    # its own (often empty) .telemetry/. Preferring the local one answers
+    # truthfully about an empty store while the data sits elsewhere.
+    main = tmp_path / "repo"
+    main.mkdir()
+    _git_init(main, branch="trunk")
+    (main / "f.txt").write_text("x", encoding="utf-8")
+    env = {**_os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    _subprocess.run(["git", "-C", str(main), "add", "-A"], check=True, env=env)
+    _subprocess.run(["git", "-C", str(main), "commit", "-qm", "init"], check=True, env=env)
+    linked = tmp_path / "wt-feature"
+    _subprocess.run(
+        ["git", "-C", str(main), "worktree", "add", "-q", "-b", "feat", str(linked)],
+        check=True, env=env,
+    )
+    _seed(main / ".telemetry", "real-data")
+    (linked / ".telemetry").mkdir()  # present but EMPTY, as the old bug produced
+
+    proc = _cli_env("--all", "--format", "json", "logs", cwd=linked)
+    assert proc.returncode == 0, proc.stderr
+    assert _header_field(proc.stdout, "OTEL source dir") == str((main / ".telemetry").resolve())
+    mech = _header_field(proc.stdout, "OTEL source resolved by")
+    assert mech.startswith("git main checkout")
+    assert "wt-feature" in mech and "trunk" in mech
+    assert "real-data" in proc.stdout  # it really read the main store
+
+    # From the main checkout there is no redirect to make.
+    proc = _cli_env("--all", "--format", "json", "logs", cwd=main)
+    assert _header_field(proc.stdout, "OTEL source resolved by") == "CWD or an ancestor"
+
+
+def test_ac103_unresolvable_store_names_paths_tried(tmp_path: Path) -> None:
+    # FR-45/FR-38/INV-1: say where you looked, and create nothing.
+    bare = tmp_path / "nothing" / "here"
+    bare.mkdir(parents=True)
+    proc = _cli_env("logs", cwd=bare)
+    assert proc.returncode == 2, proc.stdout
+    assert _reason(proc.stderr) == "store_not_found"
+    assert "tried" in proc.stderr.lower()
+    assert str(bare / ".telemetry") in proc.stderr
+    assert not (bare / ".telemetry").exists()
+
+
+def test_ac104_resolution_is_disclosed_on_success_and_failure(tmp_path: Path) -> None:
+    # FR-45/FR-29/FR-37: provenance on the answer AND on the failure, so two
+    # callers can be proven to have read the same store from output alone.
+    project = tmp_path / "proj"
+    store = _seed(project / ".telemetry")
+    ok = _cli_env("--all", "--format", "json", "logs", cwd=project)
+    assert _header_field(ok.stdout, "OTEL source dir") == str(store.resolve())
+    assert _header_field(ok.stdout, "OTEL source resolved by")
+
+    bare = tmp_path / "empty-tree"
+    bare.mkdir()
+    bad = _cli_env("--format", "json", "logs", cwd=bare)
+    assert bad.returncode == 2
+    obj = [
+        _json.loads(ln) for ln in bad.stderr.splitlines()
+        if ln.startswith("{") and "reason" in ln
+    ]
+    assert len(obj) == 1, bad.stderr
+    assert obj[0]["store"]["dir"]
+    assert "resolved_by" in obj[0]["store"]
