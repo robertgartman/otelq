@@ -80,7 +80,7 @@ if TYPE_CHECKING:
 # agent driving otelq — and the DuckDB/extension pin governance of ADR-003 — can
 # report exactly which build it is talking to. The trailing marker lets
 # release-please bump this line alongside pyproject.toml (see release-please.yml).
-__version__ = "1.0.0"  # x-release-please-version
+__version__ = "2.0.0"  # x-release-please-version
 
 # Earliest instant otelq can observe. `await` measures its wait from here, so
 # the figure it reports is a LOWER BOUND on true wall-clock: interpreter and
