@@ -230,6 +230,33 @@ uvx otelq --dir .telemetry sql "DESCRIBE traces"
 uvx otelq --dir .telemetry sql "PRAGMA table_info('logs')"
 ```
 
+## Correlate by Resource attribute (`--resource-attr`)
+
+An OTel **Resource** attribute is the spine that ties one run's traces, logs and
+metrics together. Filter on it directly — never by grepping the raw JSON:
+
+```
+uvx otelq --dir .telemetry --resource-attr smoke.run_id=abc123 errors
+uvx otelq --dir .telemetry --resource-attr service.namespace=api --resource-attr deployment.environment=dev logs
+```
+
+Repeatable (terms AND together), **exact** match, dotted keys need no escaping.
+Omit `=VALUE` to match any non-empty value. Works on `summary`, `errors`,
+`slow`, `trace`, `logs`, `metric`, and is echoed in the response header so you
+can see what was filtered.
+
+Exact match matters: `--resource-attr run=abc` must not pick up `abc-2`. Do
+**not** substitute `LIKE '%abc%'` — a run id that prefixes another id then
+selects the wrong run.
+
+In `sql` (never rewritten, so filter yourself) use the otelq-defined macro —
+not `json_extract_string`, which needs escaping and raises on a malformed row:
+
+```
+uvx otelq --dir .telemetry sql "SELECT * FROM logs
+  WHERE resource_attr(resource_attributes, 'smoke.run_id') = 'abc123'"
+```
+
 ## Exit codes (scripting otelq)
 
 otelq's exit code is a stable contract. **Exit `0` means stdout is the answer to

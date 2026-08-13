@@ -12,12 +12,13 @@ must_not_contain:
   - architectural_rationale
   - external_data_schemas
 created: 2026-07-07
-last_updated: 2026-07-08
+last_updated: 2026-08-12
 related_documents:
   - PRD-otelq
   - ADR-011-worktree-telemetry-identity
   - SPEC-otelq-cli
   - CONTRACT-telemetry-directory
+  - ADR-012-exit-codes-as-public-contract
 ai_summary: "Opt-in worktree scoping for otelq: the otelq.worktree.* convention it consumes, a tags-present master switch, the set_resource_attributes command, worktree-grouped summary, default scoping of errors/slow/logs/metric with an --all-worktrees opt-out, the guarantee that sql and trace are never scope-rewritten, and the reserved $WORKTREE_ID sql parameter otelq binds from the env-file identity."
 semantic_tags:
   - otelq
@@ -159,7 +160,14 @@ the list-shaped aggregate commands do **not** scope — they behave as though
 `--all-worktrees` were given — and state that no worktree identity was resolved,
 rather than erroring or returning nothing.
 
-**FR-9 — `sql` is never rewritten.** `otelq sql "<query>"` executes the submitted
+**FR-9 — `sql` is never rewritten.** *(Revised 2026-08-12: the offered predicate
+is now expressed with the `resource_attr()` macro of
+[SPEC-otelq-cli](SPEC-otelq-cli.md) FR-41 rather than a raw
+`json_extract_string(...)` call. Handing a caller the raw JSON call leaked three
+pieces of otelq-internal storage knowledge — the column name, that it holds JSON,
+and which function reads it — the exact coupling FR-40/FR-41 exist to remove. The
+worktree key is not privileged: it is read through the same mechanism as any
+other resource attribute.)* `otelq sql "<query>"` executes the submitted
 query verbatim — otelq injects no worktree predicate into it and never modifies its
 text, regardless of the master switch or scope flags. (The one value otelq may
 supply is the reserved `$WORKTREE_ID` named parameter, and only when the query
@@ -191,7 +199,11 @@ attributes or env files; an absent/empty tag is treated as untagged and included
 per the mine-or-untagged rule of FR-5, consistent with the read-only,
 friendly-failure behavior of [SPEC-otelq-cli](SPEC-otelq-cli.md).
 
-**FR-13 — Reserved `$WORKTREE_ID` `sql` parameter.** `otelq sql` reserves the
+**FR-13 — Reserved `$WORKTREE_ID` `sql` parameter.** *(Revised 2026-08-12: the
+identity **value** is still bound natively as specified below; only the
+surrounding extraction expression otelq documents and emits changed to the
+`resource_attr()` macro — see FR-9 and [SPEC-otelq-cli](SPEC-otelq-cli.md)
+FR-41.)* `otelq sql` reserves the
 DuckDB named parameter `$WORKTREE_ID`. When the submitted query references it — as
 determined by DuckDB's own parser, so an occurrence inside a string literal or a
 comment does **not** count — otelq resolves the current worktree identity from the
@@ -258,7 +270,7 @@ if it is unbound.
   identity is undefined. Changing `--dir` changes none of these.
   *Verification hint: unit-test the resolver with a temp `.env.local` and a temp
   git repo; assert independence from `--dir`.*
-- **AC-3** (Verifies FR-3): Given a checkout whose top-level is `/path/A` on
+- **AC-3** (Verifies FR-3, EC-3, INV-6): Given a checkout whose top-level is `/path/A` on
   branch `feat`, when `set_resource_attributes` runs, then `.env.local` contains
   `otelq.worktree.id=/path/A` and `otelq.worktree.branch=feat`; and when it runs a
   second time after a bespoke `team=blue` was added to
@@ -274,14 +286,14 @@ if it is unbound.
   is printed, and the exit code is 0.
   *Verification hint: invoke in a non-git temp dir; assert no `.env.local` and
   exit status 0.*
-- **AC-5** (Verifies FR-4): Given captured telemetry from two worktree ids plus
+- **AC-5** (Verifies FR-4, INV-3): Given captured telemetry from two worktree ids plus
   some untagged rows, when `summary` runs, then the census shows a row per
   `(worktree.id, worktree.branch, service_name)` combination, untagged rows appear
   under `(untagged)`, and the block is identical whether or not `--all-worktrees`
   is passed.
   *Verification hint: `just otelq summary` and
   `just otelq --all-worktrees summary` against a seeded store; compare census.*
-- **AC-6** (Verifies FR-5): Given telemetry tagged for worktree `A`, worktree `B`,
+- **AC-6** (Verifies FR-5, INV-5): Given telemetry tagged for worktree `A`, worktree `B`,
   and untagged, when `errors`/`slow`/`logs`/`metric` run with resolved identity
   `A`, then only `A` and untagged rows are returned.
   *Verification hint: seed a store with all three cohorts; assert row membership
@@ -302,7 +314,7 @@ if it is unbound.
   results are unscoped and the output states that no worktree identity was
   resolved.
   *Verification hint: invoke from a non-git temp cwd against a tagged store.*
-- **AC-10** (Verifies FR-9): Given any resolved identity and tagged telemetry,
+- **AC-10** (Verifies FR-9, INV-4): Given any resolved identity and tagged telemetry,
   when `sql "SELECT count(*) FROM logs"` runs, then the returned count equals the
   unscoped count of all logs (no predicate injected), and the mine-or-untagged
   predicate is surfaced only through `set_resource_attributes` output and `--help`,
@@ -310,7 +322,7 @@ if it is unbound.
   *Verification hint: compare the `sql` count to a direct DuckDB count over the
   same store; confirm no implicit filtering; assert the predicate appears in
   `set_resource_attributes` output.*
-- **AC-11** (Verifies FR-10): Given a trace whose spans are tagged for worktree
+- **AC-11** (Verifies FR-10, INV-4): Given a trace whose spans are tagged for worktree
   `B`, when `trace <id>` runs from worktree `A`, then the full span tree for `B`
   is returned and no scope banner is shown.
   *Verification hint: seed a B-tagged trace; run `trace` from identity A; assert
@@ -327,7 +339,7 @@ if it is unbound.
   rows render as `(untagged)` and identity falls back to git resolution.
   *Verification hint: seed empty/malformed tags; corrupt `.env.local`; assert no
   traceback and correct fallback.*
-- **AC-14** (Verifies EC-2): Given otelq invoked from worktree `B` with `--dir`
+- **AC-14** (Verifies EC-2, INV-1): Given otelq invoked from worktree `B` with `--dir`
   set to worktree `A`'s shared `.telemetry/`, when a list-shaped aggregate runs,
   then scoping uses identity `B`.
   *Verification hint: run from B's cwd pointing `--dir` at A's store; assert the
@@ -348,7 +360,7 @@ if it is unbound.
   executes nothing, and never falls back to the git path.
   *Verification hint: run in a git temp repo with no `.env.local`; assert non-zero
   exit, the guidance string, and that no rows were returned.*
-- **AC-17** (Verifies FR-13, FR-1, INV-2): Given any cwd (including one with no
+- **AC-17** (Verifies FR-13, FR-1, INV-2, EC-8): Given any cwd (including one with no
   `.env.local`), when a `sql` query that does **not** reference `$WORKTREE_ID` runs
   — including one where `$WORKTREE_ID` appears only inside a string literal — then
   execution and output are byte-identical to pre-feature behavior and no identity
@@ -376,7 +388,7 @@ if it is unbound.
   `... WHERE <id-expr> IS NULL OR <id-expr> = $WORKTREE_ID` — and otelq binds
   `$WORKTREE_ID` from `.env.local` (FR-13). To inspect one *specific* other worktree
   (the job the removed `--worktree` flag used to do), use an explicit literal
-  instead, e.g. `... WHERE json_extract_string(resource_attributes, '$."otelq.worktree.id"') = '/repo/wtB'`.
+  instead, e.g. `... WHERE resource_attr(resource_attributes, 'otelq.worktree.id') = '/repo/wtB'`.
 
 ## Invariants
 
