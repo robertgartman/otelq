@@ -218,6 +218,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Serena generated project memories
+/.serena/memories/
+
 # --- otelq runtime telemetry capture (Collector output + query cache) — never committed ---
 /.telemetry/*
 !/.telemetry/.gitkeep
