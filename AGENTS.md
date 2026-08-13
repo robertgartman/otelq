@@ -41,6 +41,18 @@ When either **is** available, initialize it in the worktree you are actually wor
 # Dev Workflow
 Execute `just` to see the available recipes.
 
+**Pre-commit hooks are installed once per CLONE, not per worktree.** `just hooks-install` writes into the repository's **common** git dir (`.git/hooks`), and every linked worktree resolves hooks through that same directory — so one install covers every worktree and every branch. Confirm from inside any worktree with:
+
+```
+git rev-parse --git-path hooks/pre-commit    # -> <main-checkout>/.git/hooks/pre-commit
+```
+
+Two failure modes are silent, so check rather than assume:
+- **Never installed.** With no hook file, `git commit` runs no checks and says nothing. CI is the backstop, not the first line of defence.
+- **No matching files.** Each command is skipped when no staged file matches its `glob`, and the skip is silent. `lefthook.yml` therefore lists every file that can break a check — not just `*.py` — because `README.md` is pinned by a test, and `justfile`/`lefthook.yml`/`.github/workflows/*` define the checks themselves. Prose-only changes (`AGENTS.md`, `context/**`) deliberately run nothing.
+
+Run them on demand without committing via `just hooks-run`.
+
 
 ---
 

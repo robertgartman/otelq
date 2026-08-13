@@ -4697,6 +4697,34 @@ def test_ac11_interrupted_wait_is_exit_2(temp_telemetry: Path) -> None:
     assert _reason(err) == "interrupted"
 
 
+@pytest.mark.parametrize("delay", [0.2, 0.5, 0.8, 1.2, 2.0])
+def test_ac11a_interrupt_exits_2_at_every_offset(
+    temp_telemetry: Path, delay: float
+) -> None:
+    # AC-11a/FR-11a/EC-10: every poll opens a connection and loads the reader
+    # extension, so there is a window ONCE PER POLL in which a signal lands
+    # inside DuckDB. DuckDB catches the exception our handler raises and
+    # substitutes RuntimeError("Query interrupted"), so `except _AwaitInterrupted`
+    # never matches and the wait exits 1 — which ADR-012 defines as a VERDICT.
+    # Ctrl-C would be reported to the caller as "the predicate did not come
+    # true": a false negative manufactured by the shutdown itself.
+    #
+    # AC-11's single fixed offset samples one point of a cycle that repeats
+    # every second, so it passed or failed by luck. Sweeping offsets covers both
+    # the sleep and the in-flight reader work.
+    proc = _subprocess.Popen(
+        [sys.executable, str(_OTELQ_PY), "--dir", str(temp_telemetry),
+         "await", "--timeout", "60s", "--poll", "1s", "logs"],
+        stdout=_subprocess.PIPE, stderr=_subprocess.PIPE, text=True,
+    )
+    _time.sleep(delay)
+    proc.send_signal(signal.SIGINT)
+    _, err = proc.communicate(timeout=60)
+    assert proc.returncode == 2, f"offset {delay}s exited {proc.returncode}:\n{err}"
+    assert "Traceback" not in err, f"offset {delay}s leaked a traceback:\n{err}"
+    assert _reason(err) == "interrupted"
+
+
 def test_ac12_no_poll_or_sleep_past_deadline(temp_telemetry: Path) -> None:
     # FR-3/EC-9: otelq must not sleep past the deadline. With a poll interval
     # near the budget, a naive implementation sleeps a full interval and

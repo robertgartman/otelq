@@ -190,6 +190,22 @@ and the correlation filters themselves, which are
   `--since` **must** be re-evaluated per poll when it is a trailing window, so a
   long wait does not drift into querying an ever-staler window.
 
+- **FR-11a — Interruption survives a swallowed exception.** The exit-`2`
+  guarantee of FR-11 **must not** depend on otelq's own exception reaching the
+  top of the wait loop. A signal delivered while control is inside a DuckDB call
+  is caught by DuckDB, which discards the raised exception and substitutes its
+  own error (`Query interrupted`), so the type is lost. otelq **must** therefore
+  record that a signal was received and treat **any** subsequent failure during
+  the wait as an interruption while that record stands.
+  - Every poll opens a connection and loads the reader extension, so this window
+    recurs once per poll for the whole wait — it is the common case, not a rare
+    race.
+  - Getting this wrong is worse than a crash: the wait exits `1`, which
+    [ADR-012](../adr/ADR-012-exit-codes-as-public-contract.md) defines as a
+    **verdict**. A caller that pressed Ctrl-C, or a supervisor that sent
+    `SIGTERM`, is told "the predicate did not come true" — a false negative
+    manufactured by the shutdown itself (INV-3).
+
 - **FR-11 — Interruption.** `SIGINT`/`SIGTERM` during a wait **must** exit `2`
   with reason `interrupted` and a short stderr message — never a Python
   traceback, and never a silent `0` that a caller would read as satisfied.
@@ -243,6 +259,11 @@ and the correlation filters themselves, which are
   single-shot query, which the caller should express directly.
 - **EC-8 — Aggregate predicate returning zero.** `sql "SELECT count(*) …"`
   yielding `0` is **not** satisfied (FR-2), and the wait continues.
+- **EC-10 — Signal delivered inside a DuckDB call.** A `SIGINT`/`SIGTERM`
+  arriving while a poll is inside the reader (connection setup, extension load,
+  or query execution) **must** still exit `2` with `interrupted` and **no**
+  traceback, exactly as one arriving while otelq sleeps between polls (FR-11a).
+
 - **EC-9 — Very long wait with a trailing `--since`.** The window is recomputed
   per poll (FR-10), so the wait cannot silently query a stale range.
 
@@ -303,6 +324,14 @@ and the correlation filters themselves, which are
   wraps a command whose signal has no data, then the friendly no-telemetry
   condition does **not** satisfy the wait; it times out with exit `1`.
   *Verification hint: `test_ac10_empty_store_is_not_satisfaction`.*
+- **AC-11a** (Verifies FR-11a, FR-11, EC-10, INV-3): Given waits interrupted by
+  `SIGINT` at a **range** of offsets spanning both the sleep between polls and
+  the in-flight reader work of a poll, when each is signalled, then **every** run
+  exits `2` with reason `interrupted` and prints no traceback. A single fixed
+  offset is insufficient: it samples one point in a cycle that repeats every
+  poll, so it passes or fails by luck of timing rather than by behaviour.
+  *Verification hint: `test_ac11a_interrupt_exits_2_at_every_offset`.*
+
 - **AC-11** (Verifies FR-11): Given a wait interrupted by `SIGINT`, when it is
   signalled, then it exits `2` with reason `interrupted` and no traceback.
   *Verification hint: `test_ac11_interrupted_wait_is_exit_2`; send the signal to
