@@ -266,14 +266,14 @@ usage: otelq [-h] [--version] [--dir DIR]
              [--format {table,json,jsonl,csv,compact}] [--all] [--no-cache]
              [--verbose] [--since SINCE] [--regex REGEX]
              [--session-id SESSION_ID] [--resource-attr KEY[=VALUE]]
-             [--all-worktrees]
-             {summary,sql,errors,slow,trace,logs,metric,history,triage,collector-config,doctor,troubleshoot,set_resource_attributes,help}
+             [--attr KEY[=VALUE]] [--all-worktrees]
+             {summary,sql,errors,slow,trace,logs,metric,await,history,triage,collector-config,doctor,troubleshoot,set_resource_attributes,help}
              ...
 
 Query OTLP telemetry captured by the dev OTel Collector.
 
 positional arguments:
-  {summary,sql,errors,slow,trace,logs,metric,history,triage,collector-config,doctor,troubleshoot,set_resource_attributes,help}
+  {summary,sql,errors,slow,trace,logs,metric,await,history,triage,collector-config,doctor,troubleshoot,set_resource_attributes,help}
     summary             counts and time span per signal
     sql                 run an ad-hoc SQL query
     errors              error spans and ERROR/FATAL logs
@@ -281,6 +281,10 @@ positional arguments:
     trace               all spans of one trace as a tree
     logs                filtered log records
     metric              time series for one metric
+    await               block until a wrapped query is satisfied or --timeout
+                        expires (exit 0 satisfied / 1 timed out / 2 error).
+                        Polls in-process, so the budget is real; a caller-side
+                        loop cannot measure its own spawn cost
     history             ranked past-query history — the templates most likely
                         to crack an investigation (triage assistant; also as
                         sql views history_queries/history_invocations)
@@ -324,6 +328,10 @@ options:
                         equals VALUE (exact match); omit =VALUE to match any
                         non-empty value. Repeatable (AND).
                         summary/errors/slow/trace/logs/metric only
+  --attr KEY[=VALUE]    keep only records whose OWN attribute KEY equals VALUE
+                        (span/log/metric attributes, chosen by signal) — as
+                        opposed to --resource-attr, which matches the
+                        producer. Same forms and rules; repeatable (AND)
   --all-worktrees       include every worktree's telemetry (disable default
                         worktree scoping)
 

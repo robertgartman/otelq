@@ -53,6 +53,7 @@ import os
 import re
 import shlex
 import shutil
+import signal as _signal  # aliased: `signal` is otelq's OTel-signal loop var
 import sys
 import tempfile
 import textwrap
@@ -80,6 +81,12 @@ if TYPE_CHECKING:
 # report exactly which build it is talking to. The trailing marker lets
 # release-please bump this line alongside pyproject.toml (see release-please.yml).
 __version__ = "1.0.0"  # x-release-please-version
+
+# Earliest instant otelq can observe. `await` measures its wait from here, so
+# the figure it reports is a LOWER BOUND on true wall-clock: interpreter and
+# dependency startup preceding module load are outside what we can see
+# (ADR-013). Stated as such rather than presented as exact.
+_PROCESS_T0 = time.monotonic()
 
 # Public surface of this single-file module. The CLI entry is `main`; the rest
 # is the API the test suite pins. The trailing group is deliberately exported
@@ -494,6 +501,8 @@ REASON_STORE_UNREADABLE = "store_unreadable"
 REASON_QUERY_ERROR = "query_error"
 REASON_USAGE_ERROR = "usage_error"
 REASON_INTERNAL_ERROR = "internal_error"
+REASON_INTERRUPTED = "interrupted"
+REASON_TIMEOUT = "timeout"
 
 _MACHINE_FORMATS = frozenset({"json", "jsonl", "compact"})
 
@@ -814,10 +823,13 @@ def create_unified_metrics_view(conn: duckdb.DuckDBPyConnection) -> None:
         if tbl not in have:
             continue
         ra = "resource_attributes" if _column_exists(conn, tbl, "resource_attributes") else "NULL"
+        # metric_attributes rides along too, so --attr (FR-42) resolves against
+        # the data point's own attributes for every metric type.
+        ma = "metric_attributes" if _column_exists(conn, tbl, "metric_attributes") else "NULL"
         parts.append(
             f"SELECT time_unix_nano, service_name, name, unit, "
             f"{value} AS value, '{mtype}' AS metric_type, "
-            f"{ra} AS resource_attributes FROM {tbl}"
+            f"{ra} AS resource_attributes, {ma} AS metric_attributes FROM {tbl}"
         )
     if parts:
         conn.execute("CREATE OR REPLACE VIEW metrics AS " + " UNION ALL ".join(parts))
@@ -856,6 +868,10 @@ Command = Callable[["duckdb.DuckDBPyConnection", argparse.Namespace], CommandRes
 # The min/max `timestamp` among a result's rows, for the FR-29 response header;
 # both are None for a zero-row result.
 TimeRange = tuple[datetime | None, datetime | None]
+# What `run_command` returns: rows plus everything the FR-29 header needs.
+RunResult = tuple[
+    list[str], list[Row], TimeRange, int | None, tuple[list[str], list[Row]] | None, str | None
+]
 
 
 def _one_row(rel: duckdb.DuckDBPyConnection) -> Row:
@@ -2022,6 +2038,8 @@ def _format_response_header(
     regex_removed: int | None = None,
     worktree_banner: str | None = None,
     resource_attrs: list[_ResourceAttrFilter] | None = None,
+    record_attrs: list[_ResourceAttrFilter] | None = None,
+    waited: str | None = None,
 ) -> str:
     """Render the FR-29 response header: a fixed plain-text block naming the
     command, format, OpenTelemetry signal(s), absolute telemetry directory, UTC
@@ -2054,6 +2072,13 @@ def _format_response_header(
         # it from the invocation.
         rendered = ", ".join(f.render() for f in resource_attrs)
         lines.append(f"Resource filter applied: {rendered}")
+    if record_attrs:
+        # Kept SEPARATE from the line above (FR-42): a producer-level filter and
+        # a record-level one are different claims about the data.
+        rendered = ", ".join(f.render() for f in record_attrs)
+        lines.append(f"Attribute filter applied: {rendered}")
+    if waited is not None:
+        lines.append(waited)  # FR-7: the wait, measured inside otelq
     if regex is not None:
         lines.append(f"Regex filter applied: {regex}")
         lines.append(f"Rows removed by regex: {regex_removed}")
@@ -2105,9 +2130,7 @@ def _resolve_regex_arg(args: argparse.Namespace) -> re.Pattern[str] | None:
 
 def run_command(
     args: argparse.Namespace, regex: re.Pattern[str] | None
-) -> tuple[
-    list[str], list[Row], TimeRange, int | None, tuple[list[str], list[Row]] | None, str | None
-]:
+) -> RunResult:
     """Plan, build the connection, dispatch, and apply trace/metric cold-fallback.
 
     `regex` (already compiled and scope-validated by the caller, FR-32) is
@@ -2406,28 +2429,31 @@ class _ResourceAttrFilter(NamedTuple):
         return self.key if self.value is None else f"{self.key}={self.value}"
 
 
-def _parse_resource_attr_args(args: argparse.Namespace) -> list[_ResourceAttrFilter]:
-    """Validate and parse `--resource-attr` (FR-40).
+def _parse_attr_args(
+    args: argparse.Namespace, dest: str, flag: str, column_hint: str
+) -> list[_ResourceAttrFilter]:
+    """Validate and parse `--resource-attr` (FR-40) / `--attr` (FR-42).
 
+    One routine for both, because FR-42 requires their handling to be identical.
     A real error for a malformed term or an unsupported command, never a silent
     no-op: an explicit filter that is quietly ignored would hand the caller a
     result set it believes is scoped when it is not.
     """
-    raw: list[str] = list(getattr(args, "resource_attr", None) or [])
+    raw: list[str] = list(getattr(args, dest, None) or [])
     if not raw:
         return []
-    if args.command not in _RESOURCE_ATTR_COMMANDS:
+    command = _await_inner_command(args)
+    if command not in _RESOURCE_ATTR_COMMANDS:
         supported = ", ".join(sorted(_RESOURCE_ATTR_COMMANDS))
         hint = (
-            f" — in `sql`, filter with {_RESOURCE_ATTR_MACRO}(resource_attributes, "
+            f" — in `sql`, filter with {_RESOURCE_ATTR_MACRO}({column_hint}, "
             "'<key>') instead"
-            if args.command == "sql"
+            if command == "sql"
             else ""
         )
         _fail(
             REASON_USAGE_ERROR,
-            f"--resource-attr is not supported for '{args.command}' "
-            f"(only: {supported}){hint}",
+            f"{flag} is not supported for '{command}' (only: {supported}){hint}",
         )
     filters: list[_ResourceAttrFilter] = []
     for term in raw:
@@ -2435,7 +2461,7 @@ def _parse_resource_attr_args(args: argparse.Namespace) -> list[_ResourceAttrFil
         if not key:
             _fail(
                 REASON_USAGE_ERROR,
-                f"invalid --resource-attr '{term}': expected <key> or <key>=<value>",
+                f"invalid {flag} '{term}': expected <key> or <key>=<value>",
             )
         if sep and not value:
             # An empty stored value reads as ABSENT (FR-41), so asking for one
@@ -2443,28 +2469,51 @@ def _parse_resource_attr_args(args: argparse.Namespace) -> list[_ResourceAttrFil
             # silently empty result the caller would read as "no such run".
             _fail(
                 REASON_USAGE_ERROR,
-                f"invalid --resource-attr '{term}': empty value — an empty "
-                f"attribute reads as absent; use '{key}' alone to match any "
-                "non-empty value",
+                f"invalid {flag} '{term}': empty value — an empty attribute "
+                f"reads as absent; use '{key}' alone to match any non-empty value",
             )
         filters.append(_ResourceAttrFilter(key, value if sep else None))
     return filters
 
 
-def _resource_attr_predicate(args: argparse.Namespace) -> tuple[str, list[str]]:
-    """The conjunctive WHERE fragment for `--resource-attr`, or ('', []).
+def _await_inner_command(args: argparse.Namespace) -> str:
+    """The command a filter actually applies to — `await`'s inner verb when
+    waiting, otherwise the invoked command itself."""
+    if args.command == "await":
+        inner: list[str] = list(getattr(args, "inner", None) or [])
+        return inner[0] if inner else "await"
+    return str(args.command)
 
-    Both the attribute key and its value are BOUND, never interpolated, so an
-    arbitrary caller-supplied key cannot reach the SQL text. Equality is exact:
-    a value that is a strict substring of another row's value must not match it.
+
+# The attributes column carried by each signal's records (FR-42). Chosen by the
+# SIGNAL being queried, never named by the caller, so `--attr step=x` means the
+# same thing whichever signal answers it.
+_RECORD_ATTR_COLUMNS: dict[str, str] = {
+    "traces": "span_attributes",
+    "logs": "log_attributes",
+    "metrics": "metric_attributes",
+}
+
+
+def _attr_terms(args: argparse.Namespace, slot: str) -> list[_ResourceAttrFilter]:
+    return list(getattr(args, slot, None) or [])
+
+
+def _attr_fragment(
+    filters: list[_ResourceAttrFilter], column: str
+) -> tuple[str, list[str]]:
+    """Conjunctive exact-match fragment over one JSON attributes column.
+
+    Both the key and the value are BOUND, never interpolated, so a caller-supplied
+    key cannot reach the SQL text. Equality is exact: a value that is a strict
+    substring of another row's value must not match it.
     """
-    filters: list[_ResourceAttrFilter] = list(getattr(args, "_resource_attrs", None) or [])
     if not filters:
         return "", []
     parts: list[str] = []
     params: list[str] = []
     for flt in filters:
-        expr = f"{_RESOURCE_ATTR_MACRO}(resource_attributes, ?)"
+        expr = f"{_RESOURCE_ATTR_MACRO}({column}, ?)"
         if flt.value is None:
             parts.append(f"{expr} IS NOT NULL")
             params.append(flt.key)
@@ -2474,22 +2523,73 @@ def _resource_attr_predicate(args: argparse.Namespace) -> tuple[str, list[str]]:
     return "(" + " AND ".join(parts) + ")", params
 
 
+def _record_attr_predicate(
+    args: argparse.Namespace, signal: str
+) -> tuple[str, list[str]]:
+    """`--attr` (FR-42) against the signal's own record-attributes column.
+
+    Distinct from `--resource-attr` on purpose: a Resource attribute identifies
+    the PRODUCER, a record attribute distinguishes one event WITHIN it. Matching
+    one against the other would let a mis-instrumented producer read as a false
+    positive.
+    """
+    filters = _attr_terms(args, "_record_attrs")
+    column = _RECORD_ATTR_COLUMNS.get(signal)
+    if not filters or column is None:
+        return "", []
+    return _attr_fragment(filters, column)
+
+
+def _resource_attr_predicate(args: argparse.Namespace) -> tuple[str, list[str]]:
+    """The conjunctive WHERE fragment for `--resource-attr`, or ('', []).
+
+    Both the attribute key and its value are BOUND, never interpolated, so an
+    arbitrary caller-supplied key cannot reach the SQL text. Equality is exact:
+    a value that is a strict substring of another row's value must not match it.
+    """
+    return _attr_fragment(_attr_terms(args, "_resource_attrs"), "resource_attributes")
+
+
 def _where_of(flt: tuple[str, list[str]]) -> tuple[str, list[str]]:
     """Render a (fragment, params) pair as a ` WHERE ...` clause, or ('', [])."""
     frag, params = flt
     return (f" WHERE {frag}", list(params)) if frag else ("", [])
 
 
-def _scope_predicate(args: argparse.Namespace) -> tuple[str, list[str]]:
+def _scope_predicate_no_worktree(
+    args: argparse.Namespace, signal: str
+) -> tuple[str, list[str]]:
+    """The explicit correlation filters only (FR-40 + FR-42), without worktree
+    scoping — for `summary` and `trace`, which are never worktree-scoped."""
+    frags: list[str] = []
+    params: list[str] = []
+    for frag, prm in (
+        _resource_attr_predicate(args),
+        _record_attr_predicate(args, signal),
+    ):
+        if frag:
+            frags.append(frag)
+            params.extend(prm)
+    return " AND ".join(frags), params
+
+
+def _scope_predicate(
+    args: argparse.Namespace, signal: str = ""
+) -> tuple[str, list[str]]:
     """Every WHERE fragment a signal command must apply, ANDed in a fixed order.
 
     Single choke point so each command splices one fragment and one param list
-    rather than juggling two; worktree scoping and `--resource-attr` compose
-    conjunctively (FR-40).
+    rather than juggling three; worktree scoping, `--resource-attr` (FR-40) and
+    `--attr` (FR-42) all compose conjunctively. `signal` selects the record
+    attributes column and is omitted only where `--attr` does not apply.
     """
     frags: list[str] = []
     params: list[str] = []
-    for frag, prm in (_worktree_predicate(args), _resource_attr_predicate(args)):
+    for frag, prm in (
+        _worktree_predicate(args),
+        _resource_attr_predicate(args),
+        _record_attr_predicate(args, signal),
+    ):
         if frag:
             frags.append(frag)
             params.extend(prm)
@@ -2626,13 +2726,15 @@ def cmd_summary(
     rows: list[Row] = []
     # summary is unscoped by worktree (INV-3) but DOES honor an explicit
     # --resource-attr filter (FR-40): the caller asked for one run's map.
-    flt = _resource_attr_predicate(args)
+    def flt(signal: str) -> tuple[str, list[str]]:
+        return _scope_predicate_no_worktree(args, signal)
+
     if _has_rows(conn, "traces"):
-        rows += _summary_traces(conn, flt)
+        rows += _summary_traces(conn, flt("traces"))
     if _has_rows(conn, "logs"):
-        rows += _summary_logs(conn, flt)
+        rows += _summary_logs(conn, flt("logs"))
     if _has_rows(conn, "metrics"):
-        rows += _summary_metrics(conn, flt)
+        rows += _summary_metrics(conn, flt("metrics"))
     if not rows:  # no signal has data -> friendly empty-telemetry path (FR-18)
         raise NoTelemetryError(_NO_TELEMETRY_MSG)
     return columns, rows
@@ -2805,26 +2907,30 @@ def cmd_errors(
     # not require a second sql lookup. A log with no trace context carries its
     # raw (empty) value.
     columns = ["kind", "timestamp", "service_name", "label", "detail", "trace_id"]
-    # Worktree scoping (FR-5): AND the mine-or-untagged predicate onto each arm's
-    # own WHERE; the param repeats once per arm, in union order.
-    pred, pred_params = _scope_predicate(args)
-    scope = f" AND {pred}" if pred else ""
+    # Worktree scoping (FR-5) and the correlation filters (FR-40/FR-42): AND
+    # onto each arm's own WHERE; params repeat once per arm, in union order.
+    # `errors` spans two signals, so each arm resolves --attr against ITS OWN
+    # record-attributes column (FR-42) rather than sharing one fragment.
     arms: list[str] = []
     params: list[str] = []
     if _has_rows(conn, "traces"):
+        pred, pred_params = _scope_predicate(args, "traces")
         arms.append(
             "SELECT 'span' AS kind, start_time_unix_nano AS timestamp, "
             "service_name, name AS label, status_status_message AS detail, "
-            "trace_id FROM traces WHERE status_code = 2" + scope
+            "trace_id FROM traces WHERE status_code = 2"
+            + (f" AND {pred}" if pred else "")
         )
         params.extend(pred_params)
     if _has_rows(conn, "logs"):
         # FR-4: match case-insensitively. severity_text carries inconsistent
         # casing in practice (e.g. "Error"), so fold before comparing (cf. FR-2).
+        pred, pred_params = _scope_predicate(args, "logs")
         arms.append(
             "SELECT 'log' AS kind, time_unix_nano AS timestamp, service_name, "
             "severity_text AS label, body AS detail, trace_id "
-            "FROM logs WHERE upper(severity_text) IN ('ERROR', 'FATAL')" + scope
+            "FROM logs WHERE upper(severity_text) IN ('ERROR', 'FATAL')"
+            + (f" AND {pred}" if pred else "")
         )
         params.extend(pred_params)
     if not arms:
@@ -2846,7 +2952,7 @@ def cmd_slow(
 ) -> CommandResult:
     _require(conn, "traces")
     columns = ["timestamp", "service_name", "span_name", "duration_ms", "trace_id"]
-    pred, pred_params = _scope_predicate(args)  # FR-5
+    pred, pred_params = _scope_predicate(args, "traces")  # FR-5/FR-40/FR-42
     where = f" WHERE {pred}" if pred else ""
     rows = _limited(
         conn,
@@ -2909,7 +3015,7 @@ def cmd_trace(
     # explicit --resource-attr filter does apply (FR-40) — an explicitly
     # requested filter that is silently dropped is worse than a narrowed tree,
     # and the header discloses it (FR-29).
-    frag, fparams = _resource_attr_predicate(args)
+    frag, fparams = _scope_predicate_no_worktree(args, "traces")
     extra = f" AND {frag}" if frag else ""
     spans = conn.execute(
         f"SELECT span_id, parent_span_id, name AS span_name, service_name, "
@@ -2970,7 +3076,7 @@ def cmd_logs(
         # both sides keeping it case-insensitive.
         where.append("contains(lower(body), lower(?))")
         params.append(args.grep)
-    pred, pred_params = _scope_predicate(args)  # FR-5
+    pred, pred_params = _scope_predicate(args, "logs")  # FR-5/FR-40/FR-42
     if pred:
         where.append(pred)
         params.extend(pred_params)
@@ -3004,7 +3110,7 @@ def cmd_metric(
         "value",
         "metric_unit",
     ]
-    pred, pred_params = _scope_predicate(args)  # FR-5
+    pred, pred_params = _scope_predicate(args, "metrics")  # FR-5/FR-40/FR-42
     scope = f" AND {pred}" if pred else ""
     rows = _limited(
         conn,
@@ -3495,6 +3601,16 @@ def build_parser() -> argparse.ArgumentParser:
         "(exact match); omit =VALUE to match any non-empty value. Repeatable "
         "(AND). summary/errors/slow/trace/logs/metric only",
     )
+    # --attr is the RECORD-level sibling of --resource-attr (FR-42): the column
+    # follows the signal being queried, so the caller never names one.
+    parser.add_argument(
+        "--attr",
+        action="append",
+        metavar="KEY[=VALUE]",
+        help="keep only records whose OWN attribute KEY equals VALUE (span/log/"
+        "metric attributes, chosen by signal) — as opposed to --resource-attr, "
+        "which matches the producer. Same forms and rules; repeatable (AND)",
+    )
     parser.add_argument(
         "--all-worktrees",
         action="store_true",
@@ -3533,6 +3649,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_metric.add_argument("name", help="metric name")
     p_metric.add_argument(
         "--top", type=_non_negative_int, default=_DEFAULT_TOP, help="rows to show"
+    )
+    p_await = sub.add_parser(
+        "await",
+        help="block until a wrapped query is satisfied or --timeout expires "
+        "(exit 0 satisfied / 1 timed out / 2 error). Polls in-process, so the "
+        "budget is real; a caller-side loop cannot measure its own spawn cost",
+    )
+    p_await.add_argument(
+        "--timeout",
+        required=True,
+        metavar="DURATION",
+        help="REQUIRED wall-clock budget (Ns/Nm/Nh/Nd). Total may exceed it by "
+        "at most one poll: an in-flight query is never interrupted",
+    )
+    p_await.add_argument(
+        "--poll",
+        default="1s",
+        metavar="DURATION",
+        help="delay BETWEEN polls (default 1s); the first poll runs immediately",
+    )
+    p_await.add_argument(
+        "inner",
+        nargs=argparse.REMAINDER,
+        metavar="COMMAND ...",
+        help="the command to wait on, written exactly as on its own, e.g. "
+        "`logs --grep started`",
     )
     p_history = sub.add_parser(
         "history",
@@ -4486,7 +4628,12 @@ def _dispatch(args: argparse.Namespace) -> int:
     args._session_supplied = session_supplied
     args.session_id = resolve_session_id(args)
     regex = _resolve_regex_arg(args)
-    args._resource_attrs = _parse_resource_attr_args(args)  # FR-40
+    args._resource_attrs = _parse_attr_args(  # FR-40
+        args, "resource_attr", "--resource-attr", "resource_attributes"
+    )
+    args._record_attrs = _parse_attr_args(  # FR-42
+        args, "attr", "--attr", "log_attributes"
+    )
     if args.command == "collector-config":
         print(render_collector_config())
         return 0
@@ -4518,15 +4665,29 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
     if args.command == "triage":
         return _run_triage(args, session_supplied)
+    if args.command == "await":
+        return _run_await(args)
     try:
-        columns, rows, time_range, regex_removed, services, worktree_banner = (
-            run_command(args, regex)
-        )
+        result = run_command(args, regex)
     except NoTelemetryError as exc:
         _history_note_rows(0)
         print(exc, file=sys.stderr)
         return 0
-    _history_note_rows(len(rows))
+    _history_note_rows(len(result[1]))
+    _render_command_result(args, result)
+    return 0
+
+
+def _render_command_result(
+    args: argparse.Namespace, result: RunResult, waited: str | None = None
+) -> None:
+    """Print a command's FR-29 header and FR-10 payload to stdout.
+
+    Factored out of `_dispatch` so `await` renders its satisfying poll exactly
+    as a plain invocation would — INV-4: waiting changes *when* a result is
+    produced, never *what* it is.
+    """
+    columns, rows, time_range, regex_removed, services, worktree_banner = result
     if args.command in _HEADER_COMMANDS:
         print(
             _format_response_header(
@@ -4540,6 +4701,8 @@ def _dispatch(args: argparse.Namespace) -> int:
                 regex_removed,
                 worktree_banner,
                 getattr(args, "_resource_attrs", None),
+                getattr(args, "_record_attrs", None),
+                waited,
             )
         )
     print(format_output(columns, rows, args.format))
@@ -4552,7 +4715,198 @@ def _dispatch(args: argparse.Namespace) -> int:
         print()
         print(_SUMMARY_SERVICE_LABEL)
         print(format_output(service_columns, service_rows, args.format))
-    return 0
+
+
+# --- await: bounded waiting (SPEC-otelq-await / ADR-013) ---------------------
+
+# The inner commands `await` may wrap: those that read the store and return
+# rows. `sql` is included deliberately — it is the only way to express a
+# predicate the built-in verbs cannot (FR-8).
+_AWAIT_INNER_COMMANDS = frozenset(_HEADER_COMMANDS | {"sql"})
+
+# Global flags that must govern every poll exactly as they would a single
+# invocation (FR-10). Copied onto the inner namespace rather than re-serialised
+# into argv, so no flag can be lost in translation.
+_AWAIT_GLOBAL_ATTRS = (
+    "dir", "format", "all", "no_cache", "since", "regex", "session_id",
+    "resource_attr", "attr", "all_worktrees", "verbose",
+    "_resource_attrs", "_record_attrs", "_session_supplied",
+)
+
+
+class _AwaitInterrupted(Exception):
+    """SIGINT/SIGTERM arrived mid-wait (FR-11)."""
+
+
+def _await_duration(value: str, flag: str) -> float:
+    """Parse an await duration, reusing the `--since` grammar (FR-1)."""
+    delta = _parse_since(value)
+    if delta is None or delta.total_seconds() <= 0:
+        _fail(
+            REASON_USAGE_ERROR,
+            f"invalid {flag} '{value}' (use a positive Ns/Nm/Nh/Nd, e.g. 60s, 2m)",
+        )
+    return delta.total_seconds()
+
+
+def _await_satisfied(columns: list[str], rows: list[Row]) -> bool:
+    """FR-2. At least one row — and a lone scalar cell must also be TRUTHY.
+
+    The scalar clause is the whole reason this is not a bare row count. The
+    dominant predicate shape in an automated gate is `SELECT count(*) … WHERE …`,
+    which returns exactly one row whether the count is 0 or 500; under a bare
+    rows>0 rule such a wait would be satisfied instantly and always, making
+    `await` silently useless at precisely the call sites it exists to serve.
+    A multi-column or multi-row result is judged by presence alone, so this
+    only ever engages for `sql`.
+    """
+    if not rows:
+        return False
+    if len(rows) == 1 and len(columns) == 1 and len(rows[0]) == 1:
+        cell = rows[0][0]
+        if cell is None or isinstance(cell, bool) and not cell:
+            return False
+        if isinstance(cell, (int, float)) and not isinstance(cell, bool):
+            return cell != 0
+        if isinstance(cell, str):
+            return cell != ""
+    return True
+
+
+def _await_inner_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Parse `await`'s trailing argv into a normal command namespace (FR-8)."""
+    inner_argv: list[str] = list(getattr(args, "inner", None) or [])
+    if not inner_argv:
+        _fail(
+            REASON_USAGE_ERROR,
+            "await needs a command to wait on, e.g. "
+            "`await --timeout 60s logs --grep started`",
+        )
+    verb = inner_argv[0]
+    if verb not in _AWAIT_INNER_COMMANDS:
+        supported = ", ".join(sorted(_AWAIT_INNER_COMMANDS))
+        _fail(
+            REASON_USAGE_ERROR,
+            f"await cannot wait on '{verb}' (only: {supported})",
+        )
+    inner = build_parser().parse_args(inner_argv)
+    # Globals were parsed onto the OUTER namespace; carry them across verbatim
+    # so every poll sees the same window, store, filters and format (FR-10).
+    for attr in _AWAIT_GLOBAL_ATTRS:
+        if hasattr(args, attr):
+            setattr(inner, attr, getattr(args, attr))
+    return inner
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+def _await_timing_object(
+    ok: bool, waited_ms: int, polls: int, timeout_ms: int
+) -> str:
+    return json.dumps(
+        {
+            "otelq_version": __version__,
+            "ok": ok,
+            "satisfied_after_ms": waited_ms if ok else None,
+            "waited_ms": waited_ms,
+            "polls": polls,
+            "timeout_ms": timeout_ms,
+        },
+        separators=(",", ":"),
+    )
+
+
+def _run_await(args: argparse.Namespace) -> int:
+    """Poll the inner command until satisfied or the deadline passes.
+
+    ADR-013: this is bounded waiting inside ONE foreground invocation — no
+    daemon, no registration, nothing surviving the process. Each poll is an
+    independent read of the store, which is what makes a mid-wait arrival
+    observable (FR-5); reusing a materialised snapshot would report a timeout
+    indistinguishable from a real one.
+    """
+    timeout_s = _await_duration(args.timeout, "--timeout")
+    poll_s = _await_duration(args.poll, "--poll")
+    if poll_s > timeout_s:
+        _fail(
+            REASON_USAGE_ERROR,
+            f"--poll {args.poll} exceeds --timeout {args.timeout}: that can only "
+            "ever run a single poll",
+        )
+    inner = _await_inner_args(args)
+    regex = _resolve_regex_arg(inner)
+    # FR-12: ONE history record for the whole wait, filed under the INNER
+    # command — that is the analytical act a later triage would want to repeat.
+    # Per-poll records would swamp the ranking evidence (ADR-009).
+    args._history_args = inner
+
+    def _on_signal(signum: int, frame: object) -> NoReturn:
+        raise _AwaitInterrupted()
+
+    previous = [
+        (sig, _signal.signal(sig, _on_signal))
+        for sig in (_signal.SIGINT, _signal.SIGTERM)
+    ]
+    deadline = _PROCESS_T0 + timeout_s
+    polls = 0
+    try:
+        while True:
+            # FR-38 each poll: the store can vanish mid-wait (EC-4), and that is
+            # a failure to observe (exit 2), not "not yet" (exit 1).
+            _require_store(inner.dir)
+            polls += 1
+            try:
+                result = run_command(inner, regex)
+                satisfied = _await_satisfied(result[0], result[1])
+            except NoTelemetryError:
+                # EC-6: "nothing captured" is precisely what the caller is
+                # waiting to stop being true, so it is NOT satisfaction.
+                satisfied = False
+                result = None
+            waited_ms = int((time.monotonic() - _PROCESS_T0) * 1000)
+            if satisfied and result is not None:
+                _history_note_rows(len(result[1]))
+                if args.format in _MACHINE_FORMATS:
+                    print(
+                        _await_timing_object(True, waited_ms, polls, int(timeout_s * 1000)),
+                        file=sys.stderr,
+                    )
+                _render_command_result(
+                    inner, result, waited=f"Waited: {waited_ms}ms ({_plural(polls, 'poll')})"
+                )
+                return 0
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            # FR-3: never sleep past the deadline, and never START a poll after
+            # it. otelq cannot interrupt a poll already in flight, so overshoot
+            # is bounded by one poll's duration — documented, not implied.
+            time.sleep(min(poll_s, deadline - now))
+            if time.monotonic() >= deadline:
+                break
+    except _AwaitInterrupted:
+        _fail(REASON_INTERRUPTED, "interrupted while waiting")
+    finally:
+        for sig, handler in previous:
+            _signal.signal(sig, handler)
+
+    waited_ms = int((time.monotonic() - _PROCESS_T0) * 1000)
+    _history_note_rows(0)
+    if args.format in _MACHINE_FORMATS:
+        print(
+            _await_timing_object(False, waited_ms, polls, int(timeout_s * 1000)),
+            file=sys.stderr,
+        )
+    # A timeout is a VERDICT (exit 1), not a failure to answer (exit 2): otelq
+    # was asked whether this would happen in time and answered no.
+    print(
+        f"otelq: {REASON_TIMEOUT}: not satisfied within {args.timeout} "
+        f"(waited {waited_ms}ms over {_plural(polls, 'poll')})",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def _help_for(parser: argparse.ArgumentParser, topic: str | None) -> int:
@@ -4620,7 +4974,7 @@ def _run(args: argparse.Namespace) -> int:
         # maintenance, kept off the critical path by ordering — the same rule
         # ADR-008 applies to cache sealing). Only commands that completed
         # normally are recorded; _history_record is best-effort throughout.
-        _history_record(args, code, time.monotonic_ns() - t0)
+        _history_record(getattr(args, "_history_args", args), code, time.monotonic_ns() - t0)
         return code
     except BrokenPipeError:
         # Downstream closed the pipe (e.g. `otelq ... | head`). Point stdout at

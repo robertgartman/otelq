@@ -3337,7 +3337,9 @@ def test_sessionization_survives_interleaved_concurrent_agents(
 
 
 # --- worktree scoping (SPEC-otelq-worktree-scoping / ADR-011) -----------------
+import signal  # noqa: E402
 import subprocess as _subprocess  # noqa: E402
+import threading  # noqa: E402
 
 
 def _tag_worktree(
@@ -4253,3 +4255,385 @@ def test_ac87_help_documents_the_macro_as_otelq_specific() -> None:
     text = buf.getvalue()
     assert "resource_attr(" in text
     assert "otelq" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# FR-42 — --attr, the RECORD-level sibling of --resource-attr.
+#
+# A Resource attribute identifies the PRODUCER (the correlation spine for a
+# whole run); a record attribute distinguishes one event from another WITHIN
+# that producer. Conflating them would let a mis-instrumented producer read as
+# a false positive, so the two namespaces must never cross.
+# ---------------------------------------------------------------------------
+
+
+def _tag_record(obj: dict[str, Any], **attrs: str) -> dict[str, Any]:
+    """Append attributes onto the individual span / log record / data point
+    (not the Resource). `__` stands in for `.` in keys."""
+    pairs = [
+        {"key": k.replace("__", "."), "value": {"stringValue": v}}
+        for k, v in attrs.items()
+    ]
+    for rkey, skey, rec in (
+        ("resourceSpans", "scopeSpans", "spans"),
+        ("resourceLogs", "scopeLogs", "logRecords"),
+        ("resourceMetrics", "scopeMetrics", "metrics"),
+    ):
+        for entry in obj.get(rkey, []):
+            for scope in entry.get(skey, []):
+                for item in scope.get(rec, []):
+                    if rec == "metrics":
+                        for dp in item.get("gauge", {}).get("dataPoints", []):
+                            dp.setdefault("attributes", []).extend(pairs)
+                    else:
+                        item.setdefault("attributes", []).extend(pairs)
+    return obj
+
+
+def test_ac88_attr_selects_the_signal_appropriate_column(temp_telemetry: Path) -> None:
+    # FR-42: the attribute column follows the SIGNAL — log_attributes for logs,
+    # span_attributes for traces — so the caller never names a column and the
+    # same --attr means the same thing whichever signal answers it.
+    base = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            _tag_record(make_log(base, service="log-hit", body="x"), step="pair-node"),
+            _tag_record(make_log(base, service="log-miss", body="x"), step="other"),
+        ],
+    )
+    write_jsonl(
+        temp_telemetry / "traces.jsonl",
+        [
+            _tag_record(
+                make_span(base, trace_id="t1", span_id="s1", service="span-hit", duration_ms=9000),
+                step="pair-node",
+            ),
+            _tag_record(
+                make_span(base, trace_id="t2", span_id="s2", service="span-miss", duration_ms=9000),
+                step="other",
+            ),
+        ],
+    )
+    flag = ("--attr", "step=pair-node")
+    assert _services(_run(temp_telemetry, "--all", *flag, "logs")) == {"log-hit"}
+    assert _services(_run(temp_telemetry, "--all", *flag, "slow")) == {"span-hit"}
+
+
+def test_ac89_record_and_resource_attributes_never_cross(temp_telemetry: Path) -> None:
+    # FR-42/FR-40: same key, different namespace. --attr must not see a Resource
+    # attribute, and --resource-attr must not see a record attribute.
+    base = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            _tag_record(make_log(base, service="on-record", body="x"), k="v"),
+            _tag_resource(make_log(base, service="on-resource", body="x"), k="v"),
+        ],
+    )
+    assert _services(_run(temp_telemetry, "--all", "--attr", "k=v", "logs")) == {"on-record"}
+    assert _services(
+        _run(temp_telemetry, "--all", "--resource-attr", "k=v", "logs")
+    ) == {"on-resource"}
+
+
+def test_ac90_attr_and_resource_filters_are_disclosed_separately(
+    temp_telemetry: Path,
+) -> None:
+    # FR-29/FR-42: two distinct header lines, and the filters AND together.
+    base = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            _tag_record(
+                _tag_resource(make_log(base, service="both", body="x"), run="r1"),
+                step="s1",
+            ),
+            _tag_record(
+                _tag_resource(make_log(base, service="wrong-step", body="x"), run="r1"),
+                step="s2",
+            ),
+        ],
+    )
+    out = _run(
+        temp_telemetry, "--all", "--resource-attr", "run=r1", "--attr", "step=s1", "logs"
+    )
+    header = _header_of(out)
+    assert "Resource filter applied: run=r1" in header
+    assert "Attribute filter applied: step=s1" in header
+    assert _services(out) == {"both"}
+
+
+def test_ac91_attr_validation_matches_resource_attr(temp_telemetry: Path) -> None:
+    # FR-42/FR-37: identical handling to --resource-attr — never a silent no-op.
+    import io as _io
+    from contextlib import redirect_stderr
+
+    for argv in (
+        ["--attr", "k=v", "sql", "SELECT 1"],
+        ["--attr", "k=v", "doctor"],
+        ["--attr", "=v", "logs"],
+        ["--attr", "k=", "logs"],
+    ):
+        err = _io.StringIO()
+        with redirect_stderr(err):
+            code = otelq.main(["--dir", str(temp_telemetry), *argv])
+        assert code == 2, argv
+        assert "otelq: usage_error: " in err.getvalue(), argv
+
+
+# ---------------------------------------------------------------------------
+# SPEC-otelq-await — bounded waiting (ADR-013).
+#
+# A caller-side poll loop cannot honour its own budget: it counts its sleeps but
+# not the per-iteration process spawn. These tests pin the properties bash
+# cannot provide — an immediate first poll, genuinely re-reading the store each
+# poll, a bounded deadline, and errors that abort instead of burning the budget.
+# ---------------------------------------------------------------------------
+
+
+def _await_cli(*argv: str, **kw: Any) -> tuple[float, _subprocess.CompletedProcess[str]]:
+    """Run otelq as a real process, returning (elapsed_seconds, completed)."""
+    t0 = _time.monotonic()
+    proc = _cli(*argv, **kw)
+    return _time.monotonic() - t0, proc
+
+
+@pytest.mark.parametrize(
+    "argv,why",
+    [
+        pytest.param(["await", "logs"], "missing --timeout", id="no-timeout"),
+        pytest.param(["await", "--timeout", "10x", "logs"], "bad duration", id="bad-duration"),
+        pytest.param(["await", "--timeout", "0s", "logs"], "zero budget", id="zero-timeout"),
+        pytest.param(
+            ["await", "--timeout", "1s", "--poll", "5s", "logs"], "poll > timeout", id="poll-gt-timeout"
+        ),
+        pytest.param(["await", "--timeout", "5s", "doctor"], "disallowed inner", id="bad-inner"),
+        pytest.param(["await", "--timeout", "5s", "await", "--timeout", "1s", "logs"], "nested", id="nested"),
+    ],
+)
+def test_ac1_await_argument_validation(argv: list[str], why: str, temp_telemetry: Path) -> None:
+    # FR-1/FR-8/EC-7/INV-5: --timeout is REQUIRED (a blocking call must state its
+    # budget) and waiting is always opt-in and always capped.
+    proc = _cli("--dir", str(temp_telemetry), *argv)
+    assert proc.returncode == 2, f"{why}: {proc.stderr}"
+    assert _reason(proc.stderr) == "usage_error", why
+
+
+def test_ac2_already_satisfied_returns_immediately(temp_telemetry: Path) -> None:
+    # FR-4/FR-7/EC-1: the FIRST poll runs before any sleep. The bash loop's
+    # guaranteed-miss first interval is exactly what this removes.
+    base = datetime.now(timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, service="ready", body="here")])
+    elapsed, proc = _await_cli(
+        "--dir", str(temp_telemetry), "--all", "await", "--timeout", "30s", "--poll", "10s",
+        "logs", "--grep", "here",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert elapsed < 10, f"waited a full poll interval before the first poll: {elapsed}s"
+    assert "Waited:" in proc.stdout
+    assert "ready" in proc.stdout
+
+
+def test_ac3_await_sees_telemetry_written_mid_wait(temp_telemetry: Path) -> None:
+    # FR-5/INV-2/INV-4/EC-2: each poll must genuinely re-read the store. A wait
+    # that re-queried one materialised snapshot would never see the event and
+    # would report a timeout indistinguishable from a real one.
+    base = datetime.now(timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, service="early", body="unrelated")])
+
+    def writer() -> None:
+        _time.sleep(2.0)
+        write_jsonl(
+            temp_telemetry / "logs.jsonl",
+            [make_log(datetime.now(timezone.utc), service="late", body="ARRIVED")],
+            append=True,
+        )
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    elapsed, proc = _await_cli(
+        "--dir", str(temp_telemetry), "--all", "await", "--timeout", "40s", "--poll", "1s",
+        "logs", "--grep", "ARRIVED",
+    )
+    thread.join(timeout=5)
+    assert proc.returncode == 0, proc.stderr
+    assert "ARRIVED" in proc.stdout  # INV-4: the inner result is unchanged
+    assert elapsed < 30, f"did not observe the mid-wait write promptly: {elapsed}s"
+
+
+def test_ac4_timeout_is_verdict_exit_1_within_budget(temp_telemetry: Path) -> None:
+    # FR-3/FR-6/FR-7/EC-3: a timeout is a VERDICT (exit 1), not a failure to
+    # answer (exit 2) — and the budget must be real, not merely asserted.
+    base = datetime.now(timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, service="s", body="nothing")])
+    elapsed, proc = _await_cli(
+        "--dir", str(temp_telemetry), "--all", "await", "--timeout", "3s", "--poll", "1s",
+        "logs", "--grep", "NEVER-APPEARS",
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert proc.stdout == ""
+    assert _reason(proc.stderr) == "timeout"
+    assert "poll" in proc.stderr
+    assert elapsed < 3 + 8, f"overshot the budget by more than one poll: {elapsed}s"
+
+
+def test_ac5_scalar_aggregate_is_judged_by_value(temp_telemetry: Path) -> None:
+    # FR-2/EC-8: THE trap. `SELECT count(*)` returns exactly one row whether the
+    # count is 0 or 500, so a bare rows>0 rule would satisfy instantly and always,
+    # making await silently useless at the call sites it exists to serve.
+    base = datetime.now(timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, service="s", body="present")])
+    _, unsatisfied = _await_cli(
+        "--dir", str(temp_telemetry), "--all", "await", "--timeout", "3s", "--poll", "1s",
+        "sql", "SELECT count(*) FROM logs WHERE body = 'absent'",
+    )
+    assert unsatisfied.returncode == 1, unsatisfied.stderr
+    _, satisfied = _await_cli(
+        "--dir", str(temp_telemetry), "--all", "await", "--timeout", "10s", "--poll", "1s",
+        "sql", "SELECT count(*) FROM logs WHERE body = 'present'",
+    )
+    assert satisfied.returncode == 0, satisfied.stderr
+
+
+def test_ac6_store_and_query_errors_abort_immediately(temp_telemetry: Path, tmp_path: Path) -> None:
+    # FR-6/EC-4/EC-5/INV-3: "your store is broken" and "it hasn't happened yet"
+    # are different facts. An error must not burn the budget nor be reported as
+    # a timeout — a gate that conflates them blames the system under test for
+    # its own instrumentation failing.
+    elapsed, missing = _await_cli(
+        "--dir", str(tmp_path / "absent"), "await", "--timeout", "60s", "--poll", "1s", "logs",
+    )
+    assert missing.returncode == 2, missing.stderr
+    assert _reason(missing.stderr) == "store_not_found"
+    assert elapsed < 20, f"burned the budget on a store error: {elapsed}s"
+
+    elapsed, bad_sql = _await_cli(
+        "--dir", str(temp_telemetry), "await", "--timeout", "60s", "--poll", "1s",
+        "sql", "SELEKT 1",
+    )
+    assert bad_sql.returncode == 2, bad_sql.stderr
+    assert _reason(bad_sql.stderr) == "query_error"
+    assert elapsed < 20, f"retried an unfixable query: {elapsed}s"
+
+
+def test_ac7_await_logs_by_log_and_resource_attribute(temp_telemetry: Path) -> None:
+    # FR-9/FR-10: a span is exported on END, so it cannot signal that work
+    # STARTED — a step that hangs forever emits no span at all. The start marker
+    # is a LOG RECORD, reachable by attribute rather than by body text.
+    base = datetime.now(timezone.utc)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            _tag_record(
+                _tag_resource(make_log(base, service="right", body="started"), smoke__run_id="r1"),
+                smoke__step="pair-node",
+            ),
+            _tag_record(
+                _tag_resource(make_log(base, service="wrong-run", body="started"), smoke__run_id="r2"),
+                smoke__step="pair-node",
+            ),
+            _tag_record(
+                _tag_resource(make_log(base, service="wrong-step", body="started"), smoke__run_id="r1"),
+                smoke__step="other",
+            ),
+        ],
+    )
+    proc = _cli(
+        "--dir", str(temp_telemetry), "--all",
+        "--resource-attr", "smoke.run_id=r1", "--attr", "smoke.step=pair-node",
+        "await", "--timeout", "10s", "--poll", "1s", "logs",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "right" in proc.stdout
+    assert "wrong-run" not in proc.stdout and "wrong-step" not in proc.stdout
+
+
+def test_ac8_await_emits_machine_timing_object(temp_telemetry: Path) -> None:
+    # FR-7: the elapsed wait, measured INSIDE otelq, is what makes a budget
+    # auditable rather than asserted — the number bash cannot produce.
+    base = datetime.now(timezone.utc)
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, service="s", body="present")])
+
+    def timing_of(proc: _subprocess.CompletedProcess[str]) -> dict[str, Any]:
+        objs = [
+            _json.loads(ln)
+            for ln in proc.stderr.splitlines()
+            if ln.startswith("{") and "polls" in ln
+        ]
+        assert len(objs) == 1, proc.stderr
+        return objs[0]
+
+    ok = _cli(
+        "--dir", str(temp_telemetry), "--all", "--format", "compact",
+        "await", "--timeout", "10s", "--poll", "1s", "logs", "--grep", "present",
+    )
+    assert ok.returncode == 0, ok.stderr
+    t = timing_of(ok)
+    assert t["ok"] is True
+    assert isinstance(t["satisfied_after_ms"], int) and t["polls"] >= 1
+    assert t["otelq_version"] == otelq.__version__ and t["timeout_ms"] == 10_000
+
+    late = _cli(
+        "--dir", str(temp_telemetry), "--all", "--format", "compact",
+        "await", "--timeout", "2s", "--poll", "1s", "logs", "--grep", "NEVER",
+    )
+    assert late.returncode == 1, late.stderr
+    t = timing_of(late)
+    assert t["ok"] is False and t["satisfied_after_ms"] is None
+    assert t["waited_ms"] >= 0 and t["polls"] >= 1
+    assert late.stdout == ""
+
+
+def test_ac9_await_records_one_history_entry(temp_telemetry: Path) -> None:
+    # FR-12/INV-1: a wait is ONE analytical act. Per-poll records would swamp
+    # the ranking evidence, and nothing else survives the invocation.
+    proc = _cli(
+        "--dir", str(temp_telemetry), "--session-id", "await-hist", "--all",
+        "await", "--timeout", "3s", "--poll", "1s", "logs", "--grep", "NEVER",
+    )
+    assert proc.returncode == 1, proc.stderr
+    rows = _cli(
+        "--dir", str(temp_telemetry), "--format", "compact",
+        "sql", "SELECT count(*) FROM history_invocations WHERE session_id = 'await-hist'",
+    )
+    assert rows.returncode == 0, rows.stderr
+    assert _json.loads(rows.stdout)["rows"] == [[1]]
+
+
+def test_ac10_empty_store_is_not_satisfaction(temp_telemetry: Path) -> None:
+    # FR-6/EC-6: "nothing captured" is precisely what the caller is waiting to
+    # stop being true, so the friendly empty path must not end the wait.
+    elapsed, proc = _await_cli(
+        "--dir", str(temp_telemetry), "await", "--timeout", "3s", "--poll", "1s", "logs",
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert _reason(proc.stderr) == "timeout"
+    assert elapsed >= 2, "returned before the deadline on an empty store"
+
+
+def test_ac11_interrupted_wait_is_exit_2(temp_telemetry: Path) -> None:
+    # FR-11: never a traceback, and never a silent 0 a caller would read as
+    # satisfied.
+    proc = _subprocess.Popen(
+        [sys.executable, str(_OTELQ_PY), "--dir", str(temp_telemetry),
+         "await", "--timeout", "60s", "--poll", "1s", "logs"],
+        stdout=_subprocess.PIPE, stderr=_subprocess.PIPE, text=True,
+    )
+    _time.sleep(3)
+    proc.send_signal(signal.SIGINT)
+    _, err = proc.communicate(timeout=30)
+    assert proc.returncode == 2, err
+    assert "Traceback" not in err
+    assert _reason(err) == "interrupted"
+
+
+def test_ac12_no_poll_or_sleep_past_deadline(temp_telemetry: Path) -> None:
+    # FR-3/EC-9: otelq must not sleep past the deadline. With a poll interval
+    # near the budget, a naive implementation sleeps a full interval and
+    # overshoots; the deadline must clamp it.
+    elapsed, proc = _await_cli(
+        "--dir", str(temp_telemetry), "await", "--timeout", "2s", "--poll", "2s", "logs",
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert elapsed < 2 + 8, f"slept past the deadline: {elapsed}s"

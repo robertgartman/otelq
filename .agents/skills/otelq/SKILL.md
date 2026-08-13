@@ -230,6 +230,33 @@ uvx otelq --dir .telemetry sql "DESCRIBE traces"
 uvx otelq --dir .telemetry sql "PRAGMA table_info('logs')"
 ```
 
+## Wait for something to arrive (`await`)
+
+Telemetry lands seconds after it is emitted (Collector batch + flush). Do **not**
+sleep-and-retry from the shell — otelq polls in-process, so the budget is real:
+
+```
+uvx otelq --dir .telemetry --resource-attr smoke.run_id=abc123 \
+  await --timeout 60s --poll 1s logs --attr smoke.step=pair-node
+```
+
+Exit `0` satisfied (the result is printed, with `Waited: <n>ms`), `1` the
+deadline passed unsatisfied, `2` the store or query failed. `--timeout` is
+required; the first poll runs immediately; total may exceed the timeout by at
+most one poll, since an in-flight query is not interrupted.
+
+Two things to get right:
+
+- **Await log records, not spans, for "did X start?"** An SDK exports a span on
+  span *end*, so a span cannot signal that work began — and a step that hangs
+  forever emits no span at all.
+- **A count is judged by value, not by row count.** `await sql "SELECT count(*)
+  …"` waits until the count is non-zero. It does not fire instantly just because
+  an aggregate always returns one row.
+
+A store error during a wait exits `2` immediately rather than burning the
+budget, so a timeout always means "not yet" and never "otelq was broken".
+
 ## Correlate by Resource attribute (`--resource-attr`)
 
 An OTel **Resource** attribute is the spine that ties one run's traces, logs and
@@ -244,6 +271,11 @@ Repeatable (terms AND together), **exact** match, dotted keys need no escaping.
 Omit `=VALUE` to match any non-empty value. Works on `summary`, `errors`,
 `slow`, `trace`, `logs`, `metric`, and is echoed in the response header so you
 can see what was filtered.
+
+`--resource-attr` matches the **producer**; `--attr` matches the **record**
+(span/log/metric attributes, column chosen by signal). Use `--resource-attr` for
+"which run", `--attr` for "which event within it". They never cross, so a
+mis-instrumented producer cannot read as a false positive.
 
 Exact match matters: `--resource-attr run=abc` must not pick up `abc-2`. Do
 **not** substitute `LIKE '%abc%'` — a run id that prefixes another id then
