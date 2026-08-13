@@ -8,6 +8,10 @@ output:
   - execution
   - execution_out
 
+# Hooks are installed into the repository's COMMON git dir (.git/hooks), which
+# every linked worktree resolves through — so `just hooks-install` is run ONCE
+# PER CLONE and covers every worktree and every branch automatically. It is not
+# per-worktree, and re-running it from a worktree is harmless.
 pre-commit:
   parallel: false
 
@@ -17,18 +21,49 @@ pre-commit:
     # .agents/skills/implement/SKILL.md Step 8 and in CI
     # (.github/workflows/ci.yml) — sequential, cheapest/fastest check first,
     # so a local pre-commit failure mirrors what CI would report.
+    #
+    # On globs: a command is SKIPPED ENTIRELY when no staged file matches, and
+    # the skip is silent. So every file that can break a check has to be listed,
+    # not just the sources:
+    #   - README.md      — pinned by test_readme_help_dump_matches_live_help, so
+    #                      a README-only edit can break the suite while running
+    #                      no checks at all.
+    #   - pyproject.toml — carries the ruff and pyright configuration.
+    #   - uv.lock        — the EXACT DuckDB pin (ADR-003); a bad resolve breaks
+    #                      every command.
+    #   - justfile / lefthook.yml / .github/workflows/*
+    #                    — these define how the code is validated. A mistake
+    #                      here disables the checks themselves, which is exactly
+    #                      the failure that must not pass silently.
 
     ruff-check:
       priority: 1
-      glob: "*.py"
+      glob:
+        - "*.py"
+        - "pyproject.toml"
+        - "justfile"
+        - "lefthook.yml"
+        - ".github/workflows/*"
       run: uvx ruff check .
 
     pyright:
       priority: 2
-      glob: "*.py"
+      glob:
+        - "*.py"
+        - "pyproject.toml"
+        - "justfile"
+        - "lefthook.yml"
+        - ".github/workflows/*"
       run: uvx pyright
 
     pytest:
       priority: 3
-      glob: "*.py"
+      glob:
+        - "*.py"
+        - "README.md"
+        - "pyproject.toml"
+        - "uv.lock"
+        - "justfile"
+        - "lefthook.yml"
+        - ".github/workflows/*"
       run: uv run --with pytest --with "duckdb==1.5.4" pytest tests/ -q

@@ -5245,7 +5245,18 @@ def _run_await(args: argparse.Namespace) -> int:
     # Per-poll records would swamp the ranking evidence (ADR-009).
     args._history_args = inner
 
+    # FR-11a: the exit-2 guarantee must not depend on this exception reaching
+    # the loop. A signal delivered while control is inside DuckDB is caught by
+    # DuckDB, which discards what we raised and substitutes its own
+    # RuntimeError("Query interrupted") — so the TYPE is lost. Every poll opens a
+    # connection and loads the reader extension, so that window recurs once per
+    # poll for the whole wait; it is the common case, not a rare race. The flag
+    # is the only evidence that survives.
+    interrupted = False
+
     def _on_signal(signum: int, frame: object) -> NoReturn:
+        nonlocal interrupted
+        interrupted = True
         raise _AwaitInterrupted()
 
     previous = [
@@ -5291,6 +5302,14 @@ def _run_await(args: argparse.Namespace) -> int:
                 break
     except _AwaitInterrupted:
         _fail(REASON_INTERRUPTED, "interrupted while waiting")
+    except Exception:
+        # FR-11a/EC-10. Without this the wait exits 1 — which ADR-012 defines as
+        # a VERDICT — so Ctrl-C would be reported to the caller as "the predicate
+        # did not come true": a false negative manufactured by the shutdown
+        # itself (INV-3). `_fail` raises SystemExit, which this never catches.
+        if interrupted:
+            _fail(REASON_INTERRUPTED, "interrupted while waiting")
+        raise
     finally:
         for sig, handler in previous:
             _signal.signal(sig, handler)
