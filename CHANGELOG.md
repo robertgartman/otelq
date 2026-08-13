@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.0.0](https://github.com/robertgartman/otelq/compare/v1.0.0...v2.0.0) (2026-08-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* a windowed query over a store whose records all predate the window now returns zero rows instead of the newest records regardless of age. Callers relying on the old behaviour to "always get something" should pass --all, or widen --since. Unbounded queries (--all, trace) are unaffected.
+
+### Features
+
+* --resource-attr correlation filter and resource_attr() SQL macro (R2) ([ae496ad](https://github.com/robertgartman/otelq/commit/ae496ad7b0b208cebb305796ea158683c72b6b0e))
+* add --resource-attr correlation filter and resource_attr() macro ([2fcfcb4](https://github.com/robertgartman/otelq/commit/2fcfcb46a50c95213dfa9b3518638971fe26c503))
+* add await for bounded waiting, and --attr for record attributes ([99b9436](https://github.com/robertgartman/otelq/commit/99b9436c7bc04cc370ee28936af1f689041bbee3))
+* await — bounded waiting, plus --attr for record attributes (R4) ([0c079b7](https://github.com/robertgartman/otelq/commit/0c079b7d5f5405cff3731337e1f3c0f0dba562f5))
+* disclose the window that was searched and whether data is arriving ([#36](https://github.com/robertgartman/otelq/issues/36)) ([9ad038a](https://github.com/robertgartman/otelq/commit/9ad038aefe261e6e5ba4494b1ef1337cbb93be61))
+* expose span-tree structure as queryable relations ([f48b613](https://github.com/robertgartman/otelq/commit/f48b613ce07f90c8aab794c245a1461de6e8d5b1))
+* measure the query window from wall-clock, not the newest record (ADR-015) ([#37](https://github.com/robertgartman/otelq/issues/37)) ([d467d3f](https://github.com/robertgartman/otelq/commit/d467d3f5e6aeec43c50e6aadfe199d754ada46fa))
+* otelq resolves the telemetry store itself, and says how ([#35](https://github.com/robertgartman/otelq/issues/35)) ([ee9943b](https://github.com/robertgartman/otelq/commit/ee9943b6769128e17e6e8fa31da8d15b8ec64da8))
+* span-tree relations (span_tree / span_edges) — R3 as capability, not verdict ([ad1ceb5](https://github.com/robertgartman/otelq/commit/ad1ceb5b574151364647d7b85ad828977bd7d3d3))
+
 ## [1.0.0](https://github.com/robertgartman/otelq/compare/v0.5.0...v1.0.0) (2026-08-12)
 
 
