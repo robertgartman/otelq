@@ -801,6 +801,65 @@ def _resource_attr_sql(key: str, column: str = "resource_attributes") -> str:
     return f"{_RESOURCE_ATTR_MACRO}({column}, {_sql_str(key)})"
 
 
+# --- span-tree relations (FR-43 / ADR-014) -----------------------------------
+#
+# An OTel span tree is a FOREST: every span has at most one parent. Reachability
+# and component membership over a forest are fully expressible in core recursive
+# SQL, so no graph extension is required (ADR-014).
+#
+# Two reader-schema conventions are encoded here so callers never have to know
+# them: a root is signalled by an EMPTY STRING parent (not NULL), and a
+# parent_span_id may reference a span that was never exported — sampled away,
+# still in flight, or owned by a service that does not export. Such a reference
+# is routine, not an error, and it makes its span a component top just like a
+# real root. The two are distinguished by `is_orphan`, because only the orphan
+# indicates a broken link, and conflating them would hide the exact fault a
+# caller is looking for.
+#
+# Edges are matched WITHIN a trace: span ids are only meaningful there, so a
+# coincidental id match across traces must never join two components.
+_SPAN_EDGES_SQL = """
+CREATE OR REPLACE VIEW span_edges AS
+SELECT c.span_id, c.parent_span_id, c.trace_id
+FROM traces c
+JOIN traces p
+  ON p.span_id = c.parent_span_id
+ AND p.trace_id = c.trace_id
+WHERE c.parent_span_id IS NOT NULL AND c.parent_span_id <> ''
+"""
+
+_SPAN_TREE_SQL = """
+CREATE OR REPLACE VIEW span_tree AS
+WITH RECURSIVE tops AS (
+    -- Component tops: no resolvable parent inside this trace. A genuine root
+    -- (empty parent) and an orphan (parent named but absent) are both tops.
+    SELECT t.span_id, t.trace_id, t.span_id AS root_id, 0 AS depth,
+           (t.parent_span_id IS NOT NULL AND t.parent_span_id <> '') AS is_orphan
+    FROM traces t
+    WHERE NOT EXISTS (
+        SELECT 1 FROM span_edges e
+        WHERE e.span_id = t.span_id AND e.trace_id = t.trace_id
+    )
+  UNION ALL
+    SELECT e.span_id, e.trace_id, r.root_id, r.depth + 1, FALSE
+    FROM span_edges e
+    JOIN tops r ON e.parent_span_id = r.span_id AND e.trace_id = r.trace_id
+)
+SELECT span_id, trace_id, root_id, depth, is_orphan FROM tops
+"""
+
+
+def create_span_tree_views(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create the `span_edges` / `span_tree` derived relations (FR-43).
+
+    Views, not tables: evaluated only when referenced, so a caller who never
+    asks a structural question pays nothing. They resolve (empty) over an empty
+    `traces` relation, preserving expose-empty (FR-1).
+    """
+    conn.execute(_SPAN_EDGES_SQL)
+    conn.execute(_SPAN_TREE_SQL)
+
+
 def create_unified_metrics_view(conn: duckdb.DuckDBPyConnection) -> None:
     """Create the `metrics` view as the union of whichever metric tables exist.
 
@@ -1701,6 +1760,7 @@ def _finalize_relations(
     # in-window relations are kept, not dropped.
     create_unified_metrics_view(conn)
     create_resource_attr_macro(conn)  # FR-41
+    create_span_tree_views(conn)  # FR-43
 
 
 def build_hot(
@@ -1778,6 +1838,7 @@ def connect(telemetry_dir: Path) -> duckdb.DuckDBPyConnection:
         _seed_absent_relations(conn, telemetry_dir, tmp_dir, present, "")
         create_unified_metrics_view(conn)
         create_resource_attr_macro(conn)  # FR-41
+        create_span_tree_views(conn)  # FR-43
     return conn
 
 
@@ -3485,6 +3546,39 @@ def build_parser() -> argparse.ArgumentParser:
               The built-in commands take --resource-attr KEY=VALUE for the same
               job (repeatable, AND); `sql` is never rewritten, so here you write
               the macro yourself.
+              span_edges / span_tree — otelq-DEFINED derived relations (NOT part
+              of the reader schema) that make span structure traversable.
+                span_edges  span_id, parent_span_id, trace_id — only edges whose
+                            parent actually exists IN THE SAME trace.
+                span_tree   span_id, trace_id, root_id, depth, is_orphan —
+                            root_id is the CONNECTED COMPONENT the span belongs
+                            to; two spans are connected iff their root_id match.
+                            is_orphan marks a span whose parent was named but
+                            never exported (sampled away / still in flight / a
+                            non-exporting service) — a broken link, as opposed
+                            to a genuine root, which has an empty parent.
+              Sharing a trace_id is NOT the same as being connected: a dangling
+              parent leaves spans in one trace split across components. Use
+              root_id, not trace_id, to ask "did these actually connect?", e.g.
+              telling a step that never ran apart from a hop that lost trace
+              context:
+                sql "WITH want(service_name, name) AS (
+                       VALUES ('svcA','span.one'),('svcB','span.two')),
+                     hit AS (
+                       SELECT w.service_name, w.name, st.root_id FROM want w
+                       LEFT JOIN traces t ON t.service_name = w.service_name
+                                         AND t.name = w.name
+                       LEFT JOIN span_tree st ON st.span_id = t.span_id)
+                     SELECT CASE
+                       WHEN count(*) FILTER (WHERE root_id IS NULL) > 0
+                            THEN 'missing'
+                       WHEN (SELECT count(DISTINCT service_name || name)
+                             FROM hit GROUP BY root_id ORDER BY 1 DESC LIMIT 1)
+                            = (SELECT count(*) FROM want) THEN 'connected'
+                       ELSE 'disconnected' END FROM hit"
+              otelq reports structure, never a verdict on it — you write the
+              predicate, then gate it with the exit code (add `await` to wait for
+              it: exit 0 satisfied, 1 not, 2 error).
               IMPORTANT — isolate your `sql` to this worktree: unlike the built-in
               commands, `sql` is NEVER auto-scoped, so on a shared Collector it
               sees EVERY concurrent worktree's rows. Scope a query to THIS
