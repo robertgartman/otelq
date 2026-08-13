@@ -424,7 +424,7 @@ configuration that produces the raw files.
   `doctor` surfaces the condition as a non-fatal warning (FR-26). Every rendered
   timestamp value — every command output's `timestamp` column, `summary`'s
   `earliest`/
-  `latest` columns, and the FR-29 response header's `Time range` — **must** be an
+  `latest` columns, and the FR-29 response header's `Rows time range` — **must** be an
   explicit-UTC ISO-8601/RFC-3339 string carrying a trailing `Z`, at fixed
   millisecond precision (`YYYY-MM-DDTHH:MM:SS.fffZ`, exactly 3 fractional
   digits — a fixed presentation precision; the stored values are ns-exact,
@@ -629,7 +629,8 @@ configuration that produces the raw files.
   OpenTelemetry signal: <signal>
   OTEL source dir: <directory>
   OTEL source resolved by: <mechanism>
-  Time range: <from> - <to>
+  Rows time range: <from> - <to>
+  Query window: <window>
   IMPORTANT: all timestamps are UTC
   Session: <session-id>
   ----------
@@ -652,8 +653,8 @@ configuration that produces the raw files.
   - `<directory>` **must** be the absolute, normalized path of the telemetry
     directory actually used by the invocation. A relative default or `--dir`
     value **must** be resolved before it is shown.
-  - `<from>` and `<to>` **must** be the minimum and maximum `timestamp` value
-    among the command's returned rows, rendered with the same corrected-UTC
+  - `<from>` and `<to>` on the `Rows time range:` line **must** be the minimum
+    and maximum `timestamp` value among the command's returned rows, rendered with the same corrected-UTC
     formatting used elsewhere in the output (FR-16); both **must** render as
     `n/a` when the result has zero rows.
   - The header **must** precede the FR-10 rendering of the result and **must
@@ -674,14 +675,14 @@ configuration that produces the raw files.
   - The header **must not** change which rows are returned, their order, or the
     FR-10 rendering rules applied to the payload that follows it (INV-6).
   - When `--regex <pattern>` (FR-32) is supplied, the header **must** insert
-    two additional lines after `Time range` and before the `IMPORTANT` line:
+    two additional lines after `Query window` and before the `IMPORTANT` line:
     `Regex filter applied: <pattern>` (the verbatim pattern) and `Rows removed
     by regex: <count>` (how many rows the filter excluded). These lines
     **must not** appear when `--regex` is not supplied — the header's line
     count is otherwise fixed, but this pair is the one deliberate exception,
     mirroring the `compact`-only format-line suffix.
   - When one or more `--resource-attr` filters (FR-40) are supplied, the header
-    **must** insert a single additional line after `Time range` and before the
+    **must** insert a single additional line after `Query window` and before the
     `IMPORTANT` line: `Resource filter applied: <k>=<v>[, <k>=<v>…]`, listing
     every filter in the order given (a presence-only filter renders as a bare
     `<k>`). The line **must not** appear when no `--resource-attr` is supplied.
@@ -689,6 +690,12 @@ configuration that produces the raw files.
     from the invocation. `--attr` (FR-42) **must** contribute an equivalent but
     **separate** `Attribute filter applied:` line, so a reader can tell a
     producer-level filter from a record-level one.
+  - The row-derived line **must** be labelled `Rows time range:` and the
+    window line `Query window:` (FR-46), in that order. The former describes the
+    rows **returned**; the latter describes the range **searched**. The earlier
+    label `Time range:` asserted the second meaning while carrying the first, so
+    a consumer reading it as the queried window was silently wrong; the label is
+    therefore explicit on both lines rather than inferred.
   - Under `await` ([SPEC-otelq-await](SPEC-otelq-await.md) FR-7), the header
     **must** additionally carry a `Waited: <n>ms (<p> polls)` line.
 
@@ -918,6 +925,59 @@ configuration that produces the raw files.
   The resolved directory and the mechanism **must** be disclosed on every answer
   (FR-29) and in the machine failure object (FR-37).
 
+### Window and freshness disclosure
+
+- **FR-46 — The effective query window is disclosed on every answer.** The FR-29
+  response header **must** carry a `Query window:` line stating the event-time
+  range the invocation **actually applied** to the query relations, and how that
+  window was chosen. A caller must never have to re-derive the window from the
+  flags it passed, because the window is not a restatement of the flags: it is
+  computed (FR-9, INV-7) and a default applies when no flag is given.
+  - A bounded window **must** render as `<from> - <to> (<width>, <origin>)`,
+    where `<from>`/`<to>` are the applied bounds in the corrected-UTC form of
+    FR-16, `<width>` is the compact form (`30s`, `10m`, `2h`, `1d`), and
+    `<origin>` is `--since` when the width came from the flag and `default` when
+    it came from the built-in window.
+  - An unbounded window **must** render as `all history (<origin>)`, where
+    `<origin>` is `--all` when the flag was given and `command default` when the
+    command is unbounded by definition (`trace`, FR-6).
+  - The line **must** be present even when the result has **zero rows** — the
+    case where it is the only thing distinguishing "nothing matched in the range
+    I searched" from "I searched a range you did not intend". `Rows time range:`
+    renders `n/a - n/a` there and is, by construction, uninformative.
+  - The disclosed bounds **must** be the bounds applied to the relations, and
+    **must** be identical on the cached and `--no-cache` paths for the same
+    invocation (FR-11, INV-7). Disclosure that could disagree with the query it
+    describes would be worse than no disclosure.
+  - The line **must not** change which rows are returned or how they are
+    rendered (INV-6).
+
+- **FR-47 — `summary` reports per-signal ingestion freshness.** `summary`
+  **must** append a final block naming, for each signal that has captured data,
+  the newest record's event-time and that record's age relative to wall-clock, so
+  a caller can distinguish **"nothing happened"** from **"the producer has not
+  flushed yet"** — two conditions that are otherwise indistinguishable from an
+  empty result.
+  - The block **must** be delimited by the literal label
+    `** Newest record per signal **`, mirroring the existing service block
+    (FR-3), and carry the columns `signal`, `newest`, `age`.
+  - `newest` **must** use the corrected-UTC form (FR-16); `age` **must** be the
+    compact elapsed form (`4s`, `1m02s`, `3h12m`, `41d15h`) measured against
+    wall-clock at invocation, degrading to coarser units as it grows so a long
+    silence stays readable rather than rendering as a four-digit hour count.
+  - The values **must** be computed over **all records visible to the build for
+    that signal, not restricted to the query window**. Freshness answers a
+    question about the producer, not about the window; scoping it to the window
+    would make it tautological.
+  - A signal with no captured data **must not** appear, consistent with FR-3.
+  - The block **must** report a **number, never a verdict** — no threshold, no
+    `STALE`/`OK` label. Which lag is acceptable is the caller's policy, and
+    otelq does not hold it (FR-44).
+  - This block **must** be the only place a regular query pays for freshness:
+    the FR-29 header **must not** carry per-signal freshness, so header height
+    stays effectively fixed and ordinary commands are not bloated by a diagnostic
+    that `summary` exists to answer.
+
 
 ### Machine-attributable failure (ADR-012)
 
@@ -1079,7 +1139,8 @@ configuration that produces the raw files.
   to stdout before the JSON payload; `otelq sql "..."`, `doctor`,
   `collector-config`, and `troubleshoot` print no such header. A zero-row result
   (e.g. `metric <unknown-name>`) still prints the header, with
-  `Time range: n/a - n/a`. A corpus with both traces and logs makes `summary`'s
+  `Rows time range: n/a - n/a`, while `Query window:` still carries the applied
+  bounds (FR-46). A corpus with both traces and logs makes `summary`'s
   and `errors`'s header signal field read `traces, logs`; a traces-only corpus
   makes `errors`'s read `traces` alone. (FR-29)
 - **EC-24 — `sql` timestamp-literal offset is silently discarded.** Given a log
@@ -1090,7 +1151,7 @@ configuration that produces the raw files.
   correctly converted — does **not** match, because the offset is discarded
   rather than applied. (FR-30)
 - **EC-25 — Explicit-UTC timestamp rendering.** A presented `timestamp` (or
-  `summary`'s `earliest`/`latest`, or the FR-29 header's `Time range`) matches
+  `summary`'s `earliest`/`latest`, or the FR-29 header's `Rows time range`) matches
   `YYYY-MM-DDTHH:MM:SS\.\d{3}Z` (exactly 3 fractional digits) in every
   `--format` — never a bare `YYYY-MM-DD HH:MM:SS` with no trailing `Z`/offset,
   and never 6-digit microseconds. (FR-16)
@@ -1355,7 +1416,8 @@ configuration that produces the raw files.
   `logs`/`metric`, when the command runs with any `--format`, then stdout begins
   with the fixed header (a `==========` line; `otelq <command> response, format
   <format>`; `OpenTelemetry signal: <signal>`; `OTEL source dir: <directory>`;
-  `OTEL source resolved by: <mechanism>`; `Time range: <from> - <to>`; the UTC
+  `OTEL source resolved by: <mechanism>`; `Rows time range: <from> - <to>`;
+  `Query window: <window>`; the UTC
   notice; the session id; a `----------` line) naming the invoked command,
   resolved format, absolute telemetry directory and the rule that chose it,
   followed by the FR-10 rendering of the result; the header's
@@ -1369,7 +1431,8 @@ configuration that produces the raw files.
   `==========`.*
 - **AC-40** (Verifies FR-29): Given a command whose result has zero rows (e.g.
   `metric` with an unknown name), when it runs, then the header is still printed
-  with `Time range: n/a - n/a` rather than failing or omitting the header.
+  with `Rows time range: n/a - n/a` — and a populated `Query window:` (FR-46) —
+  rather than failing or omitting the header.
   *Verification hint: `metric <unknown-name>`; assert the header's time-range
   line reads `n/a - n/a`.*
 - **AC-41** (Verifies FR-29): Given a corpus with both traces and logs, when
@@ -1385,7 +1448,7 @@ configuration that produces the raw files.
   `errors`'s signal (unlike `slow`/`trace`/`logs`/`metric`'s fixed mapping) is
   derived from the returned rows.
   *Verification hint: a fixture with only healthy (non-error) traces/logs; run
-  `errors`; assert `OpenTelemetry signal: n/a` and `Time range: n/a - n/a`.*
+  `errors`; assert `OpenTelemetry signal: n/a` and `Rows time range: n/a - n/a`.*
 - **AC-43** (Verifies FR-30, EC-24): Given a record with a known UTC
   event-time, when `sql` filters on that value as a bare literal or as a
   `Z`-suffixed ISO-8601 literal, then both match the record; when it filters on
@@ -1407,9 +1470,9 @@ configuration that produces the raw files.
   **each** of `table`, `json`, `jsonl`, `csv`, and `compact`, then every such
   value in every one of those five renderings matches
   `YYYY-MM-DDTHH:MM:SS\.\d{3}Z` (exactly 3 fractional digits); the FR-29
-  response header's `Time range` values do too.
+  response header's `Rows time range` values do too.
   *Verification hint: `test_ac45_timestamps_render_explicit_utc`; regex-match
-  the rendered value in each format plus the header's `Time range` line.*
+  the rendered value in each format plus the header's `Rows time range` line.*
 - **AC-46** (Verifies FR-10, EC-26): Given a command with no `--format` flag,
   when it runs, then its stdout equals the same command run with an explicit
   `--format compact`; `--format table` still renders the human table.
@@ -1766,6 +1829,49 @@ configuration that produces the raw files.
   carries `store.dir` and `store.resolved_by`. Two invocations can therefore be
   proven to have read the same store from output alone.
   *Verification hint: `test_ac104_resolution_is_disclosed_on_success_and_failure`.*
+
+- **AC-105** (Verifies FR-46, FR-29): Given a windowless command with no
+  `--since`, when it succeeds, then the header carries
+  `Query window: <from> - <to> (30m, default)` with bounds exactly 30 minutes
+  apart, and the label `Rows time range:` appears on the row-derived line while
+  the bare label `Time range:` appears nowhere.
+  *Verification hint: `test_ac105_default_window_is_disclosed_with_origin`.*
+
+- **AC-106** (Verifies FR-46): Given `--since 10m`, when the command succeeds,
+  then the header carries `(10m, --since)` and the disclosed bounds are exactly
+  10 minutes apart.
+  *Verification hint: `test_ac106_since_window_is_disclosed_with_origin`.*
+
+- **AC-107** (Verifies FR-46, FR-6): Given `--all`, then the header carries
+  `Query window: all history (--all)`; and given `trace` (unbounded by
+  definition), then it carries `all history (command default)`.
+  *Verification hint: `test_ac107_unbounded_windows_disclose_their_origin`.*
+
+- **AC-108** (Verifies FR-46, FR-29): Given a command whose result is **empty**
+  in the searched range, when it succeeds, then `Rows time range:` renders
+  `n/a - n/a` **and** `Query window:` still carries the applied bounds — an empty
+  answer is never returned without the range that produced it.
+  *Verification hint: `test_ac108_empty_result_still_discloses_the_window`.*
+
+- **AC-109** (Verifies FR-46, FR-11, INV-7): Given the same invocation run with
+  and without `--no-cache`, when both succeed, then both disclose byte-identical
+  `Query window:` bounds.
+  *Verification hint: `test_ac109_window_disclosure_matches_across_cache_paths`.*
+
+- **AC-110** (Verifies FR-47, FR-3): Given a store with traces and logs but no
+  metrics, when `summary` runs, then its output ends with a
+  `** Newest record per signal **` block carrying `signal`, `newest`, `age`
+  columns with one row for `traces` and one for `logs`, and **no** row for
+  `metrics`.
+  *Verification hint: `test_ac110_summary_reports_newest_record_per_signal`.*
+
+- **AC-111** (Verifies FR-47, FR-44): Given a record older than the query window,
+  when `summary` runs, then the freshness block still reports that record's
+  event-time and age (freshness is not window-scoped), the reported age carries
+  no `STALE`/`OK` verdict or threshold, and the FR-29 header carries no
+  per-signal freshness line.
+  *Verification hint: `test_ac111_freshness_is_window_independent_and_unjudged`.*
+
 
 
 ### Examples
