@@ -29,6 +29,13 @@ Creates `.telemetry/` and brings up the dev OTel Collector (OTLP gRPC `:4317` / 
 - The `otlp` community extension **may lag DuckDB releases** — this is why the pin is exact (see ADR-003). Confirm the extension exists for a target version before any bump.
 - `just otel-clean` **stops the Collector before truncating** the active jsonl files, then restarts it. The Collector holds those fds open; `rm`-ing or live-truncating them while it runs orphans the fd / leaves a NUL hole and silently loses low-volume logs/metrics. Use the recipe; don't clear `.telemetry/` by hand.
 
+**6. Code-intelligence tooling — if present, initialize it in *this* worktree.** Serena (symbol-level LSP intelligence) and CodeGraph (call/dependency graph) are optional developer tools for working *on* this repo. They are **not** part of otelq's architecture — the CLI-ONLY / no-MCP rule in §4 governs what otelq **is**, not what you use to edit it. Neither is required; if the binaries are absent, carry on with `rg`/read.
+
+When either **is** available, initialize it in the worktree you are actually working in, **before** relying on its answers:
+- **Their indexes are per-directory, and a linked git worktree inherits none of them.** This is the same trap as the telemetry store (**ADR-011** / **SPEC-otelq-cli FR-45**): an un-indexed worktree does not error, it returns *plausible but incomplete* results — no callers found, symbol not defined anywhere — which reads exactly like a real finding. Treat "no results" from an unverified index as unknown, not as evidence.
+- **Serena** — `.serena/project.yml` is committed, so configuration carries across worktrees; the LSP cache does not. Warm it with `serena project index`. Check with `serena project health-check`.
+- **CodeGraph** — `.codegraph/` is per-worktree and gitignored, so it must be built locally: `codegraph init`. Refresh after significant edits with `codegraph sync`, and confirm freshness with `codegraph status` — a stale graph is the same failure mode as an absent one.
+
 ---
 
 # Dev Workflow

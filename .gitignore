@@ -221,3 +221,8 @@ __marimo__/
 # --- otelq runtime telemetry capture (Collector output + query cache) — never committed ---
 /.telemetry/*
 !/.telemetry/.gitkeep
+
+# --- agent code-intelligence indexes (per-worktree, rebuilt locally — never committed) ---
+#   Serena keeps its own nested .serena/.gitignore for /cache and /project.local.yml;
+#   .serena/project.yml IS committed so config carries across worktrees (AGENTS.md §6).
+/.codegraph/
