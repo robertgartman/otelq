@@ -364,8 +364,8 @@ output format (pick the fewest tokens the consumer can parse):
   --format csv      spreadsheet/interchange.
   --format table    for a human reading the terminal, not for parsing.
 
-time window (filters by each record's own event-time):
-  (default)            a recent window (the cache's hot window)
+time window (wall-clock, over each record's event-time):
+  (default)            the trailing 30 minutes
   --since Ns|Nm|Nh|Nd  only the trailing window, e.g. 30s, 10m, 2h, 1d
   --all                the full captured history (no window)
   `trace` ignores the window — a trace id is looked up across all
@@ -496,6 +496,7 @@ sql views (for `otelq sql "<query>"`):
   queries with the same care as a shell command.
 
 Run `otelq troubleshoot` for the capture → query loop and common fixes.
+
 ```
 
 Run `otelq help <command>` (or `otelq <command> -h`) for the full, authoritative

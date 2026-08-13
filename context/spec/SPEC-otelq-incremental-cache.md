@@ -14,6 +14,7 @@ must_not_contain:
 created: 2026-06-22
 last_updated: 2026-07-07
 related_documents:
+  - ADR-015-wall-clock-query-window
   - ADR-008-unified-cache-first-read-and-retention
   - ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0
   - ADR-005-incremental-parquet-cache
@@ -83,13 +84,19 @@ rationale for the cache (see
 - **RETENTION_HORIZON** — the event-time age beyond which sealed partitions are
   evicted; default **24 hours**. (Replaces the former ~30-minute rolling window
   per [ADR-008](../adr/ADR-008-unified-cache-first-read-and-retention.md).)
-- **DEFAULT_WINDOW** — the trailing event-time window a command without an
-  explicit range queries; default **30 minutes**. A query-scope default only — it
+- **DEFAULT_WINDOW** — the trailing window a command without an explicit range
+  queries, measured from wall-clock (INV-7) over each record's event-time;
+  default **30 minutes**. A query-scope default only — it
   no longer bounds what is sealed or retained.
 - **MARGIN** — the watermark lateness allowance; default **2 minutes**.
-- **MAX_FUTURE_SKEW** — the tolerance beyond host wall-clock allowed for an
-  event-time anchor; an observed watermark further ahead than this is clamped for
-  windowing, eviction, and ingest-floor purposes (EC-12, INV-7); default **1 day**.
+- **MAX_FUTURE_SKEW** — the tolerance beyond host wall-clock within which an
+  event-time is still considered plausible; default **1 day**. It serves two
+  distinct purposes (EC-12, INV-7): it is the query window's **upper bound**
+  (`now + MAX_FUTURE_SKEW`), so records beyond it are excluded while a merely
+  skewed producer is still returned; and it bounds the **plausible** watermark.
+  Since [ADR-015](../adr/ADR-015-wall-clock-query-window.md) it is **not** used to
+  clamp a data-derived window anchor — the query window is not derived from record
+  timestamps — and the eviction/ingest anchor is `min(watermark, now)`.
 - **Watermark (per signal)** — the maximum event-time otelq has observed for that
   signal across all ingest so far.
 - **Covered minute** — a minute that has a sealed parquet partition for the
@@ -283,18 +290,25 @@ rationale for the cache (see
   (FR-11), including out-of-order and byte-identical duplicate records.
 - **EC-12 — Divergent clocks.** Sealing and the watermark are driven by record
   event-time, so otelq running on a host whose wall-clock differs from the
-  applications' still seals the correct minutes. To bound a poison record whose
-  event-time is implausibly far in the future, the ingest floor and query window
-  anchor derived from observed event-time **must** be clamped to
-  `wall_clock + MAX_FUTURE_SKEW` before use, so a single far-future outlier cannot
-  yank the watermark (evicting or hiding real recent data). The clamp is applied
+  applications' still seals the correct minutes. The **query window** no longer
+  derives its anchor from observed event-time at all (INV-7,
+  [ADR-015](../adr/ADR-015-wall-clock-query-window.md)), so a far-future outlier
+  can no longer push the window past real data. Two clamps remain, and both
+  **must** hold: the ingest/eviction anchor is `min(watermark, now)`, so a poison
+  record cannot yank the watermark and evict real recent data; and the query
+  window's upper bound is `now + MAX_FUTURE_SKEW`, which excludes implausible
+  outliers **while still returning records from a producer running merely
+  seconds-to-minutes ahead** — such a producer **must not** be dropped from
+  results, which a `now` upper bound would do silently. Both are applied
   identically on the cache-first and `--no-cache` paths, preserving FR-11; the
   true (unclamped) watermark is still persisted for cursor fidelity.
 - **EC-13 — Far-future poison record.** A single record whose event-time is days
   ahead of every other record **must not** cause real, recently-arrived records to
-  be evicted from the cache or excluded from a default-window query; the window
-  anchor is clamped per EC-12 and the outlier itself is simply out of the clamped
-  window.
+  be evicted from the cache or excluded from a default-window query. Eviction is
+  anchored at `min(watermark, now)` per EC-12, so the outlier cannot ratchet the
+  floor forward; and the outlier itself simply sits beyond the window's upper
+  bound. Since [ADR-015](../adr/ADR-015-wall-clock-query-window.md) it cannot move
+  the window at all, because the window is not derived from record timestamps.
 - **EC-14 — Empty metric result in window.** A `metric <name>` query that matches
   no samples within the queried window returns an empty result for that window
   without silently widening to the full raw history; the user widens explicitly
@@ -449,10 +463,11 @@ rationale for the cache (see
 - **AC-21** (Verifies EC-12, EC-13, INV-7): Given a corpus in which one record's
   event-time is days in the future while the rest are recent, when a default-window
   query runs with the cache and with `--no-cache`, then real recent records are still
-  returned (not evicted or hidden by the outlier), the window anchor is clamped to
-  `wall_clock + MAX_FUTURE_SKEW`, and cached output equals `--no-cache`.
+  returned (neither evicted by the outlier ratcheting the eviction floor, nor hidden
+  by it), the outlier is excluded as beyond the window's upper bound
+  (`now + MAX_FUTURE_SKEW`), and cached output equals `--no-cache`.
   *Verification hint: `tests/test_otelq.py::test_clock_skew_outlier_does_not_drop_records`
-  and `::test_b1_window_anchor_clamped_to_ceiling`.*
+  and `::test_far_future_record_is_excluded_by_the_ceiling`.*
 - **AC-22** (Verifies FR-10, EC-14): Given a `metric <name>` query matching no
   samples in the default window, when it runs without `--all`/`--since`, then it
   returns an empty result for that window and does not silently widen to the full
@@ -543,10 +558,22 @@ rationale for the cache (see
 - **INV-5** — At most one process writes cache state (sealing, eviction, cursor) at
   a time; readers never block on the writer.
 - **INV-6** — otelq never modifies or deletes raw `*.jsonl` files.
-- **INV-7** — Query time windows (the trailing `DEFAULT_WINDOW` and any `--since`)
-  are measured relative to the maximum observed event-time, not the host
-  wall-clock, and the identical basis is applied on the cache-first and
-  `--no-cache` paths. The event-time anchor used for the ingest floor, eviction,
-  and the query window is clamped to `wall_clock + MAX_FUTURE_SKEW` so a single
-  implausibly-far-future record cannot advance the effective watermark; the true
-  watermark is still persisted for cursor fidelity (EC-12).
+- **INV-7** — Query time windows (the trailing `DEFAULT_WINDOW` and any
+  `--since`) are measured from **host wall-clock**, captured **once per
+  invocation** and applied identically on the cache-first and `--no-cache` paths
+  ([ADR-015](../adr/ADR-015-wall-clock-query-window.md)): the lower bound is
+  `now - window` and the upper bound is `now + MAX_FUTURE_SKEW`. The upper bound
+  stays a generous ceiling rather than `now` so a producer whose clock runs ahead
+  is **not** silently dropped from results (EC-12); records beyond the ceiling
+  are excluded. The retention/eviction anchor is `min(watermark, now)` — the
+  **minimum** in both directions, so a future-dated watermark cannot evict rows
+  that are still inside the query window (which would break FR-11), and a
+  stalled producer's cache is not evicted out from under a query that may still
+  ask for it. The true watermark is still persisted for cursor fidelity (EC-12).
+
+  > Amended 2026-08-13 by [ADR-015](../adr/ADR-015-wall-clock-query-window.md).
+  > This invariant previously measured windows from the maximum observed
+  > event-time. That made `--since 10m` mean "the ten minutes preceding the
+  > newest record", so a stalled producer returned a confidently stale answer —
+  > and a clean one was indistinguishable from a genuinely clean recent window.
+  > The cache-path-equality half of the invariant is unchanged.
