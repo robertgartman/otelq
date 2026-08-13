@@ -1134,13 +1134,33 @@ def _no_signal_msg(
     )
 
 
-def _require(conn: duckdb.DuckDBPyConnection, *relations: str) -> None:
+def _signal_was_captured(info: BuildInfo | None, relation: str) -> bool:
+    """Whether this signal has records in the store at all, ignoring the window.
+    `metrics` spans four typed relations, any of which counts."""
+    if info is None:
+        return False
+    if relation == "metrics":
+        return any(s.startswith("metrics") for s in info.newest_by_signal)
+    return relation in info.newest_by_signal
+
+
+def _require(
+    conn: duckdb.DuckDBPyConnection, args: argparse.Namespace, *relations: str
+) -> None:
     # "Required" means the relation must carry DATA, not merely exist: every
     # relation now resolves (empty) whenever any telemetry is present (FR-1), so a
     # row-count check is what keeps slow/trace/logs/metric naming the gap (FR-19).
     missing = [r for r in relations if not _has_rows(conn, r)]
-    if missing:
-        raise NoTelemetryError(_no_signal_msg(conn, missing[0], (missing[0],)))
+    if not missing:
+        return
+    # ADR-015: since the window is wall-clock, a relation can be empty simply
+    # because every record predates the window. That is NOT "nothing captured" —
+    # FR-18 says so in as many words — and saying it would be a false statement
+    # about the store, in the one case a caller most needs the truth. Answer with
+    # zero rows and let the FR-46 window line explain them.
+    if _signal_was_captured(getattr(args, "_build_info", None), missing[0]):
+        return
+    raise NoTelemetryError(_no_signal_msg(conn, missing[0], (missing[0],)))
 
 
 def _fmt_ts(dt: datetime) -> str:
@@ -1551,6 +1571,7 @@ def _ingest_and_seal(
     telemetry_dir: Path,
     cursor: Cursor,
     tmp_dir: str,
+    now: datetime,
 ) -> None:
     """Read each stream's delta, seal newly-complete minutes, rewrite pending,
     evict stale partitions, and persist the advanced cursor. Caller holds the
@@ -1595,11 +1616,14 @@ def _ingest_and_seal(
         wm = _parse_ts(cursor["streams"][stream_of(signal)].get("max_event_ts_seen"))
         if wm is None:
             continue
-        # Clamp the retention anchor to a plausible ceiling: a single far-future
-        # record must not ratchet hot_floor forward and evict the whole sealed
-        # cache (B-1). The persisted watermark keeps the true max (INV-7); only
-        # the floors derived here are clamped.
-        anchor = min(wm, _future_ceiling())
+        # ADR-015: anchor retention at min(watermark, now). The MINIMUM matters
+        # in both directions. Above wall-clock, a future-dated record would push
+        # hot_floor past the wall-clock window floor and the cache would evict
+        # rows a --no-cache scan still returns, breaking FR-11/INV-4. Below it, a
+        # STALLED producer keeps its cache instead of having it evicted out from
+        # under a query that can still legitimately ask for it. The persisted
+        # watermark keeps the true max (INV-7); only the floors derived here move.
+        anchor = min(wm, now)
         hot_floor = anchor - timedelta(minutes=RETENTION_MINUTES)
         # Retention is per-minute but the query window is sub-minute: the minute
         # straddling hot_floor still holds records >= hot_floor that an in-window
@@ -1828,17 +1852,25 @@ class BuildInfo:
     lo: datetime | None
     hi: datetime | None
     newest_by_signal: dict[str, datetime]
+    # The invocation's wall-clock reading. This, not `hi`, is what the FR-46
+    # header shows as the window's end: `hi` is the implausibility ceiling
+    # (`now + MAX_FUTURE_SKEW`), and rendering a 30-minute window as a day wide
+    # would misdescribe the search far more than it disclosed the guard.
+    now: datetime | None = None
 
 
-_EMPTY_BUILD = BuildInfo(None, None, {})
+_EMPTY_BUILD = BuildInfo(None, None, {}, None)
 
 
 def _finalize_relations(
-    conn: duckdb.DuckDBPyConnection, present: set[str], window: timedelta | None
+    conn: duckdb.DuckDBPyConnection,
+    present: set[str],
+    window: timedelta | None,
+    now: datetime,
 ) -> BuildInfo:
     """Create the final query relations (traces/logs/metrics_*) from _all_<signal>,
-    restricted to the planned event-time window. `now` is the max observed
-    event-time across the built relations, so the hot and cold paths apply the
+    restricted to the planned window. `now` is the invocation's single wall-clock
+    reading (ADR-015), passed in rather than read here so the hot and cold paths apply the
     identical window basis (SPEC INV-7). Returns the applied bounds and the
     per-signal pre-window maxima for FR-46/FR-47 disclosure."""
     if not present:
@@ -1850,18 +1882,22 @@ def _finalize_relations(
         )
         if v is not None:
             newest[s] = v
-    maxes = list(newest.values())
-    now_evt = max(maxes) if maxes else None
-    if window is None or now_evt is None:
+    if window is None:
         lo = hi = None
     else:
-        # Clamp the window's upper anchor to a plausible ceiling so one far-future
-        # record can't push the whole window past every real record and return the
-        # friendly "no telemetry" while telemetry plainly exists (B-1). Applied on
-        # BOTH hot and cold paths so cached == --no-cache (FR-11); a no-op unless
-        # an event-time sits more than MAX_FUTURE_SKEW ahead of wall-clock.
-        hi = min(now_evt, _future_ceiling())
-        lo = hi - window
+        # ADR-015: the window is measured from WALL-CLOCK, not from the newest
+        # record. Anchoring on the data made `--since 10m` mean "the ten minutes
+        # before the newest record", so a stalled producer answered a question
+        # about a window that had closed hours ago — a stale YES, or worse a
+        # clean GREEN indistinguishable from a genuinely clean recent window.
+        #
+        # Only the FLOOR carries the caller's request. The ceiling stays
+        # generous on purpose: a hard `hi = now` would exclude every record from
+        # a producer whose clock runs even slightly ahead (EC-12), replacing a
+        # stale read with a silently disappearing writer. Records beyond the
+        # ceiling are still excluded as implausible.
+        lo = now - window
+        hi = now + MAX_FUTURE_SKEW
     for s in present:
         if lo is None or hi is None:
             conn.execute(f"CREATE TABLE {s} AS SELECT * FROM _all_{s}")
@@ -1882,7 +1918,7 @@ def _finalize_relations(
     create_unified_metrics_view(conn)
     create_resource_attr_macro(conn)  # FR-41
     create_span_tree_views(conn)  # FR-43
-    return BuildInfo(lo, hi, newest)
+    return BuildInfo(lo, hi, newest, now)
 
 
 def build_hot(
@@ -1890,29 +1926,31 @@ def build_hot(
     telemetry_dir: Path,
     window: timedelta | None,
     tmp_dir: str,
+    now: datetime | None = None,
 ) -> BuildInfo:
     """Ingest the delta if we win the writer lock, then build the query relations
     from the parquet cache (sealed ∪ pending). A run that loses the lock answers
     from the cache as last committed; if the cache is empty (a concurrent first
     run, or a stale foreign lock), it falls back to a stateless cold scan so the
     query still answers (SPEC FR-12)."""
+    now = now or _utc_now()
     cursor = _self_heal(telemetry_dir)
     cdir = cache_dir(telemetry_dir)
     fd = _acquire_lock(cdir)
     if fd is not None:
         try:
-            _ingest_and_seal(conn, telemetry_dir, cursor, tmp_dir)
+            _ingest_and_seal(conn, telemetry_dir, cursor, tmp_dir, now)
         finally:
             _release_lock(cdir, fd)
     present = _assemble_hot(conn, telemetry_dir, tmp_dir)
     if not present:
         # Empty cache: a stateless cold scan reads the raw delta (and itself seeds
         # absent relations), so the query still answers (SPEC FR-12).
-        return build_cold(conn, telemetry_dir, window, tmp_dir)
+        return build_cold(conn, telemetry_dir, window, tmp_dir, now)
     # Cache has data: seed the signals that sealed none empty so all documented
     # relations resolve on the hot path exactly as on the cold path (FR-1/FR-11).
     _seed_absent_relations(conn, telemetry_dir, tmp_dir, present, "_all_")
-    return _finalize_relations(conn, present, window)
+    return _finalize_relations(conn, present, window, now)
 
 
 def build_cold(
@@ -1920,9 +1958,11 @@ def build_cold(
     telemetry_dir: Path,
     window: timedelta | None,
     tmp_dir: str,
+    now: datetime | None = None,
 ) -> BuildInfo:
     """Stateless full raw scan, restricted to the window. The --no-cache path and
     the fallback for queries reaching older than the hot window."""
+    now = now or _utc_now()
     present: set[str] = set()
     for stream in CURSOR_STREAMS:
         staged = _stage_stream(stream, telemetry_dir, tmp_dir)
@@ -1932,7 +1972,7 @@ def build_cold(
             _materialize(conn, f"_all_{signal}", signal, staged)
             present.add(signal)
     _seed_absent_relations(conn, telemetry_dir, tmp_dir, present, "_all_")
-    return _finalize_relations(conn, present, window)
+    return _finalize_relations(conn, present, window, now)
 
 
 def connect(telemetry_dir: Path) -> duckdb.DuckDBPyConnection:
@@ -1967,7 +2007,7 @@ def connect(telemetry_dir: Path) -> duckdb.DuckDBPyConnection:
 
 
 class Plan:
-    __slots__ = ("route", "window", "use_cache", "origin")
+    __slots__ = ("route", "window", "use_cache", "origin", "now")
 
     def __init__(
         self,
@@ -1975,6 +2015,7 @@ class Plan:
         window: timedelta | None,
         use_cache: bool,
         origin: str = "default",
+        now: datetime | None = None,
     ):
         self.route = route  # "HOT" | "COLD" | "HOT_THEN_COLD"
         self.window = window  # None = unbounded
@@ -1983,6 +2024,10 @@ class Plan:
         # caller whether it asked for that or merely accepted a default, and
         # those are different claims about the answer.
         self.origin = origin
+        # ADR-015/FR-15: ONE wall-clock reading per invocation. Reading the clock
+        # separately per build path would let the hot and cold windows differ by
+        # milliseconds, so cached and --no-cache could disagree (FR-11).
+        self.now = now or _utc_now()
 
 
 def _parse_since(since: str | None) -> timedelta | None:
@@ -2077,9 +2122,13 @@ def _render_query_window(plan: Plan | None, info: BuildInfo | None) -> str:
     if plan.window is None:
         return f"all history ({plan.origin})"
     width = f"({_compact_window(plan.window)}, {plan.origin})"
-    if info is None or info.lo is None or info.hi is None:
+    if info is None or info.lo is None or info.now is None:
         return f"n/a - n/a {width}"
-    return f"{_iso_utc(info.lo)} - {_iso_utc(info.hi)} {width}"
+    # End = wall-clock, NOT the implausibility ceiling: the rendered span then
+    # equals the width the caller asked for. Records dated slightly beyond it
+    # are still returned (FR-15 keeps a skewed producer visible), which FR-46
+    # states rather than leaving a reader to infer from a suspicious timestamp.
+    return f"{_iso_utc(info.lo)} - {_iso_utc(info.now)} {width}"
 
 
 def _plan_summary(plan: Plan) -> str:
@@ -2101,10 +2150,10 @@ def build_connection(
     conn.execute("LOAD otlp")
     with tempfile.TemporaryDirectory(prefix="otelq-") as tmp_dir:
         if plan.route == "COLD" or not plan.use_cache:
-            info = build_cold(conn, telemetry_dir, plan.window, tmp_dir)
+            info = build_cold(conn, telemetry_dir, plan.window, tmp_dir, plan.now)
         else:
             try:
-                info = build_hot(conn, telemetry_dir, plan.window, tmp_dir)
+                info = build_hot(conn, telemetry_dir, plan.window, tmp_dir, plan.now)
             except duckdb.Error:
                 # A cache parquet vanished mid-read (a concurrent writer's
                 # eviction) or was torn — fall back to a stateless cold scan on a
@@ -2113,7 +2162,7 @@ def build_connection(
                 conn = duckdb.connect(database=":memory:")
                 conn.execute("INSTALL otlp FROM community")
                 conn.execute("LOAD otlp")
-                info = build_cold(conn, telemetry_dir, plan.window, tmp_dir)
+                info = build_cold(conn, telemetry_dir, plan.window, tmp_dir, plan.now)
     return conn, info
 
 
@@ -2152,7 +2201,7 @@ def _freshness_rows(info: BuildInfo) -> tuple[list[str], list[Row]]:
     maxima: an empty result from a dead producer and one from a producer whose
     collector has not flushed are otherwise identical, and telling them apart is
     the whole point — so this must not be scoped to the query window."""
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = _utc_now()
     family: dict[str, datetime] = {}
     for signal, ts in info.newest_by_signal.items():
         key = "metrics" if signal.startswith("metrics") else signal
@@ -2466,7 +2515,7 @@ def run_command(
             "otelq: hot window empty — widened to a full-history cold scan",
             file=sys.stderr,
         )
-    cold_plan = Plan("COLD", None, True, "command default")
+    cold_plan = Plan("COLD", None, True, "command default", plan.now)
     conn, build_info = build_connection(args.dir, cold_plan)
     # The widened scan is what actually answered, so it is what must be
     # disclosed — reporting the abandoned hot window would misdescribe the answer.
@@ -3026,8 +3075,15 @@ def cmd_summary(
         rows += _summary_logs(conn, flt("logs"))
     if _has_rows(conn, "metrics"):
         rows += _summary_metrics(conn, flt("metrics"))
-    if not rows:  # no signal has data -> friendly empty-telemetry path (FR-18)
-        raise NoTelemetryError(_NO_TELEMETRY_MSG)
+    if not rows:
+        info = getattr(args, "_build_info", None)
+        if info is None or not info.newest_by_signal:
+            # Nothing captured at all -> friendly empty-telemetry path (FR-18).
+            raise NoTelemetryError(_NO_TELEMETRY_MSG)
+        # Records EXIST, they are just older than the window (ADR-015). Answering
+        # with the friendly message here would suppress the FR-47 freshness block
+        # in exactly the case it exists for, rendering "nothing was captured" and
+        # "nothing was captured RECENTLY" identically (FR-18 carve-out).
     return columns, rows
 
 
@@ -3241,7 +3297,7 @@ def cmd_errors(
 def cmd_slow(
     conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
 ) -> CommandResult:
-    _require(conn, "traces")
+    _require(conn, args, "traces")
     columns = ["timestamp", "service_name", "span_name", "duration_ms", "trace_id"]
     pred, pred_params = _scope_predicate(args, "traces")  # FR-5/FR-40/FR-42
     where = f" WHERE {pred}" if pred else ""
@@ -3300,7 +3356,7 @@ def _resolve_trace_id(conn: duckdb.DuckDBPyConnection, wanted: str) -> str:
 def cmd_trace(
     conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
 ) -> CommandResult:
-    _require(conn, "traces")
+    _require(conn, args, "traces")
     trace_id = _resolve_trace_id(conn, args.trace_id)
     # `trace` is never narrowed by WORKTREE scoping (worktree FR-10), but an
     # explicit --resource-attr filter does apply (FR-40) — an explicitly
@@ -3349,7 +3405,7 @@ def cmd_trace(
 def cmd_logs(
     conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
 ) -> CommandResult:
-    _require(conn, "logs")
+    _require(conn, args, "logs")
     where: list[str] = []
     params: list[str] = []
     if args.service:
@@ -3392,7 +3448,7 @@ def cmd_logs(
 def cmd_metric(
     conn: duckdb.DuckDBPyConnection, args: argparse.Namespace
 ) -> CommandResult:
-    _require(conn, "metrics")
+    _require(conn, args, "metrics")
     columns = [
         "timestamp",
         "service_name",
@@ -3717,8 +3773,8 @@ def build_parser() -> argparse.ArgumentParser:
               --format csv      spreadsheet/interchange.
               --format table    for a human reading the terminal, not for parsing.
 
-            time window (filters by each record's own event-time):
-              (default)            a recent window (the cache's hot window)
+            time window (wall-clock, over each record's event-time):
+              (default)            the trailing 30 minutes
               --since Ns|Nm|Nh|Nd  only the trailing window, e.g. 30s, 10m, 2h, 1d
               --all                the full captured history (no window)
               `trace` ignores the window — a trace id is looked up across all

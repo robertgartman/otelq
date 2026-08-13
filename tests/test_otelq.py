@@ -515,6 +515,7 @@ def test_integration_event_times_are_sensible_datetimes() -> None:
 # =============================================================================
 import hashlib as _hashlib  # noqa: E402
 import json as _json  # noqa: E402
+from collections.abc import Iterator  # noqa: E402
 from datetime import datetime, timedelta, timezone  # noqa: E402
 
 CACHE = otelq.CACHE_DIRNAME
@@ -785,6 +786,34 @@ def temp_telemetry(tmp_path: Path) -> Path:
     d = tmp_path / ".telemetry"
     d.mkdir()
     return d
+
+
+# Since ADR-015 the query window is measured from WALL-CLOCK, so a fixture
+# dated 2026-06-22 would fall outside every window when the suite runs on a real
+# clock. Pinning otelq's clock keeps the fixtures deterministic AND keeps the
+# window meaningful: 12:05 sits five minutes after the standard `base` of
+# 12:00, so ordinary corpora land inside the default 30m window exactly as they
+# did before. Tests that need a different relationship between data and clock
+# call `_pin_now` to override.
+PINNED_NOW = datetime(2026, 6, 22, 12, 5, 0)
+PINNED_NOW_UTC = PINNED_NOW.replace(tzinfo=timezone.utc)
+
+
+def _pin_now(monkeypatch: pytest.MonkeyPatch, when: datetime) -> None:
+    """Pin otelq's wall-clock. Naive UTC, matching the reader's event-times."""
+    naive = when.replace(tzinfo=None) if when.tzinfo is not None else when
+    monkeypatch.setattr(otelq, "_utc_now", lambda: naive)
+
+
+@pytest.fixture(autouse=True)
+def pinned_wall_clock() -> Iterator[None]:
+    # Deliberately NOT the shared `monkeypatch` fixture: a test that calls
+    # monkeypatch.undo() to drop its own patch would otherwise restore the real
+    # clock too, silently reverting half the test to wall-clock time.
+    mp = pytest.MonkeyPatch()
+    mp.setattr(otelq, "_utc_now", lambda: PINNED_NOW)
+    yield
+    mp.undo()
 
 
 import re as _re  # noqa: E402
@@ -1281,8 +1310,14 @@ def test_ac5_cold_start_seals_only_hot_window(temp_telemetry: Path) -> None:
 # --- AC-6 / FR-6: a later run evicts partitions that fell out of the window ----
 
 
-def test_ac6_eviction_drops_stale_partitions(temp_telemetry: Path) -> None:
+def test_ac6_eviction_drops_stale_partitions(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    # The clock advances with the data. Since ADR-015 eviction anchors at
+    # min(watermark, now), so a producer running AHEAD of the host clock can no
+    # longer evict — the realistic case is that both moved together.
+    _pin_now(monkeypatch, base + timedelta(minutes=45))
     traces = temp_telemetry / "traces.jsonl"
     write_jsonl(traces, _minutes_per_minute(base, 6))  # minutes 0..5
     _build(temp_telemetry)
@@ -1313,8 +1348,11 @@ def test_ac6_eviction_drops_stale_partitions(temp_telemetry: Path) -> None:
 # --- AC-9 / FR-9: recent-by-default, --all widens -----------------------------
 
 
-def test_ac9_recent_default_vs_all(temp_telemetry: Path) -> None:
+def test_ac9_recent_default_vs_all(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     base = datetime(2026, 6, 22, 10, 0, 0, tzinfo=timezone.utc)
+    _pin_now(monkeypatch, base + timedelta(minutes=90))
     write_jsonl(temp_telemetry / "traces.jsonl", _minutes_per_minute(base, 90))
     default = _signal_count(temp_telemetry, "traces", "summary")
     widened = _signal_count(temp_telemetry, "traces", "--all", "summary")
@@ -1326,8 +1364,11 @@ def test_ac9_recent_default_vs_all(temp_telemetry: Path) -> None:
 # --- AC-8 / FR-8: --since beyond the window reaches old data (cold path) -------
 
 
-def test_ac8_since_beyond_window_is_cold(temp_telemetry: Path) -> None:
+def test_ac8_since_beyond_window_is_cold(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     base = datetime(2026, 6, 22, 10, 0, 0, tzinfo=timezone.utc)
+    _pin_now(monkeypatch, base + timedelta(minutes=90))
     write_jsonl(temp_telemetry / "traces.jsonl", _minutes_per_minute(base, 90))
     far = _signal_count(temp_telemetry, "traces", "--since", "120m", "summary")
     assert far == 90
@@ -2000,8 +2041,11 @@ def test_f2_since_accepts_seconds_unit() -> None:
         otelq._parse_since("10x")
 
 
-def test_f2_since_seconds_windows_end_to_end(temp_telemetry: Path) -> None:
+def test_f2_since_seconds_windows_end_to_end(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _pin_now(monkeypatch, base + timedelta(seconds=40))
     write_jsonl(
         temp_telemetry / "logs.jsonl",
         [
@@ -2010,7 +2054,8 @@ def test_f2_since_seconds_windows_end_to_end(temp_telemetry: Path) -> None:
             make_log(base + timedelta(seconds=40), body="newest"),
         ],
     )
-    # Anchor is the max event-time (base+40s); a 30s window keeps mid+newest.
+    # The clock sits at base+40s; a 30s window (ADR-015: measured back from
+    # wall-clock, not from the newest record) keeps mid+newest, drops oldest.
     out = _strip_header(_run(temp_telemetry, "--since", "30s", "logs"))
     bodies = [r["body"] for r in _json.loads(out)]
     assert "oldest" not in bodies
@@ -2176,15 +2221,15 @@ def test_d4_and_b1_doctor_flags_clock_skew(temp_telemetry: Path) -> None:
     assert any(r[0] == "clock skew" and r[1] == "WARN" for r in rows)
 
 
-def test_b1_window_anchor_clamped_to_ceiling(temp_telemetry: Path) -> None:
-    # B-1: a single far-future record must not push the query window past all real
-    # data. The window's upper anchor is clamped to wall-clock + tolerance, so a
-    # record near the ceiling stays visible while the poison record is excluded;
-    # --all (windowless) still sees both. Identical hot vs cold (FR-11).
-    # aware UTC so make_log's naive-vs-aware timestamp conversion matches the
-    # naive-UTC ceiling the clamp computes at query time.
-    ceiling = datetime.now(timezone.utc) + otelq.MAX_FUTURE_SKEW
-    in_window = ceiling - timedelta(minutes=5)  # within the default hot window
+def test_far_future_record_is_excluded_by_the_ceiling(temp_telemetry: Path) -> None:
+    # AC-35/FR-16/EC-7: an implausible far-future record is excluded because it
+    # sits beyond the window's upper bound. Since ADR-015 it cannot move the
+    # window at all — the window is not derived from record timestamps — so this
+    # guard is now only about excluding the outlier, not about protecting an
+    # anchor from being dragged. --all (windowless) still sees both, identically
+    # hot vs cold (FR-11).
+    ceiling = PINNED_NOW_UTC + otelq.MAX_FUTURE_SKEW
+    in_window = PINNED_NOW_UTC - timedelta(minutes=1)
     poison = ceiling + timedelta(days=10)  # implausible outlier
     write_jsonl(
         temp_telemetry / "logs.jsonl",
@@ -2194,7 +2239,7 @@ def test_b1_window_anchor_clamped_to_ceiling(temp_telemetry: Path) -> None:
     def count(*argv: str) -> int:
         return _json.loads(_run(temp_telemetry, *argv, "sql", "SELECT count(*) AS n FROM logs"))[0]["n"]
 
-    assert count() == 1  # default window: poison clamped out, real record kept
+    assert count() == 1  # poison is beyond the ceiling; the real record is kept
     assert count("--all") == 2  # windowless: both present
     windowed = _run(temp_telemetry, "sql", "SELECT count(*) AS n FROM logs")
     assert windowed == _run(temp_telemetry, "--no-cache", "sql", "SELECT count(*) AS n FROM logs")
@@ -2422,12 +2467,15 @@ def test_ac61_generated_session_ids_are_unique_per_invocation(
 # =============================================================================
 
 
-def test_ac43_sql_timestamp_literal_utc_convention(temp_telemetry: Path) -> None:
+def test_ac43_sql_timestamp_literal_utc_convention(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # FR-30/EC-24: native TIMESTAMP_NS event-time columns are naive UTC. Bare
     # and Z-suffixed literals both match a known-UTC record. DuckDB 1.5.4 also
     # normalizes explicit offsets for TIMESTAMP_NS comparison, so the same
     # instant written with +02:00 matches too.
     base = datetime(2026, 7, 1, 10, 0, 0, tzinfo=timezone.utc)  # == 12:00 at +02:00
+    _pin_now(monkeypatch, base + timedelta(minutes=1))  # this corpus has its own date
     write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="hi")])
 
     def count(literal: str) -> int:
@@ -2909,7 +2957,7 @@ def test_history_janitor_badness_order_and_floor(
     monkeypatch.setenv("OTELQ_HISTORY_MAX_ROWS", "10")
     monkeypatch.setenv("OTELQ_HISTORY_STALE_DAYS", "1000")
     monkeypatch.setenv("OTELQ_HISTORY_KEEP_MIN", "2")
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = PINNED_NOW
     t = now - timedelta(minutes=5)
     _hist_seed(
         temp_telemetry,
@@ -2934,7 +2982,7 @@ def test_history_janitor_age_eligibility_protects_recent(
 ) -> None:
     monkeypatch.setenv("OTELQ_HISTORY_KEEP_MIN", "0")
     # default 24h eligibility: a recent 0-row query is protected...
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = PINNED_NOW
     _hist_seed(temp_telemetry, [_hist_entry(now - timedelta(minutes=5), "errors zero", 0)])
     assert set(_hist_queries(temp_telemetry)) == {"errors zero"}
     # ...and removable the moment the eligibility window is configured away
@@ -2954,7 +3002,7 @@ def test_history_janitor_stale_rule(
     monkeypatch.setenv("OTELQ_HISTORY_MIN_AGE_HOURS", "0")
     monkeypatch.setenv("OTELQ_HISTORY_KEEP_MIN", "0")
     monkeypatch.setenv("OTELQ_HISTORY_STALE_DAYS", "30")
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = PINNED_NOW
     _hist_seed(
         temp_telemetry,
         [
@@ -2966,7 +3014,7 @@ def test_history_janitor_stale_rule(
 
 
 def test_history_merge_is_idempotent(temp_telemetry: Path) -> None:
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = PINNED_NOW
     lines = [
         _hist_entry(now - timedelta(minutes=3), "errors a", 5),
         _hist_entry(now - timedelta(minutes=2), "errors a", 7),
@@ -2983,7 +3031,7 @@ def test_history_merge_is_idempotent(temp_telemetry: Path) -> None:
 
 
 def test_history_command_ranks_terminal_queries(temp_telemetry: Path) -> None:
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = PINNED_NOW
     t0 = now - timedelta(hours=2)
     # two explicit investigation sessions; "logs --grep x" ends both. Sessions
     # exist ONLY as explicit ids — id-less rows carry no terminal evidence.
@@ -3089,7 +3137,9 @@ def _hist_invocations(d: Path) -> list[dict[str, Any]]:
     return out
 
 
-def test_history_stores_only_supplied_session_ids(temp_telemetry: Path) -> None:
+def test_history_stores_only_supplied_session_ids(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import io as _io
     from contextlib import redirect_stderr, redirect_stdout
 
@@ -3100,6 +3150,10 @@ def test_history_stores_only_supplied_session_ids(temp_telemetry: Path) -> None:
     # GENERATED id is an offer in the footer, not an asserted correlation, so
     # it must be stored as NULL (else every casual call would masquerade as
     # its own asserted single-query investigation and pollute terminal stats).
+    # History is ordered by ts and the suite's clock is frozen, so without this
+    # the two invocations share a timestamp and the assertion tests an arbitrary
+    # tie-break rather than ordering (it passed or failed by luck).
+    _pin_now(monkeypatch, PINNED_NOW + timedelta(seconds=1))
     with redirect_stdout(_io.StringIO()), redirect_stderr(_io.StringIO()):
         otelq.main(["--dir", str(temp_telemetry), "summary"])
     ids = [r["session_id"] for r in _hist_invocations(temp_telemetry)]
@@ -3107,7 +3161,7 @@ def test_history_stores_only_supplied_session_ids(temp_telemetry: Path) -> None:
 
 
 def test_sessionization_explicit_ids_bridge_and_split(temp_telemetry: Path) -> None:
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = PINNED_NOW
     _hist_seed(
         temp_telemetry,
         [
@@ -3130,7 +3184,7 @@ def test_history_scoring_prefers_recent_over_stale_heavy_use(
     temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("OTELQ_HISTORY_HALF_LIFE_DAYS", "1")
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = PINNED_NOW
     lines = [
         # stale champion: 6 winning singleton sessions, 10 days old
         _hist_entry(now - timedelta(days=10, minutes=i * 30), "errors stale", 5)
@@ -3151,7 +3205,7 @@ def test_history_compact_migrates_presession_parquet(temp_telemetry: Path) -> No
     # still merge (BY NAME + ALTER guard), old rows reading as NULL session.
     hd = _hist_dir(temp_telemetry)
     hd.mkdir(parents=True, exist_ok=True)
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = PINNED_NOW
     conn = duckdb.connect(":memory:")
     conn.execute(
         "CREATE TABLE inv (qid VARCHAR, ts TIMESTAMP, rows_returned BIGINT, "
@@ -3199,7 +3253,7 @@ def test_triage_grounds_with_summary_when_session_unseeded(
     # runs the RCA guide's step 1 itself instead of refusing.
     base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base)])
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = PINNED_NOW
     _hist_seed(
         temp_telemetry,
         [_hist_entry(now - timedelta(days=6), "errors meh", 5)],
@@ -3219,7 +3273,7 @@ def test_triage_refuses_and_dumps_once_session_is_grounded(
     # The anchor session ALREADY ran summary and history has no successor
     # evidence -> honest refusal + the ranked template dump (grounding twice
     # would be noise).
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = PINNED_NOW
     _hist_seed(
         temp_telemetry,
         [
@@ -3245,7 +3299,7 @@ def test_triage_markov_autoruns_and_suggests_next(
         temp_telemetry / "logs.jsonl",
         [make_log(base, severity="ERROR", sevnum=17, body="boom")],
     )
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = PINNED_NOW
     # two past sessions: summary -> errors -> logs; anchor session ends at summary
     lines: list[str] = []
     for i, sid in enumerate(("h1", "h2")):
@@ -3285,7 +3339,7 @@ def test_triage_nonconcrete_candidate_suggests_instead_of_running(
 ) -> None:
     monkeypatch.setenv("OTELQ_TRIAGE_EVIDENCE", "1")
     monkeypatch.setenv("OTELQ_TRIAGE_SHARE", "0.4")
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = PINNED_NOW
     sql_norm = "sql SELECT count(*) FROM logs WHERE body = '?'"
     sql_raw = "sql SELECT count(*) FROM logs WHERE body = 'stale-thing'"
     lines: list[str] = []
@@ -3319,7 +3373,7 @@ def test_sessionization_survives_interleaved_concurrent_agents(
     # an id-less row contributes NO terminal/transition evidence — under the
     # old time-gap heuristic all five rows would have merged into one bogus
     # session.
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = PINNED_NOW
     t = now - timedelta(minutes=30)
     _hist_seed(
         temp_telemetry,
@@ -5182,3 +5236,105 @@ def test_ac13_timeout_reports_per_signal_freshness(temp_telemetry: Path) -> None
     )
     assert proc2.returncode == 1, proc2.stderr
     assert "no records captured" in proc2.stderr.lower(), proc2.stderr
+
+
+# ---- the query window is measured from wall-clock (ADR-015) ------------------
+# Anchoring on the newest record made `--since 10m` mean "the ten minutes before
+# the newest record". A stalled producer therefore returned a confidently stale
+# YES, and a clean window that closed hours ago was indistinguishable from a
+# genuinely clean recent one. These pin the wall-clock floor, the generous
+# ceiling that keeps skewed producers visible, and the disclosure that explains
+# the emptiness the change introduces.
+
+
+def test_ac112_window_floor_is_wall_clock_not_newest_record(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AC-112: the newest record is two hours old. Under event-time anchoring the
+    # window followed it and returned rows; the caller asking "anything in the
+    # last 30 minutes?" got a stale YES with nothing to indicate it.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _pin_now(monkeypatch, base + timedelta(hours=2))
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="old")])
+    out = _run(temp_telemetry, "logs")
+    assert _json.loads(_strip_header(out)) == []
+    lo, hi = _window_bounds(out)
+    # the floor is 30m before the CLOCK, not 30m before that record; the end is
+    # wall-clock, so the disclosed span is exactly the width that was requested
+    assert lo == datetime(2026, 6, 22, 13, 30, tzinfo=timezone.utc)
+    assert hi == datetime(2026, 6, 22, 14, 0, tzinfo=timezone.utc)
+
+
+def test_ac113_skew_ceiling_keeps_slightly_future_records(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AC-113/EC-12: a producer whose clock runs minutes ahead must NOT vanish. A
+    # hard `hi = now` would drop it silently — trading a stale read for an
+    # invisible writer, which is worse because nothing in the output hints at it.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _pin_now(monkeypatch, base)
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            make_log(base + timedelta(minutes=5), body="skewed-ahead"),
+            make_log(base + timedelta(days=3), body="implausible"),
+        ],
+    )
+    bodies = {r["body"] for r in _json.loads(_strip_header(_run(temp_telemetry, "logs")))}
+    assert "skewed-ahead" in bodies, "a slightly-ahead producer must not be dropped"
+    assert "implausible" not in bodies, "beyond the ceiling stays excluded"
+
+
+def test_ac114_out_of_window_store_reports_freshness_not_empty(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # AC-114: THE case ADR-015 creates. Every record is older than the window, so
+    # summary has nothing in-window — but "nothing captured" and "nothing captured
+    # RECENTLY" are different diagnoses. Taking the friendly empty path here would
+    # suppress the freshness block that explains which one this is.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _pin_now(monkeypatch, base + timedelta(hours=3))
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base, body="old")])
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base)])
+    out = _run(temp_telemetry, "summary")
+    err = capsys.readouterr().err
+    assert "no telemetry captured" not in err
+    assert "otelq summary response" in out  # answered normally, with a header
+    block = out.split("** Newest record per signal **", 1)[1]
+    assert '"logs"' in block and '"traces"' in block
+    assert '"3h00m"' in block, block  # the age that explains the emptiness
+
+
+def test_ac115_future_watermark_does_not_evict_in_window_rows(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AC-115/FR-11: retention anchors on the event-time watermark. Once the query
+    # floor is wall-clock, a future-dated record would push the eviction floor
+    # ABOVE the window floor and the cache would drop rows a --no-cache scan
+    # still returns. Anchoring at min(watermark, now) is what prevents that.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _pin_now(monkeypatch, base + timedelta(minutes=5))
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [make_log(base + timedelta(seconds=i), body=f"m{i}") for i in range(5)]
+        + [make_log(base + timedelta(hours=20), body="ahead-of-clock")],
+    )
+    cached = _strip_header(_run(temp_telemetry, "logs"))
+    nocache = _strip_header(_run(temp_telemetry, "--no-cache", "logs"))
+    assert cached == nocache, "future watermark evicted rows still inside the window"
+    assert len(_json.loads(cached)) == 6
+
+
+def test_ac116_all_history_is_unaffected_by_the_clock(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AC-116: --all carries no window, so no amount of clock drift may hide data.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _pin_now(monkeypatch, base + timedelta(days=40))
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [make_log(base + timedelta(seconds=i), body=f"m{i}") for i in range(4)],
+    )
+    out = _run(temp_telemetry, "--all", "logs")
+    assert len(_json.loads(_strip_header(out))) == 4
+    assert _window_field(out) == "all history (--all)"

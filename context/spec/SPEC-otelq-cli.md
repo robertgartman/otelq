@@ -14,6 +14,7 @@ must_not_contain:
 created: 2026-06-23
 last_updated: 2026-08-13
 related_documents:
+  - ADR-015-wall-clock-query-window
   - PRD-otelq
   - SPEC-otelq-incremental-cache
   - SPEC-otelq-worktree-scoping
@@ -405,6 +406,17 @@ configuration that produces the raw files.
   the query to a trailing window of `N` seconds (`s`), minutes (`m`), hours (`h`),
   or days (`d`). A malformed `--since` value **must** be rejected as a real error
   (FR-17) with a message naming the accepted forms.
+  - The window's lower bound **must** be measured from **host wall-clock**:
+    `--since 10m` means the last ten minutes, not the ten minutes preceding the
+    newest record ([ADR-015](../adr/ADR-015-wall-clock-query-window.md), INV-7 of
+    [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md)). The same
+    basis governs the default trailing window.
+  - The upper bound **must** remain `wall-clock + tolerance`, **not** wall-clock
+    itself: a producer whose clock runs seconds-to-minutes ahead **must not** be
+    silently dropped from results. Only the lower bound carries the caller's
+    request; the upper bound exists solely to exclude implausible timestamps.
+  - Wall-clock **must** be captured **once per invocation** and applied
+    identically on the cached and `--no-cache` paths (FR-11).
 
 ### Presentation and robustness
 
@@ -415,10 +427,12 @@ configuration that produces the raw files.
   [ADR-010](../adr/ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md)); a raw 2026 event
   **must not** render as a far-future year. A single implausible far-future
   event-time (a clock-skewed producer or a unit mistake) **must not** blank out
-  otherwise-valid queries: the trailing-window anchor is clamped to a plausible
-  ceiling (`wall-clock + tolerance`) identically on the cache and `--no-cache`
-  paths, so a bogus record beyond the ceiling is excluded from a windowed result
-  rather than pushing the window past all real data. The clamp is defined once, as
+  otherwise-valid queries: the window's upper bound is a plausible ceiling
+  (`wall-clock + tolerance`) applied identically on the cache and `--no-cache`
+  paths, so a bogus record beyond the ceiling is excluded from a windowed result.
+  Since [ADR-015](../adr/ADR-015-wall-clock-query-window.md) such a record can no
+  longer push the window past real data either, because the window is not derived
+  from record timestamps at all — the ceiling now only excludes the outlier. The clamp is defined once, as
   the window/watermark anchor, in
   [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md) (INV-7, EC-12);
   `doctor` surfaces the condition as a non-fatal warning (FR-26). Every rendered
@@ -494,6 +508,18 @@ configuration that produces the raw files.
   relation existence, governs this: under expose-empty (FR-1) a required signal's
   relation may resolve empty, which **must** still trigger the friendly path (or
   the gap message of FR-19 when another signal does have data).
+  - **Records outside the query window are not "nothing captured".** Since the
+    window is measured from wall-clock (FR-15,
+    [ADR-015](../adr/ADR-015-wall-clock-query-window.md)), a required signal can
+    resolve empty simply because every record predates the window. **No** command
+    **may** take the friendly path in that case — the store demonstrably holds
+    that signal, so the message would be false, and false in the one case the
+    caller most needs the truth. Such a command **must** answer normally: exit
+    `0` with the FR-29 header, its `Query window:` line (FR-46), and zero rows.
+    For `summary` this additionally means the FR-47 freshness block is emitted;
+    suppressing the answer would hide the very values that explain the emptiness.
+    "Nothing was captured" and "nothing was captured *recently*" are different
+    diagnoses and **must not** render identically.
 - **FR-19 — Name the gap, don't blame the Collector.** When a command's required
   signal has **no captured rows** **but another signal does have data**, otelq
   **must** print a message that names the missing signal (and its likely cause:
@@ -949,6 +975,20 @@ configuration that produces the raw files.
     **must** be identical on the cached and `--no-cache` paths for the same
     invocation (FR-11, INV-7). Disclosure that could disagree with the query it
     describes would be worse than no disclosure.
+  - The bounds **must** be the wall-clock-derived bounds of FR-15
+    ([ADR-015](../adr/ADR-015-wall-clock-query-window.md)): `<from>` is the
+    applied lower bound and `<to>` is **wall-clock at invocation**, so the
+    rendered span equals the requested width. `<to>` **must not** be the
+    implausibility ceiling of FR-15 — rendering a 30-minute window as a day wide
+    would misdescribe the search far more than it disclosed the guard. A record
+    from a clock-skewed producer may therefore carry a `timestamp` slightly
+    **after** `<to>` and still legitimately appear (FR-15, EC-12); this is
+    stated here so a reader meets it as documented behaviour rather than
+    inferring a defect from a suspicious timestamp.
+  - A consumer **must not** infer freshness from these bounds: they read
+    identically whether or not anything is arriving, which is why freshness is
+    reported separately (FR-47, and
+    [SPEC-otelq-await](SPEC-otelq-await.md) FR-13).
   - The line **must not** change which rows are returned or how they are
     rendered (INV-6).
 
@@ -970,6 +1010,9 @@ configuration that produces the raw files.
     question about the producer, not about the window; scoping it to the window
     would make it tautological.
   - A signal with no captured data **must not** appear, consistent with FR-3.
+  - The block **must** be emitted even when the per-signal block is empty because
+    every record falls outside the window (FR-18). That is the case it exists
+    for: it is what distinguishes a stalled producer from one that never ran.
   - The block **must** report a **number, never a verdict** — no threshold, no
     `STALE`/`OK` label. Which lag is acceptable is the caller's policy, and
     otelq does not hold it (FR-44).
@@ -1106,8 +1149,9 @@ configuration that produces the raw files.
   result is returned and **no** notice is printed. The notice never appears on
   stdout. (FR-23)
 - **EC-15 — `--since` seconds unit.** `--since 30s` restricts the query to the
-  trailing 30 seconds (anchored at the max in-window event-time), a tighter window
-  than the `1m` floor previously allowed. (FR-15)
+  trailing 30 seconds of **wall-clock** (FR-15,
+  [ADR-015](../adr/ADR-015-wall-clock-query-window.md)), a tighter window than the
+  `1m` floor previously allowed. (FR-15)
 - **EC-16 — `--version`.** `otelq --version` prints `otelq <version>` and exits
   `0`, where `<version>` equals the packaged distribution version. (FR-24)
 - **EC-17 — `--verbose` metadata.** `otelq --verbose summary` prints the same
@@ -1397,9 +1441,12 @@ configuration that produces the raw files.
   *Verification hint: `test_f4_trace_prefix_resolves_and_flags_ambiguity`.*
 - **AC-35** (Verifies FR-16, EC-7): Given a corpus with one far-future record plus
   in-window records, when a windowed command runs, then the far-future record is
-  excluded (the window anchor is clamped) while the in-window records are
-  returned, identically cached vs `--no-cache`; `--all` includes both.
-  *Verification hint: `test_b1_window_anchor_clamped_to_ceiling`.*
+  excluded (it sits beyond the window's plausibility ceiling) while the in-window
+  records are returned, identically cached vs `--no-cache`; `--all` includes both.
+  The record is excluded by the **ceiling**, not by a clamp on a data-derived
+  anchor — since [ADR-015](../adr/ADR-015-wall-clock-query-window.md) no record
+  can move the window at all.
+  *Verification hint: `test_far_future_record_is_excluded_by_the_ceiling`.*
 - **AC-36** (Verifies FR-28, EC-21): Given a telemetry directory whose path
   contains a single quote, when a command runs, then it returns the correct result
   with no SQL error, identical cached vs `--no-cache`.
@@ -1871,6 +1918,46 @@ configuration that produces the raw files.
   no `STALE`/`OK` verdict or threshold, and the FR-29 header carries no
   per-signal freshness line.
   *Verification hint: `test_ac111_freshness_is_window_independent_and_unjudged`.*
+
+- **AC-112** (Verifies FR-15, FR-46): Given a store whose newest record is two
+  hours old and a windowed command with no `--since`, when it runs, then it
+  returns **zero** rows — the window is the last 30 minutes of wall-clock, not
+  the 30 minutes preceding the newest record — and the disclosed `Query window:`
+  lower bound sits 30 minutes before wall-clock rather than 30 minutes before
+  that record. (The upper bound is the plausibility ceiling of FR-15, **not**
+  wall-clock itself; see AC-113.)
+  *Verification hint: `test_ac112_window_floor_is_wall_clock_not_newest_record`.*
+
+- **AC-113** (Verifies FR-15, FR-16): Given a record whose event-time is
+  minutes **ahead** of wall-clock (a clock-skewed producer), when a windowed
+  command runs, then that record **is** returned; and given a record beyond the
+  plausibility ceiling, then it is excluded. A skewed producer is never silently
+  dropped.
+  *Verification hint: `test_ac113_skew_ceiling_keeps_slightly_future_records`.*
+
+- **AC-114** (Verifies FR-18, FR-47, FR-46): Given a store whose every record is
+  older than the window, when `summary` runs, then it does **not** print the
+  friendly no-telemetry message: it exits `0` having printed the FR-29 header
+  with the applied `Query window:`, and a `** Newest record per signal **` block
+  reporting the age of the newest record — so "nothing captured" and "nothing
+  captured recently" are distinguishable.
+  *Verification hint: `test_ac114_out_of_window_store_reports_freshness_not_empty`.*
+
+- **AC-115** (Verifies FR-11): Given a store whose watermark is
+  **ahead** of wall-clock, when the same command runs cached and with
+  `--no-cache`, then both return identical rows — retention anchored at
+  `min(watermark, now)` must not evict rows that are still inside the wall-clock
+  window. (Verifies INV-7 and EC-12 of
+  [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md); this file's
+  own INV-7/EC-12 are unrelated requirements.)
+  *Verification hint: `test_ac115_future_watermark_does_not_evict_in_window_rows`.*
+
+- **AC-116** (Verifies FR-15, FR-46): Given a store whose records are all far
+  older than any window, when the command is run with `--all`, then every record
+  is returned and the header discloses `all history (--all)` — unbounded queries
+  are unaffected by the clock.
+  *Verification hint: `test_ac116_all_history_is_unaffected_by_the_clock`.*
+
 
 
 
