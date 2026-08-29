@@ -229,3 +229,6 @@ __marimo__/
 #   Serena keeps its own nested .serena/.gitignore for /cache and /project.local.yml;
 #   .serena/project.yml IS committed so config carries across worktrees (AGENTS.md §6).
 /.codegraph/
+
+# MacOS
+.DS_Store
