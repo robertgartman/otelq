@@ -420,6 +420,25 @@ configuration that produces the raw files.
     can only return nothing, and silence there hides a wrong value or a wrong
     clock. Which spelling applies is decided on shape (`@…` or `YYYY-MM-DD…`)
     before parsing, so a malformed instant is reported as a malformed instant.
+  - The accepted instant spellings **must** be exactly those listed above and no
+    others: the ISO form **must** carry a time component (`YYYY-MM-DD`, then `T`
+    or a space, then `HH:MM[:SS[.fraction]]`, then `Z`, `±HH:MM` or nothing),
+    and the `@` form **must** be a non-negative decimal. A bare date, a bodiless
+    `@`, a negative or non-numeric `@` body are usage errors, **not** instants:
+    reading `2026-06-22` as midnight would silently widen the window by up to a
+    day, and widening a lower bound the caller did not ask to widen is the one
+    thing this flag must never do. Sub-second digits **must** be floored, never
+    rounded, so the bound never moves past a record the caller asked for.
+  - An instant older than the hot retention window is served by the **cold
+    route** — a full raw scan — exactly as a duration wider than that window is;
+    routing is decided by the resolved width, not by the spelling. Because an
+    instant's age grows with the clock while its text does not, an unchanged
+    invocation crosses to the cold route on its own; under `--verbose` that
+    crossing **must** be named on stderr.
+  - The `--since` DURATION grammar is shared with `await --timeout`/`--poll`
+    (FR-1), which accept durations only. A malformed value **must** be rejected
+    with a message naming the flag actually at fault, and **must not** advertise
+    the instant spellings where they would be rejected.
   - The window's lower bound **must** be measured from **host wall-clock**:
     `--since 10m` means the last ten minutes, not the ten minutes preceding the
     newest record ([ADR-015](../adr/ADR-015-wall-clock-query-window.md), INV-7 of
@@ -1133,12 +1152,30 @@ configuration that produces the raw files.
   `otelq --format json errors`. (FR-11)
 - **EC-6 — Malformed `--since`.** `--since 10x` (or `--since abc`) exits non-zero
   with a message naming the accepted forms (`10m`, `2h`, `1d`, and the instant
-  spellings); a malformed instant (`--since 2026-13-45T00:00:00Z`, `--since @abc`)
-  exits non-zero with a message naming the instant forms. (FR-15)
+  spellings); a malformed instant (`--since 2026-13-45T00:00:00Z`, `--since @abc`,
+  and the instant-shaped-but-unaccepted `--since 2026-06-22`, `--since @`,
+  `--since @-5`) exits non-zero with a message naming the instant forms. The two
+  messages are distinguishable by their own prefixes — `invalid --since '<v>'`
+  for a duration, `invalid --since instant '<v>'` for an instant — not by the
+  word "instant", which both carry. `await --timeout 10x` / `--poll 10x` exit
+  non-zero with a message naming `--timeout`/`--poll` and offering durations
+  only, since an instant is meaningless there. (FR-15, FR-1)
 - **EC-35 — Future `--since` instant.** `--since 2099-01-01T00:00:00Z` (any
   instant later than the invocation's wall-clock reading) exits non-zero as a
   usage error whose message states the current wall-clock, rather than
   returning an empty result. (FR-15, FR-17)
+- **EC-36 — `await` re-polls under an instant `--since`.** Across an `await`
+  that polls more than once, an instant `--since` discloses the SAME lower bound
+  on every poll while the upper bound advances with the clock; a duration
+  `--since` re-measures, so its lower bound slides forward between polls. The
+  answer is therefore anchored on the caller's instant, not on when the wait
+  happened to finish. (FR-15, FR-46)
+- **EC-37 — Instant `--since` older than the hot window.** An instant older than
+  the hot retention window is answered from the cold route (full raw scan) with
+  the same rows as ever; under `--verbose` a one-line stderr notice names the
+  crossing. Without `--verbose` nothing is printed, and routing is unchanged.
+  A wide DURATION gets no such notice — its width was chosen by the caller.
+  (FR-15, FR-25)
 - **EC-7 — Far-future timestamps avoided.** Presented `timestamp` values render
   in the correct (near-present) year for genuine events, never a far-future one,
   whatever encoding the reader surfaces. (FR-16)
@@ -1997,6 +2034,51 @@ configuration that produces the raw files.
   `test_f2_since_instant_is_disclosed_as_the_lower_bound`,
   `test_f2_malformed_or_future_instant_is_a_usage_error`,
   `test_f2_await_timeout_keeps_the_duration_grammar`.*
+
+- **AC-118** (Verifies FR-15, EC-6): Given the clock at T+40s, when `--since` is
+  given an instant-shaped value the grammar does not accept — a bare date
+  `2026-06-22`, `2026-06-22T12`, `@`, `@-5`, `@abc`, `@1e9` — then the command
+  exits `2` as `usage_error` naming the instant forms, and **no** query runs; a
+  bare date is never read as midnight. `2026-06-22T12:00Z` (HH:MM) and
+  `2026-06-22 12:00:10.5` are accepted, and a fraction finer than a microsecond
+  floors: `@<epoch of T+10s>.9999999` and `…T12:00:10.9999999Z` both resolve to
+  the width `29.000001s`, never `29s`.
+  *Verification hint: `test_f2_instant_grammar_is_exact_and_floors_fractions`,
+  `test_f2_malformed_or_future_instant_is_a_usage_error`.*
+
+- **AC-119** (Verifies FR-15, EC-36, FR-46): Given an `await` that polls more
+  than once against a clock that advances between polls, when it runs with
+  `--since <instant>`, then the disclosed lower bound on the answer equals that
+  instant while the upper bound has moved; run instead with `--since 30s`, the
+  disclosed window is 30s wide and its lower bound has slid forward with the
+  clock.
+  *Verification hint: `test_f2_await_instant_lower_bound_holds_still_across_polls`.*
+
+- **AC-120** (Verifies FR-15, FR-46): Given a window width that is not a whole
+  number of seconds — the ordinary case for an instant measured against a
+  sub-second clock — when the header discloses it, then the fraction is kept
+  (`29.75s`, not `29s`), and a zero width renders `0s`, never `0d`/`0h`/`0m`.
+  *Verification hint:
+  `test_f2_compact_window_keeps_fractions_and_never_renders_zero_as_a_day`.*
+
+- **AC-121** (Verifies FR-15, FR-35): Given two invocations differing only in
+  their instant `--since`, when each is recorded in history, then both yield the
+  identical raw invocation `--since '<instant>' …` — an instant is unique per
+  run by construction, so recording it verbatim would mint a template per run
+  and defeat frequency ranking and transitions — while a duration `--since 10m`
+  is recorded verbatim; every part is shell-quoted, so a value containing a
+  space survives the `shlex.split` re-parse `triage` performs; and a template
+  carrying `<instant>` is never auto-run.
+  *Verification hint: `test_history_raw_records_an_instant_since_as_a_placeholder`,
+  `test_history_raw_canonical_form`.*
+
+- **AC-122** (Verifies FR-15, EC-37, FR-25): Given an instant `--since` older
+  than the hot retention window, when the command runs with `--verbose`, then
+  the rows are the cold-route answer as before and stderr carries a one-line
+  notice naming the instant and the hot window; an in-window instant, a wide
+  duration, and the same instant without `--verbose` print no such notice.
+  *Verification hint:
+  `test_f2_instant_older_than_hot_window_is_disclosed_under_verbose`.*
 
 ### Examples
 

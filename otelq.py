@@ -132,6 +132,7 @@ __all__ = [
     "_parse_since",
     "_parse_window",
     "_parse_instant",
+    "_compact_window",
     "_seal_external_access",
     "_future_ceiling",
     "_fmt_ts",
@@ -143,6 +144,8 @@ __all__ = [
     "_history_janitor",
     "_HISTORY_NO_STORE_MSG",
     "_triage_config",
+    "_triage_concrete",
+    "_TriageCandidate",
     "_TRIAGE_NO_HISTORY_MSG",
     "_TRIAGE_NO_CANDIDATE_MSG",
     # worktree scoping (SPEC-otelq-worktree-scoping)
@@ -2032,49 +2035,82 @@ class Plan:
         self.now = now or _utc_now()
 
 
-def _parse_since(since: str | None) -> timedelta | None:
+def _parse_since(
+    since: str | None, *, flag: str = "--since", mention_instant: bool = True
+) -> timedelta | None:
     """Translate a window like '30s' / '10m' / '2h' / '1d' into a timedelta.
 
     Durations ONLY. `--since` also accepts an absolute instant (FR-15), but that
     form is resolved by `_parse_window`, because this grammar is shared with
-    `await --timeout`/`--poll`, where an instant would be meaningless.
+    `await --timeout`/`--poll`, where an instant would be meaningless. The error
+    therefore names the CALLER's flag, and advertises the instant spellings only
+    where they are accepted (`mention_instant`) — a `--timeout` message offering
+    a form `--timeout` rejects would send the caller straight into the next
+    usage error.
     """
     if not since:
         return None
     units = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
     unit = units.get(since[-1].lower())
     if unit is None or not since[:-1].isdigit():
-        _fail(
-            REASON_USAGE_ERROR,
-            f"invalid --since '{since}' (use a trailing window like 30s, 10m, 2h, 1d, "
-            "or an absolute UTC instant like 2026-09-03T08:18:50Z or @<epoch-seconds>)",
-        )
+        if mention_instant:
+            forms = (
+                "use a trailing window like 30s, 10m, 2h, 1d, or an absolute UTC "
+                "instant like 2026-09-03T08:18:50Z or @<epoch-seconds>"
+            )
+        else:
+            forms = "use a duration like 30s, 10m, 2h, 1d"
+        _fail(REASON_USAGE_ERROR, f"invalid {flag} '{since}' ({forms})")
     return timedelta(**{unit: int(since[:-1])})
 
 
 def _looks_like_instant(text: str) -> bool:
-    """Whether a `--since` value is written as an absolute instant rather than a
-    duration: `@<epoch>` or a calendar date (`YYYY-MM-DD...`). Decided on SHAPE,
+    """Whether a `--since` value is WRITTEN as an absolute instant rather than a
+    duration: `@…` or a calendar-date prefix (`YYYY-MM-DD…`). Decided on SHAPE,
     before parsing, so a malformed instant is reported as a malformed instant
-    and not as a malformed duration."""
+    and not as a malformed duration. Whether it PARSES is `_parse_instant`'s
+    call, against the exact grammar below."""
     return text.startswith("@") or bool(re.match(r"^\d{4}-\d{2}-\d{2}", text))
+
+
+# FR-15 instant grammar, matched EXACTLY before anything is parsed. The stdlib
+# parsers are wider than the SPEC: `datetime.fromisoformat` takes a bare date
+# (`2026-06-22` — silently midnight, a window up to a day wider than the caller
+# pictured) and `float()` takes `@-5`/`@1e9`/`@`-with-nothing. Widening a query
+# window without the caller having said so is the one thing a lower bound must
+# never do, so the accepted spellings are enumerated here, not inherited.
+_INSTANT_ISO_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?$"
+)
+_INSTANT_EPOCH_RE = re.compile(r"^@(\d+)(?:\.(\d+))?$")
 
 
 def _parse_instant(text: str) -> datetime | None:
     """An absolute UTC instant as naive UTC (the reader's event-time basis).
 
-    Accepted: `@<epoch-seconds>` (integer or fractional) and ISO-8601 /
-    RFC-3339 (`2026-09-03T08:18:50Z`, `...T08:18:50.123+00:00`, a non-UTC offset
-    which is CONVERTED to UTC, or a bare `2026-09-03 08:18:50`, which is UTC by
-    otelq's convention — FR-29). Returns None when the text does not parse.
+    Accepted, and nothing else: `@<epoch-seconds>` as a non-negative decimal,
+    and ISO-8601/RFC-3339 WITH a time component — `YYYY-MM-DD`, then `T` or a
+    space, then `HH:MM[:SS[.fraction]]`, then `Z`, `±HH:MM` (a non-UTC offset
+    is CONVERTED to UTC) or nothing (UTC by otelq's convention, FR-29). A bare
+    date is refused rather than read as midnight. Sub-second digits are FLOORED
+    to the microsecond on both spellings: rounding `@…610.9999999` up into
+    second 611 would move the lower bound past a record the caller asked for.
+    Returns None when the text is not an accepted instant.
     """
-    try:
-        if text.startswith("@"):
-            parsed = datetime.fromtimestamp(float(text[1:]), tz=timezone.utc)
-        else:
-            parsed = datetime.fromisoformat(text)
-    except (ValueError, OverflowError, OSError):
+    epoch = _INSTANT_EPOCH_RE.match(text)
+    if epoch:
+        micros = int((epoch.group(2) or "").ljust(6, "0")[:6])
+        try:
+            parsed = datetime.fromtimestamp(int(epoch.group(1)), tz=timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return None
+        return parsed.replace(tzinfo=None) + timedelta(microseconds=micros)
+    if not _INSTANT_ISO_RE.match(text):
         return None
+    try:
+        parsed = datetime.fromisoformat(text)  # truncates a >6-digit fraction
+    except ValueError:
+        return None  # shape-valid but impossible, e.g. month 13
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(timezone.utc)
     return parsed.replace(tzinfo=None)
@@ -2099,9 +2135,9 @@ def _parse_window(since: str | None, now: datetime) -> timedelta | None:
     if instant is None:
         _fail(
             REASON_USAGE_ERROR,
-            f"invalid --since instant '{since}' (use ISO-8601 UTC like "
-            "2026-09-03T08:18:50Z, a bare 'YYYY-MM-DD HH:MM:SS' read as UTC, or "
-            "@<epoch-seconds>)",
+            f"invalid --since instant '{since}' (use ISO-8601 UTC with a time "
+            "component like 2026-09-03T08:18:50Z, a bare 'YYYY-MM-DD HH:MM:SS' "
+            "read as UTC, or @<epoch-seconds> as a non-negative number)",
         )
     if instant > now:
         # A window that starts after the clock returns nothing, silently, and
@@ -2154,12 +2190,23 @@ def plan_range(args: argparse.Namespace) -> Plan:
 
 
 def _compact_window(window: timedelta) -> str:
-    """A window as the compact form the user types (30s/10m/2h/1d)."""
-    seconds = int(window.total_seconds())
+    """A window as the compact form the user types (30s/10m/2h/1d).
+
+    A width that is not a whole number of seconds — an instant `--since`
+    measured against a sub-second clock — keeps its fraction (`29.75s`): the
+    header discloses the bounds actually APPLIED (FR-46), and flooring would
+    state a width other than the one the query used. A zero width (an instant
+    equal to the clock) is `0s`; `0 % 86400 == 0` must not make it `0d`."""
+    seconds = window.total_seconds()
+    if seconds <= 0:
+        return "0s"
+    if seconds != int(seconds):
+        return f"{seconds:.6f}".rstrip("0").rstrip(".") + "s"
+    whole = int(seconds)
     for size, suffix in ((86400, "d"), (3600, "h"), (60, "m")):
-        if seconds % size == 0:
-            return f"{seconds // size}{suffix}"
-    return f"{seconds}s"
+        if whole % size == 0:
+            return f"{whole // size}{suffix}"
+    return f"{whole}s"
 
 
 def _human_window(window: timedelta | None) -> str:
@@ -2212,6 +2259,24 @@ def _plan_summary(plan: Plan) -> str:
     return (
         f"otelq: window={_human_window(plan.window)} (by event-time), "
         f"route={plan.route.lower()}, cache={cache}"
+    )
+
+
+def _instant_cold_notice(since: str | None, plan: Plan) -> str | None:
+    """The --verbose line for an instant `--since` older than the hot window
+    (FR-15). Routing is unchanged — it is served COLD exactly as a duration
+    wider than the hot window is — but a duration is a width the caller chose
+    knowing its size, whereas an instant's age is whatever the clock says now,
+    so the same run start quietly becomes a full raw scan half an hour in. The
+    caller picked a bound, not a route; say which one they got."""
+    if plan.route != "COLD" or plan.origin != "--since" or not since:
+        return None
+    text = since.strip()
+    if not _looks_like_instant(text):
+        return None
+    return (
+        f"otelq: --since instant {text} is older than the {RETENTION_MINUTES}m "
+        "hot window; served by the cold route (full raw scan)"
     )
 
 
@@ -2554,6 +2619,9 @@ def run_command(
     verbose = bool(getattr(args, "verbose", False))
     if verbose:
         print(_plan_summary(plan), file=sys.stderr)
+        notice = _instant_cold_notice(getattr(args, "since", None), plan)
+        if notice:
+            print(notice, file=sys.stderr)
     command = COMMANDS[args.command]
     fallback = plan.use_cache and plan.route == "HOT_THEN_COLD"
     conn, build_info = build_connection(args.dir, plan)
@@ -4228,10 +4296,14 @@ _HISTORY_TOP_DEFAULTS = {"errors": 50, "slow": 20, "logs": 50, "metric": 50}
 # literals); templates do, and template identity is what makes frequency and
 # transition statistics meaningful. Quoted SQL literals ('' escapes included)
 # and long hex ids collapse to '?'; everything else — including --regex/--grep
-# patterns and --since windows — stays verbatim, because those values ARE the
-# reusable recipe.
+# patterns and --since durations — stays verbatim, because those values ARE the
+# reusable recipe. The one value that is never a recipe is an instant --since
+# (FR-15): "since my run started" is unique per run by construction, so it is
+# recorded as a placeholder already in the raw form — a placeholder is what the
+# caller should see when the template is suggested back (FR-35).
 _HISTORY_SQL_LITERAL_RE = re.compile(r"'(?:[^']|'')*'")
 _HISTORY_HEX_ID_RE = re.compile(r"\b[0-9a-fA-F]{16,}\b")
+_HISTORY_INSTANT_PLACEHOLDER = "<instant>"
 
 
 class _HistoryConfig(NamedTuple):
@@ -4333,20 +4405,32 @@ def history_dir(telemetry_dir: Path) -> Path:
 
 def _history_raw(args: argparse.Namespace) -> str:
     """The canonical invocation string: the semantic parts of the command line,
-    in fixed order. Presentation flags (--format/--verbose) and perf flags
-    (--no-cache) are excluded — they don't change what was asked."""
+    in fixed order, each shell-quoted so the string re-parses with `shlex.split`
+    (triage re-runs it, FR-35) — a `--grep 'two words'` or a bare
+    `--since 'YYYY-MM-DD HH:MM:SS'` would otherwise split into extra tokens and
+    fail to parse. Presentation flags (--format/--verbose) and perf flags
+    (--no-cache) are excluded — they don't change what was asked. An instant
+    `--since` is recorded as the `<instant>` placeholder (see the notes above);
+    a duration stays verbatim. The `sql` query text is the one unquoted part: it
+    is normalised as SQL, not shell (`_history_normalize`), and is rendered for
+    a human to re-quote — shell-quoting it would wrap the whole query in the
+    very quotes the SQL-literal collapse looks for."""
     parts: list[str] = []
     since = getattr(args, "since", None)
     if since:
-        parts += ["--since", str(since)]
+        text = str(since).strip()
+        if _looks_like_instant(text):
+            text = _HISTORY_INSTANT_PLACEHOLDER
+        parts += ["--since", text]
     if getattr(args, "all", False):
         parts.append("--all")
     regex = getattr(args, "regex", None)
     if regex is not None:
         parts += ["--regex", str(regex)]
     parts.append(args.command)
+    query: list[str] = []
     if args.command == "sql":
-        parts.append(str(args.query))
+        query.append(str(args.query))
     elif args.command == "trace":
         parts.append(str(args.trace_id))
     elif args.command == "metric":
@@ -4359,14 +4443,25 @@ def _history_raw(args: argparse.Namespace) -> str:
     top = getattr(args, "top", None)
     if top is not None and top != _HISTORY_TOP_DEFAULTS.get(args.command):
         parts += ["--top", str(top)]
-    return " ".join(parts)
+    return " ".join([shlex.quote(p) for p in parts] + query)
 
 
 def _history_normalize(command: str, raw: str) -> str:
     """Collapse an invocation to its template (see the regex notes above)."""
     norm = re.sub(r"\s+", " ", raw).strip()
     if command == "sql":
-        norm = _HISTORY_SQL_LITERAL_RE.sub("'?'", norm)
+        # Collapse literals in the QUERY TEXT only. The flags before the `sql`
+        # token are shell-quoted (`_history_raw`), and a quoted `--regex 'a|b'`
+        # or `--since '<instant>'` is a recipe, not a SQL literal. The command
+        # token is the first bare ` sql `: a flag value can only contain that
+        # substring inside its shell quotes, which `_history_raw` puts there
+        # exactly when the value has a space.
+        if norm.startswith("sql "):
+            head, query = "sql ", norm[4:]
+        else:
+            before, sep, query = norm.partition(" sql ")
+            head = before + sep
+        norm = head + _HISTORY_SQL_LITERAL_RE.sub("'?'", query)
     norm = _HISTORY_HEX_ID_RE.sub("?", norm)
     if command == "trace":
         # trace ids are volatile even when short (a unique prefix is accepted);
@@ -4796,7 +4891,11 @@ class _TriageCandidate(NamedTuple):
 def _triage_concrete(candidate: _TriageCandidate) -> bool:
     """A template is auto-runnable only when normalisation introduced no '?'
     placeholders — i.e. the stored example IS the template. Re-running someone
-    else's stale trace id or SQL literal verbatim would query noise."""
+    else's stale trace id or SQL literal verbatim would query noise. The
+    `<instant>` placeholder (FR-15) is already in the raw form, so it is checked
+    by name: there is no instant to re-run, only a bound for the caller to fill."""
+    if _HISTORY_INSTANT_PLACEHOLDER in candidate.raw_example:
+        return False
     return candidate.norm == re.sub(r"\s+", " ", candidate.raw_example).strip()
 
 
@@ -5225,8 +5324,9 @@ class _AwaitInterrupted(Exception):
 
 
 def _await_duration(value: str, flag: str) -> float:
-    """Parse an await duration, reusing the `--since` grammar (FR-1)."""
-    delta = _parse_since(value)
+    """Parse an await duration, reusing the `--since` DURATION grammar (FR-1).
+    An instant is meaningless here, so the error must not advertise one."""
+    delta = _parse_since(value, flag=flag, mention_instant=False)
     if delta is None or delta.total_seconds() <= 0:
         _fail(
             REASON_USAGE_ERROR,

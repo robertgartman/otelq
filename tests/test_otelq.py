@@ -2089,12 +2089,23 @@ def test_f2_since_accepts_an_absolute_utc_instant() -> None:
 
 
 def test_f2_malformed_or_future_instant_is_a_usage_error(temp_telemetry: Path) -> None:
-    # EC-6: a malformed INSTANT is reported as one (shape decides the grammar).
-    for bad in ("2026-13-45T00:00:00Z", "@abc", "2026-06-22Tnoon"):
+    # EC-6: a malformed INSTANT is reported as one (shape decides the grammar) —
+    # by the instant message's own prefix, not by the word "instant", which the
+    # duration message also carries now that it advertises both spellings. The
+    # shape gate is deliberately wider than the grammar (AC-118): a bare date
+    # and a bodiless/negative/non-numeric `@` are instant-SHAPED, so they are
+    # refused as malformed instants, never widened into a window (midnight) or
+    # mis-reported as a bad duration.
+    for bad in (
+        "2026-13-45T00:00:00Z", "@abc", "2026-06-22Tnoon",
+        "2026-06-22", "@", "@-5", "@1e9",
+    ):
         proc = _cli("--dir", str(temp_telemetry), "--since", bad, "logs")
         assert proc.returncode == 2, (bad, proc.stderr)
         assert _reason(proc.stderr) == "usage_error"
-        assert "instant" in proc.stderr, proc.stderr
+        assert f"invalid --since instant '{bad}'" in proc.stderr, proc.stderr
+        assert "trailing window" not in proc.stderr, proc.stderr
+        assert "@<epoch-seconds>" in proc.stderr, proc.stderr
     # EC-35: a future instant can only return nothing; that is an error, not
     # an empty answer.
     proc = _cli("--dir", str(temp_telemetry), "--since", "2099-01-01T00:00:00Z", "logs")
@@ -2146,12 +2157,154 @@ def test_f2_since_instant_is_disclosed_as_the_lower_bound(
 
 def test_f2_await_timeout_keeps_the_duration_grammar(temp_telemetry: Path) -> None:
     # `await --timeout` shares the DURATION grammar only (FR-1); an instant
-    # there is meaningless and must stay a usage error.
-    proc = _cli(
-        "--dir", str(temp_telemetry), "await", "--timeout", "2026-06-22T12:00:10Z", "logs"
-    )
+    # there is meaningless and must stay a usage error — one that names the
+    # flag actually at fault and does NOT advertise the instant spellings,
+    # which would send the caller straight into the next usage error (EC-6).
+    for bad in ("2026-06-22T12:00:10Z", "10x"):
+        proc = _cli("--dir", str(temp_telemetry), "await", "--timeout", bad, "logs")
+        assert proc.returncode == 2, proc.stderr
+        assert _reason(proc.stderr) == "usage_error"
+        assert f"invalid --timeout '{bad}'" in proc.stderr, proc.stderr
+        assert "--since" not in proc.stderr, proc.stderr
+        assert "instant" not in proc.stderr, proc.stderr
+    proc = _cli("--dir", str(temp_telemetry), "await", "--timeout", "5s", "--poll", "1x", "logs")
     assert proc.returncode == 2, proc.stderr
-    assert _reason(proc.stderr) == "usage_error"
+    assert "invalid --poll '1x'" in proc.stderr and "instant" not in proc.stderr, proc.stderr
+
+
+def test_f2_instant_grammar_is_exact_and_floors_fractions() -> None:
+    # AC-118: the accepted spellings are enumerated, not inherited from the
+    # stdlib parsers, which are wider than the SPEC (a bare date is midnight to
+    # `fromisoformat`; `float()` takes a sign and an exponent).
+    base = datetime(2026, 6, 22, 12, 0, 0)
+    now = base + timedelta(seconds=40)
+    pw = otelq._parse_window
+    assert pw("2026-06-22T12:00Z", now) == timedelta(seconds=40), "HH:MM is a time"
+    assert pw("2026-06-22 12:00:10.5", now) == timedelta(seconds=29, milliseconds=500)
+    for bad in ("2026-06-22", "2026-06-22T12", "@", "@-5", "@abc", "@1e9", "@ 5"):
+        assert otelq._parse_instant(bad) is None, bad
+        with pytest.raises(SystemExit):
+            pw(bad, now)
+    # A sub-microsecond fraction FLOORS on both spellings. Rounding would carry
+    # ...:10.9999999 up into second 11, moving the lower bound past a record at
+    # 10.999999 that the caller asked for.
+    epoch = int((base + timedelta(seconds=10)).replace(tzinfo=timezone.utc).timestamp())
+    floored = timedelta(seconds=29, microseconds=1)
+    assert pw(f"@{epoch}.9999999", now) == floored
+    assert pw("2026-06-22T12:00:10.9999999Z", now) == floored
+    assert pw(f"@{epoch}.5", now) == timedelta(seconds=29, milliseconds=500)
+
+
+def test_f2_compact_window_keeps_fractions_and_never_renders_zero_as_a_day() -> None:
+    # AC-120/FR-46: the disclosed width is the width APPLIED. An instant measured
+    # against a sub-second clock is rarely a whole second; flooring 29.75s to
+    # 29s would disclose a bound other than the one used. And a zero width (the
+    # instant equals the clock) is 0s — `0 % 86400 == 0` must not make it "0d".
+    cw = otelq._compact_window
+    assert cw(timedelta(0)) == "0s"
+    assert cw(timedelta(seconds=29, milliseconds=750)) == "29.75s"
+    assert cw(timedelta(minutes=1, milliseconds=500)) == "60.5s"
+    assert cw(timedelta(seconds=29, microseconds=1)) == "29.000001s"
+    # whole widths keep the compact unit forms
+    assert cw(timedelta(seconds=90)) == "90s"
+    assert cw(timedelta(minutes=10)) == "10m"
+    assert cw(timedelta(hours=2)) == "2h"
+    assert cw(timedelta(days=1)) == "1d"
+
+
+def test_f2_await_instant_lower_bound_holds_still_across_polls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AC-119/EC-36 — THE property the instant form exists for. A duration is
+    # re-measured on every await poll, so its lower bound slides forward with
+    # the clock; an instant is the bound itself. Driven in-process with a
+    # STEPPING clock (every read advances it) and a sleep that lands the awaited
+    # record instead of waiting, so two real polls happen at two clock readings.
+    base = datetime(2026, 6, 22, 12, 0, 0)
+    instant = base + timedelta(seconds=10)
+    clock = {"now": base + timedelta(seconds=40)}
+    arrived: list[datetime] = []
+    active: list[Path] = []
+
+    def stepping_now() -> datetime:
+        clock["now"] += timedelta(seconds=1)
+        return clock["now"]
+
+    def arrive_on_first_sleep(_: float) -> None:
+        if arrived:
+            return
+        arrived.append(clock["now"])
+        write_jsonl(
+            active[-1] / "logs.jsonl",
+            [make_log(clock["now"].replace(tzinfo=timezone.utc), body="ARRIVED")],
+            append=True,
+        )
+
+    monkeypatch.setattr(otelq, "_utc_now", stepping_now)
+    monkeypatch.setattr(_time, "sleep", arrive_on_first_sleep)
+
+    def await_with(name: str, since: str) -> tuple[datetime, datetime, datetime]:
+        # a FRESH store per run: the first run's cache would otherwise still
+        # hold ARRIVED and satisfy the second on its first poll, and a single
+        # poll cannot show whether a bound moves.
+        d = tmp_path / name
+        d.mkdir()
+        active.append(d)
+        write_jsonl(d / "logs.jsonl", [make_log(base, body="old")])
+        arrived.clear()
+        # the deadline is measured from process start; re-anchor it per run
+        monkeypatch.setattr(otelq, "_PROCESS_T0", _time.monotonic())
+        started = clock["now"]
+        out = _run(
+            d, "--since", since, "await", "--timeout", "60s",
+            "--poll", "1s", "logs", "--grep", "ARRIVED",
+        )
+        assert arrived, "the record must have landed between two polls"
+        assert "ARRIVED" in out
+        lo, hi = _window_bounds(out)
+        return started, lo.replace(tzinfo=None), hi.replace(tzinfo=None)
+
+    started, lo, hi = await_with("instant", "2026-06-22T12:00:10Z")
+    assert hi > started + timedelta(seconds=1), "the clock moved across the polls"
+    assert lo == instant, "the instant IS the lower bound on the final poll"
+
+    # Control: the same wait with a duration slides its lower bound forward.
+    started, lo, hi = await_with("duration", "30s")
+    assert hi > started + timedelta(seconds=1), "the clock moved across the polls"
+    assert hi - lo == timedelta(seconds=30)
+    assert lo > started - timedelta(seconds=30), "a duration's bound slid with the clock"
+    assert lo != instant
+
+
+def test_f2_instant_older_than_hot_window_is_disclosed_under_verbose(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # AC-122/FR-15: an instant older than the hot window routes COLD exactly as
+    # a wider duration does — unchanged — but a duration is a width the caller
+    # chose knowing its size, while an instant's age is whatever the clock says
+    # now. Under --verbose the crossing is named; routing itself is not touched.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _pin_now(monkeypatch, base + timedelta(hours=2))
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base + timedelta(hours=1), body="x")])
+
+    out = _run(temp_telemetry, "--verbose", "--since", "2026-06-22T12:00:00Z", "logs")
+    err = capsys.readouterr().err
+    assert "route=cold" in err, err
+    assert "otelq: --since instant 2026-06-22T12:00:00Z is older than the 30m hot window" in err
+    assert "cold route" in err, err
+    assert '"x"' in out  # the answer is the full-history one, as before
+
+    # in-window instant: hot route, no notice
+    _run(temp_telemetry, "--verbose", "--since", "2026-06-22T13:45:00Z", "logs")
+    err = capsys.readouterr().err
+    assert "route=hot" in err and "hot window" not in err, err
+    # a wide DURATION is a width the caller picked: cold, no notice
+    _run(temp_telemetry, "--verbose", "--since", "3h", "logs")
+    err = capsys.readouterr().err
+    assert "route=cold" in err and "hot window" not in err, err
+    # without --verbose nothing is said at all
+    _run(temp_telemetry, "--since", "2026-06-22T12:00:00Z", "logs")
+    assert "hot window" not in capsys.readouterr().err
 
 
 def _raw_span(ts: datetime, tid: str, sid: str, name: str = "GET /x") -> dict[str, Any]:
@@ -2983,6 +3136,9 @@ def test_history_records_and_compacts(temp_telemetry: Path) -> None:
     assert (hd / "audit.jsonl").stat().st_size > 0
 
 
+import shlex as _shlex  # noqa: E402
+
+
 def test_history_raw_canonical_form() -> None:
     args = Namespace(
         command="errors", since="10m", all=False, regex=None, top=20
@@ -2995,9 +3151,51 @@ def test_history_raw_canonical_form() -> None:
         command="logs", since=None, all=True, regex="timeout|reset",
         service=None, level="ERROR", grep=None, top=50,
     )
+    # every part is shell-quoted, so the string is exactly what a shell needs
+    # and re-parses with shlex.split (triage re-runs it)
     assert (
         otelq._history_raw(lg)
-        == "--all --regex timeout|reset logs --level ERROR"
+        == "--all --regex 'timeout|reset' logs --level ERROR"
+    )
+
+
+def test_history_raw_records_an_instant_since_as_a_placeholder() -> None:
+    # AC-121/FR-15: an instant --since is unique per run by construction, so
+    # recorded verbatim every anchored call would be its own template and the
+    # ranking/transition statistics would never see a repeat. It is recorded as
+    # the `<instant>` placeholder in the RAW form; a duration stays verbatim.
+    def logs(since: str, grep: str | None = None) -> Namespace:
+        return Namespace(
+            command="logs", since=since, all=False, regex=None,
+            service=None, level=None, grep=grep, top=50,
+        )
+
+    a = otelq._history_raw(logs("2026-06-22T12:00:10Z"))
+    b = otelq._history_raw(logs("@1782129610"))
+    c = otelq._history_raw(logs("2026-06-22 12:00:10"))
+    assert a == b == c == "--since '<instant>' logs", (a, b, c)
+    assert otelq._history_raw(logs("10m")) == "--since 10m logs"
+    # a value with a space round-trips through the re-parse triage performs
+    raw = otelq._history_raw(logs("2026-06-22 12:00:10", grep="two words"))
+    assert _shlex.split(raw) == ["--since", "<instant>", "logs", "--grep", "two words"]
+    # the placeholder survives normalisation unchanged, and a template carrying
+    # it is never auto-run (FR-35 concreteness): there is no instant to re-run
+    norm = otelq._history_normalize("logs", a)
+    assert norm == a
+    cand = otelq._TriageCandidate(
+        qid="q", raw_example=a, norm=norm, command="logs", evidence=9.0, share=1.0
+    )
+    assert not otelq._triage_concrete(cand)
+    # under `sql`, the literal collapse is scoped to the QUERY TEXT: the quoted
+    # flag values before the command token are recipe, not SQL literals
+    q = Namespace(
+        command="sql", since="2026-06-22T12:00:10Z", all=False, regex="a|b",
+        query="SELECT 1 WHERE x = 'lit' AND y = 'it''s'",
+    )
+    raw = otelq._history_raw(q)
+    assert raw == "--since '<instant>' --regex 'a|b' sql SELECT 1 WHERE x = 'lit' AND y = 'it''s'"
+    assert otelq._history_normalize("sql", raw) == (
+        "--since '<instant>' --regex 'a|b' sql SELECT 1 WHERE x = '?' AND y = '?'"
     )
 
 
