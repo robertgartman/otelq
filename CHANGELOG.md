@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.1.0](https://github.com/robertgartman/otelq/compare/v2.0.0...v2.1.0) (2026-09-05)
+
+
+### Features
+
+* add .DS_Store to .gitignore for MacOS compatibility ([e4ebaab](https://github.com/robertgartman/otelq/commit/e4ebaab4e4540de46a6854c56383a6e259d575e8))
+* **cli:** --since accepts an absolute UTC instant as the window's lower bound ([81393dd](https://github.com/robertgartman/otelq/commit/81393ddd96f532f1e703aa01603ccfc60fce54b8))
+
+
+### Bug Fixes
+
+* **cli:** tighten the --since instant grammar, its errors, and what it discloses ([4090e6d](https://github.com/robertgartman/otelq/commit/4090e6d38118270af78a774113c72b5fa7f5b621))
+
 ## [2.0.0](https://github.com/robertgartman/otelq/compare/v1.0.0...v2.0.0) (2026-08-13)
 
 
