@@ -80,7 +80,7 @@ if TYPE_CHECKING:
 # agent driving otelq — and the DuckDB/extension pin governance of ADR-003 — can
 # report exactly which build it is talking to. The trailing marker lets
 # release-please bump this line alongside pyproject.toml (see release-please.yml).
-__version__ = "2.0.0"  # x-release-please-version
+__version__ = "2.1.0"  # x-release-please-version
 
 # Earliest instant otelq can observe. `await` measures its wait from here, so
 # the figure it reports is a LOWER BOUND on true wall-clock: interpreter and
@@ -130,6 +130,8 @@ __all__ = [
     "_LOCK_HARD_STALE_SECS",
     "_NO_TELEMETRY_MSG",
     "_parse_since",
+    "_parse_window",
+    "_parse_instant",
     "_seal_external_access",
     "_future_ceiling",
     "_fmt_ts",
@@ -2031,7 +2033,12 @@ class Plan:
 
 
 def _parse_since(since: str | None) -> timedelta | None:
-    """Translate a window like '30s' / '10m' / '2h' / '1d' into a timedelta."""
+    """Translate a window like '30s' / '10m' / '2h' / '1d' into a timedelta.
+
+    Durations ONLY. `--since` also accepts an absolute instant (FR-15), but that
+    form is resolved by `_parse_window`, because this grammar is shared with
+    `await --timeout`/`--poll`, where an instant would be meaningless.
+    """
     if not since:
         return None
     units = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
@@ -2039,16 +2046,84 @@ def _parse_since(since: str | None) -> timedelta | None:
     if unit is None or not since[:-1].isdigit():
         _fail(
             REASON_USAGE_ERROR,
-            f"invalid --since '{since}' (use e.g. 30s, 10m, 2h, 1d)",
+            f"invalid --since '{since}' (use a trailing window like 30s, 10m, 2h, 1d, "
+            "or an absolute UTC instant like 2026-09-03T08:18:50Z or @<epoch-seconds>)",
         )
     return timedelta(**{unit: int(since[:-1])})
+
+
+def _looks_like_instant(text: str) -> bool:
+    """Whether a `--since` value is written as an absolute instant rather than a
+    duration: `@<epoch>` or a calendar date (`YYYY-MM-DD...`). Decided on SHAPE,
+    before parsing, so a malformed instant is reported as a malformed instant
+    and not as a malformed duration."""
+    return text.startswith("@") or bool(re.match(r"^\d{4}-\d{2}-\d{2}", text))
+
+
+def _parse_instant(text: str) -> datetime | None:
+    """An absolute UTC instant as naive UTC (the reader's event-time basis).
+
+    Accepted: `@<epoch-seconds>` (integer or fractional) and ISO-8601 /
+    RFC-3339 (`2026-09-03T08:18:50Z`, `...T08:18:50.123+00:00`, a non-UTC offset
+    which is CONVERTED to UTC, or a bare `2026-09-03 08:18:50`, which is UTC by
+    otelq's convention — FR-29). Returns None when the text does not parse.
+    """
+    try:
+        if text.startswith("@"):
+            parsed = datetime.fromtimestamp(float(text[1:]), tz=timezone.utc)
+        else:
+            parsed = datetime.fromisoformat(text)
+    except (ValueError, OverflowError, OSError):
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed.replace(tzinfo=None)
+
+
+def _parse_window(since: str | None, now: datetime) -> timedelta | None:
+    """The `--since` window as a width measured back from `now` (FR-15).
+
+    Two spellings, one meaning. A DURATION (`30s`/`10m`/`2h`/`1d`) is a width;
+    an INSTANT (`2026-09-03T08:18:50Z`, `@1788423530`) is the lower bound the
+    caller actually knows — "everything since my run started" — and is turned
+    into the width `now - instant` here, so every consumer downstream keeps
+    seeing one shape. The instant form never drifts: a duration re-measured on
+    each `await` poll slides its lower bound forward, an instant does not.
+    """
+    if not since:
+        return None
+    text = since.strip()
+    if not _looks_like_instant(text):
+        return _parse_since(text)
+    instant = _parse_instant(text)
+    if instant is None:
+        _fail(
+            REASON_USAGE_ERROR,
+            f"invalid --since instant '{since}' (use ISO-8601 UTC like "
+            "2026-09-03T08:18:50Z, a bare 'YYYY-MM-DD HH:MM:SS' read as UTC, or "
+            "@<epoch-seconds>)",
+        )
+    if instant > now:
+        # A window that starts after the clock returns nothing, silently, and
+        # a caller who passed a future instant has the wrong value or the wrong
+        # clock — both are worth a real error rather than an empty answer.
+        _fail(
+            REASON_USAGE_ERROR,
+            f"--since instant '{since}' is in the future (wall-clock now is "
+            f"{_iso_utc(now)}); nothing can have happened since then",
+        )
+    return now - instant
 
 
 def plan_range(args: argparse.Namespace) -> Plan:
     cmd = args.command
     no_cache = bool(getattr(args, "no_cache", False))
     all_flag = bool(getattr(args, "all", False))
-    since = _parse_since(getattr(args, "since", None))
+    # ONE wall-clock reading (ADR-015/FR-15): the instant form of --since is
+    # measured against the same `now` the Plan applies, so the disclosed lower
+    # bound (FR-46) is exactly the instant the caller passed.
+    now = _utc_now()
+    since = _parse_window(getattr(args, "since", None), now)
     hot = timedelta(minutes=RETENTION_MINUTES)
     use_cache = not no_cache
 
@@ -2075,7 +2150,7 @@ def plan_range(args: argparse.Namespace) -> Plan:
         route = "HOT_THEN_COLD"
     else:
         route = "HOT"
-    return Plan(route, window, use_cache, origin)
+    return Plan(route, window, use_cache, origin, now)
 
 
 def _compact_window(window: timedelta) -> str:
@@ -3776,6 +3851,12 @@ def build_parser() -> argparse.ArgumentParser:
             time window (wall-clock, over each record's event-time):
               (default)            the trailing 30 minutes
               --since Ns|Nm|Nh|Nd  only the trailing window, e.g. 30s, 10m, 2h, 1d
+              --since <instant>    everything since an absolute UTC instant:
+                                   ISO-8601 (2026-09-03T08:18:50Z, an offset is
+                                   converted, a bare date-time is UTC) or
+                                   @<epoch-seconds>. A caller that knows when
+                                   its run started passes that, not a width
+                                   that has to be re-derived per call.
               --all                the full captured history (no window)
               `trace` ignores the window — a trace id is looked up across all
               history, and a unique id prefix is accepted.
@@ -3951,7 +4032,9 @@ def build_parser() -> argparse.ArgumentParser:
     # and appears in the top-level usage line. See SPEC-otelq-cli FR-11/FR-15.
     parser.add_argument(
         "--since",
-        help="restrict to a trailing time window: Ns/Nm/Nh/Nd (e.g. 30s, 10m, 2h, 1d)",
+        help="restrict to a trailing time window (Ns/Nm/Nh/Nd, e.g. 30s, 10m, 2h, "
+        "1d) or to everything since an absolute UTC instant (ISO-8601 like "
+        "2026-09-03T08:18:50Z, or @<epoch-seconds>)",
     )
     # --regex is a GLOBAL flag: like --format, it applies to the result of
     # whichever query command runs. See SPEC-otelq-cli FR-11/FR-32.

@@ -319,8 +319,10 @@ options:
   --all                 widen the query to the full raw history (cold scan)
   --no-cache            bypass the parquet cache entirely (pure cold scan)
   --verbose             print the resolved time window and route to stderr
-  --since SINCE         restrict to a trailing time window: Ns/Nm/Nh/Nd (e.g.
-                        30s, 10m, 2h, 1d)
+  --since SINCE         restrict to a trailing time window (Ns/Nm/Nh/Nd, e.g.
+                        30s, 10m, 2h, 1d) or to everything since an absolute
+                        UTC instant (ISO-8601 like 2026-09-03T08:18:50Z, or
+                        @<epoch-seconds>)
   --regex REGEX         keep only rows matching this pattern in some cell
                         (summary/errors/slow/trace/logs/metric only); reported
                         in the response header
@@ -367,6 +369,12 @@ output format (pick the fewest tokens the consumer can parse):
 time window (wall-clock, over each record's event-time):
   (default)            the trailing 30 minutes
   --since Ns|Nm|Nh|Nd  only the trailing window, e.g. 30s, 10m, 2h, 1d
+  --since <instant>    everything since an absolute UTC instant:
+                       ISO-8601 (2026-09-03T08:18:50Z, an offset is
+                       converted, a bare date-time is UTC) or
+                       @<epoch-seconds>. A caller that knows when
+                       its run started passes that, not a width
+                       that has to be re-derived per call.
   --all                the full captured history (no window)
   `trace` ignores the window — a trace id is looked up across all
   history, and a unique id prefix is accepted.
@@ -496,7 +504,6 @@ sql views (for `otelq sql "<query>"`):
   queries with the same care as a shell command.
 
 Run `otelq troubleshoot` for the capture → query loop and common fixes.
-
 ```
 
 Run `otelq help <command>` (or `otelq <command> -h`) for the full, authoritative

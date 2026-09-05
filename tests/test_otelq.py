@@ -2065,6 +2065,95 @@ def test_f2_since_seconds_windows_end_to_end(
     )
 
 
+def test_f2_since_accepts_an_absolute_utc_instant() -> None:
+    # FR-15/AC-117: an instant is the lower bound the caller actually knows.
+    # Every spelling of T+10s must resolve to the same 30s width at T+40s.
+    base = datetime(2026, 6, 22, 12, 0, 0)  # naive UTC, the reader's basis
+    now = base + timedelta(seconds=40)
+    want = timedelta(seconds=30)
+    assert otelq._parse_window("2026-06-22T12:00:10Z", now) == want
+    assert otelq._parse_window("2026-06-22T12:00:10+00:00", now) == want
+    assert otelq._parse_window("2026-06-22T14:00:10+02:00", now) == want, (
+        "a non-UTC offset is CONVERTED, never dropped (the DuckDB-literal trap)"
+    )
+    assert otelq._parse_window("2026-06-22 12:00:10", now) == want, "bare = UTC (FR-29)"
+    assert otelq._parse_window("2026-06-22T12:00:10.250Z", now) == timedelta(
+        seconds=29, milliseconds=750
+    )
+    epoch = int((base + timedelta(seconds=10)).replace(tzinfo=timezone.utc).timestamp())
+    assert otelq._parse_window(f"@{epoch}", now) == want
+    assert otelq._parse_window(f"@{epoch}.5", now) == timedelta(seconds=29, milliseconds=500)
+    # Durations still go through the duration grammar, unchanged.
+    assert otelq._parse_window("30s", now) == want
+    assert otelq._parse_window(None, now) is None
+
+
+def test_f2_malformed_or_future_instant_is_a_usage_error(temp_telemetry: Path) -> None:
+    # EC-6: a malformed INSTANT is reported as one (shape decides the grammar).
+    for bad in ("2026-13-45T00:00:00Z", "@abc", "2026-06-22Tnoon"):
+        proc = _cli("--dir", str(temp_telemetry), "--since", bad, "logs")
+        assert proc.returncode == 2, (bad, proc.stderr)
+        assert _reason(proc.stderr) == "usage_error"
+        assert "instant" in proc.stderr, proc.stderr
+    # EC-35: a future instant can only return nothing; that is an error, not
+    # an empty answer.
+    proc = _cli("--dir", str(temp_telemetry), "--since", "2099-01-01T00:00:00Z", "logs")
+    assert proc.returncode == 2, proc.stderr
+    assert _reason(proc.stderr) == "usage_error"
+    assert "future" in proc.stderr and "wall-clock" in proc.stderr, proc.stderr
+    # The duration message now names the instant forms too (FR-15).
+    proc = _cli("--dir", str(temp_telemetry), "--since", "10x", "logs")
+    assert proc.returncode == 2
+    assert "@<epoch-seconds>" in proc.stderr, proc.stderr
+
+
+def test_f2_since_instant_windows_end_to_end(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _pin_now(monkeypatch, base + timedelta(seconds=40))
+    write_jsonl(
+        temp_telemetry / "logs.jsonl",
+        [
+            make_log(base, body="oldest"),
+            make_log(base + timedelta(seconds=10), body="mid"),
+            make_log(base + timedelta(seconds=40), body="newest"),
+        ],
+    )
+    # The instant IS the lower bound: T+10s keeps mid+newest and drops oldest,
+    # exactly as `--since 30s` does at T+40s (test_f2_since_seconds_windows_end_to_end).
+    for spelling in ("2026-06-22T12:00:10Z", "2026-06-22T14:00:10+02:00", "@1782129610"):
+        out = _strip_header(_run(temp_telemetry, "--since", spelling, "logs"))
+        bodies = [r["body"] for r in _json.loads(out)]
+        assert set(bodies) == {"mid", "newest"}, spelling
+        assert _run(temp_telemetry, "--since", spelling, "logs") == _run(
+            temp_telemetry, "--no-cache", "--since", spelling, "logs"
+        ), spelling
+
+
+def test_f2_since_instant_is_disclosed_as_the_lower_bound(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FR-46: the header's applied lower bound is the instant the caller passed,
+    # with origin --since, so a reader never has to re-derive it.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    _pin_now(monkeypatch, base + timedelta(seconds=40))
+    write_jsonl(temp_telemetry / "logs.jsonl", [make_log(base + timedelta(seconds=20), body="x")])
+    out = _run(temp_telemetry, "--since", "2026-06-22T12:00:10Z", "logs")
+    field = _window_field(out)
+    assert field == "2026-06-22T12:00:10.000Z - 2026-06-22T12:00:40.000Z (30s, --since)", field
+
+
+def test_f2_await_timeout_keeps_the_duration_grammar(temp_telemetry: Path) -> None:
+    # `await --timeout` shares the DURATION grammar only (FR-1); an instant
+    # there is meaningless and must stay a usage error.
+    proc = _cli(
+        "--dir", str(temp_telemetry), "await", "--timeout", "2026-06-22T12:00:10Z", "logs"
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert _reason(proc.stderr) == "usage_error"
+
+
 def _raw_span(ts: datetime, tid: str, sid: str, name: str = "GET /x") -> dict[str, Any]:
     """A span with an explicit (already-hex) trace id, for prefix-match tests."""
     end = ts + timedelta(milliseconds=5)

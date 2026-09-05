@@ -12,7 +12,7 @@ must_not_contain:
   - architectural_rationale
   - external_data_schemas
 created: 2026-06-23
-last_updated: 2026-08-13
+last_updated: 2026-09-05
 related_documents:
   - ADR-015-wall-clock-query-window
   - PRD-otelq
@@ -406,6 +406,20 @@ configuration that produces the raw files.
   the query to a trailing window of `N` seconds (`s`), minutes (`m`), hours (`h`),
   or days (`d`). A malformed `--since` value **must** be rejected as a real error
   (FR-17) with a message naming the accepted forms.
+  - `--since` **must** also accept an **absolute UTC instant** as the window's
+    lower bound: ISO-8601/RFC-3339 (`2026-09-03T08:18:50Z`, fractional seconds
+    allowed; a non-UTC offset is converted; a bare `YYYY-MM-DD HH:MM:SS` or
+    `YYYY-MM-DDTHH:MM:SS` is UTC per FR-29) or `@<epoch-seconds>` (integer or
+    fractional). The instant is resolved to the width `now − instant` against
+    the invocation's single wall-clock reading, so every downstream rule
+    (routing, disclosure, caching) sees one window shape. A caller that knows
+    when its run started passes that instant instead of re-deriving a width on
+    every call — and, unlike a duration re-measured per `await` poll, the
+    instant's lower bound never slides. An instant **in the future** **must**
+    be rejected as a usage error (FR-17): a window that starts after the clock
+    can only return nothing, and silence there hides a wrong value or a wrong
+    clock. Which spelling applies is decided on shape (`@…` or `YYYY-MM-DD…`)
+    before parsing, so a malformed instant is reported as a malformed instant.
   - The window's lower bound **must** be measured from **host wall-clock**:
     `--since 10m` means the last ten minutes, not the ten minutes preceding the
     newest record ([ADR-015](../adr/ADR-015-wall-clock-query-window.md), INV-7 of
@@ -1118,7 +1132,13 @@ configuration that produces the raw files.
   rejected as an unrecognized argument; the user must write
   `otelq --format json errors`. (FR-11)
 - **EC-6 — Malformed `--since`.** `--since 10x` (or `--since abc`) exits non-zero
-  with a message naming the accepted forms (`10m`, `2h`, `1d`). (FR-15)
+  with a message naming the accepted forms (`10m`, `2h`, `1d`, and the instant
+  spellings); a malformed instant (`--since 2026-13-45T00:00:00Z`, `--since @abc`)
+  exits non-zero with a message naming the instant forms. (FR-15)
+- **EC-35 — Future `--since` instant.** `--since 2099-01-01T00:00:00Z` (any
+  instant later than the invocation's wall-clock reading) exits non-zero as a
+  usage error whose message states the current wall-clock, rather than
+  returning an empty result. (FR-15, FR-17)
 - **EC-7 — Far-future timestamps avoided.** Presented `timestamp` values render
   in the correct (near-present) year for genuine events, never a far-future one,
   whatever encoding the reader surfaces. (FR-16)
@@ -1324,7 +1344,8 @@ configuration that produces the raw files.
   the query is restricted to the trailing 10-minute window; given a malformed
   `--since` (e.g. `10x`), otelq exits non-zero with a message naming `10m/2h/1d`.
   *Verification hint: `_parse_since` accepts `10m/2h/1d` and raises `SystemExit`
-  on `10x`; window behavior cross-checked via `test_ac9_recent_default_vs_all`.*
+  on `10x`; window behavior cross-checked via `test_ac9_recent_default_vs_all`.
+  The instant spellings are `_parse_window`'s: AC-117.*
 - **AC-15** (Verifies FR-16, EC-7): Given the real fixture, when any relation is
   queried, then the presented `timestamp` falls in the correct (near-present)
   year, not a far-future one.
@@ -1960,6 +1981,22 @@ configuration that produces the raw files.
 
 
 
+
+- **AC-117** (Verifies FR-15, EC-6, EC-35, FR-46): Given a corpus with records
+  at T, T+10s and T+40s and the clock at T+40s, when a command runs with
+  `--since <T+10s as an ISO-8601 UTC instant>`, then exactly the T+10s and T+40s
+  records are returned, identically cached vs `--no-cache`, and the header
+  discloses the applied lower bound as that instant with origin `--since`; the
+  same window results from `@<epoch of T+10s>`, from a non-UTC offset spelling
+  of the same instant, and from the bare `YYYY-MM-DD HH:MM:SS` form; a malformed
+  instant exits `2` as `usage_error`; an instant after the wall-clock exits `2`
+  as `usage_error` with the wall-clock in the message; `await --timeout` keeps
+  the duration-only grammar.
+  *Verification hint: `test_f2_since_accepts_an_absolute_utc_instant`,
+  `test_f2_since_instant_windows_end_to_end`,
+  `test_f2_since_instant_is_disclosed_as_the_lower_bound`,
+  `test_f2_malformed_or_future_instant_is_a_usage_error`,
+  `test_f2_await_timeout_keeps_the_duration_grammar`.*
 
 ### Examples
 
