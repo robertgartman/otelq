@@ -12,7 +12,7 @@ must_not_contain:
   - implementation_walkthroughs
   - reversible_decisions
 created: 2026-06-23
-last_updated: 2026-07-07
+last_updated: 2026-09-21
 related_documents:
   - ADR-002-pep723-uv-single-file-distribution
   - ADR-006-read-otlp-extension-quirks
@@ -30,6 +30,7 @@ semantic_tags:
   - version-pin
   - ci-governance
   - offline-fallback
+  - platform-coverage
   - observability
 ---
 
@@ -124,6 +125,67 @@ absorbs it is decided in
 model of this ADR — exact pin, CI probe, offline fallback, checklist-gated
 bumps — is unchanged and applies to all future bumps.
 
+### Amendment 2026-09-21 — the published build is per platform, and the offline path is now built
+
+The 2026-07-07 bump confirmed a published build on `osx_arm64` and `linux_amd64`
+only. That was not the whole condition. The community repository builds **per
+platform as well as per version**, and each extension entry declares an
+`excluded_platforms` set. otlp 0.6.x excludes `windows_amd64`,
+`windows_amd64_mingw` and `linux_amd64_musl` — all of which had builds under
+1.5.3. The bump to `duckdb==1.5.4` therefore **silently dropped Windows and musl
+support**, and nothing could see it: CI runs `ubuntu-latest` and `macos-latest`,
+and the extension probe ran the same two. It surfaced as a user report.
+
+The failure is quiet in an unhelpful way: `uvx otelq` **installs cleanly** on
+Windows — otelq's own wheel is `py3-none-any` and DuckDB publishes Windows wheels
+— and then fails on the first query, when `INSTALL otlp FROM community` 404s. The
+missing artefact is the extension, never the package, so "no Windows build of
+otelq" is the wrong place to look.
+
+Evidence, 2026-09-21:
+`community-extensions.duckdb.org/v1.5.4/windows_amd64/otlp.duckdb_extension.gz`
+returns **HTTP 404** while the `v1.5.3` URL returns **200**; `v1.5.5` (otlp 0.6.1)
+is 404 on Windows as well. Upstream restored MSVC builds in
+`smithclay/duckdb-otlp#67` (otlp 0.7.x, built against DuckDB v1.5.5), but nothing
+is published until the entry in `duckdb/community-extensions` is updated — it
+still carries otlp 0.6.1 with `windows_amd64` excluded.
+
+**The supported-platform set is named here**, because the checklist below has to
+check against something concrete and previously did not. As of `duckdb==1.5.4`
+with otlp 0.6.x, otelq's query path works on `linux_amd64`, `linux_arm64`,
+`osx_amd64` and `osx_arm64`. `windows_amd64`, `windows_amd64_mingw` and
+`linux_amd64_musl` have **no published build**; on those, otelq installs and every
+query fails unless the extension is supplied by the fallback below. WSL2 is the
+Windows answer in the meantime, because it resolves as `linux_amd64`.
+
+**Decision point 3 is now implemented rather than merely available.** The offline
+/ vendored path had been decided in 2026-06-23 and never built, so an unsupported
+platform had no way out at all. It is now reachable from the CLI through two
+environment variables — one naming an extension file to load directly, one naming
+a repository to install from, with the file winning over the repository and the
+repository over the community default. Two DuckDB behaviours shaped that and are
+recorded because neither is obvious:
+
+- A custom repository must be installed with **`FORCE`**. A machine that has
+  already installed `otlp` from the community repository refuses a plain install
+  of the same extension from a different origin, so without `FORCE` the mirror
+  path would fail for every existing user and work only on a clean machine.
+- Loading an extension file directly requires **`allow_unsigned_extensions`**, a
+  connection-time setting. A self-built extension — the whole reason to use this
+  path on a platform the community repository does not cover — carries no
+  signature. Naming a file in that variable is therefore the trust decision, and
+  it is scoped to that case alone: the mirror and community paths keep signature
+  verification. The normative CLI contract for the two variables belongs in
+  [SPEC-otelq-cli](../spec/SPEC-otelq-cli.md); this ADR records only that the
+  fallback exists and why it has this shape.
+
+**The probe now asserts a state per platform.** Each platform leg declares whether
+a build is expected to exist, and a leg goes red when its platform's state
+*changes*. The Windows leg is green while the gap persists and red on the day the
+build appears — that red is the signal to run the checklist, not a regression.
+Without the per-platform expectation, adding Windows to the probe would only mean
+a permanently red job that nobody reads.
+
 ## Alternatives Considered
 
 - **Hand-write an OTLP-JSON parser.** Rejected. OTLP's JSON encoding (nested
@@ -145,27 +207,30 @@ bumps — is unchanged and applies to all future bumps.
 
 - **A pin-bump checklist is mandatory.** Before changing the DuckDB pin, all of
   the following must hold:
-  1. Confirm a **published `otlp` build exists for the target DuckDB version
-     across the platforms otelq supports** (per the platform support in
-     [SPEC-otelq-cli](../spec/SPEC-otelq-cli.md)), not merely that the extension
-     *declares* compatibility.
+  1. Confirm a **published `otlp` build exists for the target DuckDB version on
+     every supported platform** — each one fetched, not sampled, and never a
+     compatibility claim in the extension's manifest. The supported set is named
+     in the 2026-09-21 amendment above. A bump that drops a platform from that
+     set is a breaking change and must be recorded as one; absorbing it silently
+     is exactly what the 2026-07-07 bump did to `windows_amd64` and
+     `linux_amd64_musl`.
   2. Bump the pin in **both** the PEP 723 inline block **and** `pyproject`
      together — never one without the other (ADR-002).
   3. **Re-validate the 2048-row workaround** against the new DuckDB version, since
      that workaround depends on `read_otlp_*` behavior the new version could alter
      (see [ADR-006](../archive/ADR-006-read-otlp-extension-quirks.md)).
-- **A scheduled extension-probe workflow governs the pin continuously.** It is the
-  early-warning system for the deferred 1.5.4 bump (it surfaces when a published
-  1.5.4 `otlp` build appears) and any future divergence; the pin is only ever moved
-  through the checklist above, never reactively.
-- **An offline / air-gapped path is available and deterministic.** The extension
-  can be loaded without the community network repository by installing from a
-  mirror or local directory — `INSTALL otlp FROM '<mirror-or-local-dir>'` — or by
-  pointing DuckDB at a vendored extension directory (`SET extension_directory=...`)
-  with `allow_unsigned_extensions` enabled. The `otlp` project additionally
-  publishes an **unsigned GitHub-Pages repository**, which serves this offline /
-  CI-determinism case directly. This keeps CI and air-gapped runs from depending
-  on live community-repository availability.
+- **A scheduled extension-probe workflow governs the pin continuously**, one leg
+  per platform, each asserting whether a build is expected to exist. It is the
+  early-warning system in both directions: a supported platform losing its build,
+  and an unsupported one gaining one. The pin is only ever moved through the
+  checklist above, never reactively.
+- **An offline / air-gapped path is available and deterministic**, and as of the
+  2026-09-21 amendment it is implemented rather than notional: the extension can
+  be loaded from a supplied file or from a mirror instead of the community network
+  repository. The `otlp` project additionally publishes an **unsigned GitHub-Pages
+  repository**, which serves this case directly. This keeps CI and air-gapped runs
+  from depending on live community-repository availability — and it is the only
+  way to run otelq at all on a platform with no published build.
 - **The tool is agnostic to extension *acquisition*, not to the *pin*.** How the
   extension is loaded (community vs mirror vs vendored) can vary per environment,
   but the DuckDB version is fixed by the pin; the behavioral surface the loaded

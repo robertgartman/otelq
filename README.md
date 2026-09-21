@@ -513,6 +513,33 @@ behavior of any command.
 
 The DuckDB runtime dependency is pinned exactly. This is deliberate. otelq reads OTLP JSONL via the community [`duckdb-otlp`](https://github.com/smithclay/duckdb-otlp) extension, which is built per DuckDB version — a floating DuckDB would silently fail to load the extension. CI runs an extension-probe step that loads the extension against the pinned version so the pin and the published extension stay in lockstep. See [`context/adr/ADR-003`](context/adr/ADR-003-duckdb-otlp-extension-pin-governance.md) for the decision and trade-offs.
 
+### Platform support
+
+The extension is built per **platform** as well as per version, and not every platform has a published build. As of `duckdb-otlp` 0.6.1 there is **no `windows_amd64` and no `linux_amd64_musl` build at all** — so on Windows, and on musl-based images such as Alpine, `uvx otelq` installs cleanly and then fails on its first query, when `INSTALL otlp FROM community` 404s. Linux (glibc, amd64/arm64) and macOS (Intel and Apple silicon) are covered. On Windows, WSL2 works today, because it resolves as `linux_amd64`.
+
+Upstream restored MSVC builds in [duckdb-otlp#67](https://github.com/smithclay/duckdb-otlp/pull/67) (otlp 0.7.x, DuckDB v1.5.5), but nothing is published until that lands in [`duckdb/community-extensions`](https://github.com/duckdb/community-extensions). The weekly extension probe watches for it and goes red on the day it appears.
+
+### Loading the extension from somewhere else
+
+For an air-gapped machine, a deterministic CI run, or a platform with no published build, point otelq at an extension you supply instead of the community repository:
+
+| Variable | Effect |
+| --- | --- |
+| `OTELQ_OTLP_EXTENSION` | Load this `.duckdb_extension` file directly — no network, no install step. DuckDB's signature check is relaxed for it, because a self-built extension carries no signature: naming a file here is the trust decision. |
+| `OTELQ_EXTENSION_REPOSITORY` | `INSTALL` from this extension repository instead of the community one. It must serve `<repository>/v<duckdb-version>/<platform>/otlp.duckdb_extension`. |
+
+An explicit file wins over a repository, which wins over the community default.
+
+```sh
+# a vendored binary, no network
+OTELQ_OTLP_EXTENSION=/opt/otlp/otlp.duckdb_extension uvx otelq summary
+
+# an internal mirror of the community repository
+OTELQ_EXTENSION_REPOSITORY=https://mirror.internal/duckdb uvx otelq summary
+```
+
+Either way, a failed load now names the platform it failed on and both ways out, instead of surfacing DuckDB's raw 404.
+
 ## Agentic engineering
 
 This repo is built to be developed with AI engineering:

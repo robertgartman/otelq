@@ -9,7 +9,10 @@
 # and every otelq command fails. 1.5.4 carries otlp v0.6.0
 # (community-extensions.duckdb.org/v1.5.4/<platform>/otlp...). Bump this only
 # through the ADR-003 checklist, after confirming the extension exists for the
-# target version.
+# target version. Existence is per *platform* as well as per version: otlp
+# 0.6.x publishes no windows_amd64 and no linux_amd64_musl build at all, so
+# those platforms need the OTELQ_OTLP_EXTENSION / OTELQ_EXTENSION_REPOSITORY
+# fallback that _connect_with_otlp implements.
 """otelq — query OTLP telemetry captured by the dev OTel Collector.
 
 Reads .telemetry/*.jsonl (OTLP JSONL written by the Collector fileexporter)
@@ -129,6 +132,13 @@ __all__ = [
     "_LOCK_STALE_SECS",
     "_LOCK_HARD_STALE_SECS",
     "_NO_TELEMETRY_MSG",
+    # otlp extension sourcing (ADR-003)
+    "_sql_str",
+    "_connect_with_otlp",
+    "_otlp_source",
+    "_otlp_failure",
+    "_EXTENSION_PATH_ENV",
+    "_EXTENSION_REPO_ENV",
     "_parse_since",
     "_parse_window",
     "_parse_instant",
@@ -1980,16 +1990,139 @@ def build_cold(
     return _finalize_relations(conn, present, window, now)
 
 
+# --- otlp extension loading (ADR-003) ----------------------------------------
+
+_EXTENSION_PATH_ENV = "OTELQ_OTLP_EXTENSION"
+_EXTENSION_REPO_ENV = "OTELQ_EXTENSION_REPOSITORY"
+
+_EXTENSION_HELP = (
+    f"  {_EXTENSION_PATH_ENV}=/path/to/otlp.duckdb_extension\n"
+    "      Load that file directly — no network, no install step. This is the\n"
+    "      air-gapped, deterministic-CI and self-built-extension path. DuckDB's\n"
+    "      signature check is relaxed for it, because a self-built extension is\n"
+    "      unsigned: naming a file here is the trust decision.\n"
+    f"  {_EXTENSION_REPO_ENV}=https://mirror.example/\n"
+    "      Install from that extension repository instead of the community one."
+)
+
+
+def _otlp_source() -> tuple[str, str]:
+    """The configured extension source, as (kind, value).
+
+    Precedence: an explicit file beats a mirror beats the community repository.
+    Both env vars are read fresh on every call — otelq is a single-invocation
+    CLI, so there is no config to cache and no process to restart."""
+    explicit = os.environ.get(_EXTENSION_PATH_ENV, "").strip()
+    if explicit:
+        return ("file", explicit)
+    repository = os.environ.get(_EXTENSION_REPO_ENV, "").strip()
+    if repository:
+        return ("repository", repository)
+    return ("community", "community")
+
+
+def _duckdb_platform(conn: duckdb.DuckDBPyConnection) -> str:
+    """DuckDB's own platform triple (osx_arm64, linux_amd64, windows_amd64, …).
+
+    It is the directory name the community repository publishes under, so it is
+    exactly what someone needs to see when no build exists for their machine."""
+    row = conn.execute("PRAGMA platform").fetchone()
+    return str(row[0]) if row else "unknown"
+
+
+def _otlp_failure(
+    conn: duckdb.DuckDBPyConnection, kind: str, value: str, exc: Exception
+) -> OtelqFailure:
+    """A failed extension load, as a message a human can act on.
+
+    The raw DuckDB exception is an HTTPException or an IOException that names
+    neither the platform that has no build nor the two ways around it — so it is
+    quoted as the reason and wrapped in both (fail FRIENDLY, not raw).
+
+    Exit 2 with a reason token, never a bare SystemExit: no answer was produced,
+    and under ADR-012 exit 1 would tell a gate the query ran and the verdict was
+    negative. A source the caller configured that does not work is their usage
+    error; the community default failing is not — on a platform with no
+    published build there is nothing the caller did wrong."""
+    import duckdb  # lazy; see TYPE_CHECKING note above
+
+    platform = _duckdb_platform(conn)
+    if kind == "community":
+        tried = (
+            "  Tried the DuckDB community repository. 'otlp' is a *community*\n"
+            f"  extension, built per DuckDB version AND per platform — there may be\n"
+            f"  no {platform} build for DuckDB {duckdb.__version__} at all (ADR-003).\n"
+            f"  Check: community-extensions.duckdb.org/v{duckdb.__version__}/{platform}/\n"
+        )
+    elif kind == "repository":
+        tried = f"  Tried the extension repository {value} ({_EXTENSION_REPO_ENV}).\n"
+    else:
+        tried = f"  Tried the extension file {value} ({_EXTENSION_PATH_ENV}).\n"
+    reason = REASON_INTERNAL_ERROR if kind == "community" else REASON_USAGE_ERROR
+    return OtelqFailure(
+        reason,
+        f"could not load the 'otlp' DuckDB extension on {platform}.\n"
+        f"{tried}"
+        f"  DuckDB said: {exc}\n"
+        "  Load it from somewhere else with one of:\n"
+        f"{_EXTENSION_HELP}",
+    )
+
+
+def _connect_with_otlp() -> duckdb.DuckDBPyConnection:
+    """A fresh in-memory connection with the `otlp` reader loaded (ADR-003).
+
+    ADR-003 pins DuckDB exactly so a matching community build of the extension
+    exists — but existence is per platform as well as per version, and some
+    platforms have no published build at all (windows_amd64 and linux_amd64_musl,
+    as of otlp 0.6.1). This is ADR-003's offline/vendored fallback: the two env
+    vars in _EXTENSION_HELP load the extension from a file or a mirror instead.
+
+    Every otelq connection is created here, so the fallback and the friendly
+    failure apply to all of them."""
+    import duckdb  # lazy; see TYPE_CHECKING note above
+
+    kind, value = _otlp_source()
+    path = Path(value).expanduser() if kind == "file" else None
+    if path is not None and not path.is_file():
+        _fail(
+            REASON_USAGE_ERROR,
+            f"{_EXTENSION_PATH_ENV} is set to {value}, which is not a readable "
+            "file. Point it at a .duckdb_extension binary.",
+        )
+    # allow_unsigned_extensions is a connection-time setting, so the decision has
+    # to be made here rather than around the LOAD. It is enabled ONLY for an
+    # explicit file: a self-built extension — the reason to point at a file on a
+    # platform the community repository does not cover — carries no signature.
+    config: dict[str, str | bool | int | float | list[str]] = (
+        {"allow_unsigned_extensions": True} if kind == "file" else {}
+    )
+    conn = duckdb.connect(database=":memory:", config=config)
+    try:
+        if path is not None:
+            conn.execute(f"LOAD {_sql_str(str(path))}")
+            return conn
+        if kind == "repository":
+            # FORCE, because a machine that has run otelq before already has otlp
+            # installed from the community repository, and a plain INSTALL from a
+            # different origin is refused rather than overridden.
+            conn.execute(f"FORCE INSTALL otlp FROM {_sql_str(value)}")
+        else:
+            conn.execute("INSTALL otlp FROM community")
+        conn.execute("LOAD otlp")
+    except duckdb.Error as exc:
+        failure = _otlp_failure(conn, kind, value, exc)
+        conn.close()
+        raise failure from exc
+    return conn
+
+
 def connect(telemetry_dir: Path) -> duckdb.DuckDBPyConnection:
     """Full unfiltered cold connection over a telemetry dir (no cache).
 
     Retained for the test fixtures and as the simplest read path. Builds the
     query relations directly from every raw file."""
-    import duckdb  # lazy; see TYPE_CHECKING note above
-
-    conn = duckdb.connect(database=":memory:")
-    conn.execute("INSTALL otlp FROM community")
-    conn.execute("LOAD otlp")
+    conn = _connect_with_otlp()
     with tempfile.TemporaryDirectory(prefix="otelq-") as tmp_dir:
         present: set[str] = set()
         for stream in CURSOR_STREAMS:
@@ -2285,9 +2418,7 @@ def build_connection(
 ) -> tuple[duckdb.DuckDBPyConnection, BuildInfo]:
     import duckdb  # lazy; see TYPE_CHECKING note above
 
-    conn = duckdb.connect(database=":memory:")
-    conn.execute("INSTALL otlp FROM community")
-    conn.execute("LOAD otlp")
+    conn = _connect_with_otlp()
     with tempfile.TemporaryDirectory(prefix="otelq-") as tmp_dir:
         if plan.route == "COLD" or not plan.use_cache:
             info = build_cold(conn, telemetry_dir, plan.window, tmp_dir, plan.now)
@@ -2299,9 +2430,7 @@ def build_connection(
                 # eviction) or was torn — fall back to a stateless cold scan on a
                 # fresh connection so the query still answers (SPEC FR-12).
                 conn.close()
-                conn = duckdb.connect(database=":memory:")
-                conn.execute("INSTALL otlp FROM community")
-                conn.execute("LOAD otlp")
+                conn = _connect_with_otlp()
                 info = build_cold(conn, telemetry_dir, plan.window, tmp_dir, plan.now)
     return conn, info
 

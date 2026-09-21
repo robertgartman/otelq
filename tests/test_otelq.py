@@ -45,6 +45,18 @@ def hermetic_git_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(var, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def hermetic_extension_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the otlp extension source to its default for every test.
+
+    OTELQ_OTLP_EXTENSION / OTELQ_EXTENSION_REPOSITORY (ADR-003's offline
+    fallback) are read fresh on every connection, so a developer who has either
+    one exported would run the whole suite against a different extension than CI
+    does. The tests that exercise the fallback set them explicitly."""
+    monkeypatch.delenv(otelq._EXTENSION_PATH_ENV, raising=False)
+    monkeypatch.delenv(otelq._EXTENSION_REPO_ENV, raising=False)
+
+
 @pytest.fixture
 def synth_conn() -> duckdb.DuckDBPyConnection:
     """In-memory DuckDB with the duckdb-otlp schema and known rows."""
@@ -5653,3 +5665,115 @@ def test_ac116_all_history_is_unaffected_by_the_clock(
     out = _run(temp_telemetry, "--all", "logs")
     assert len(_json.loads(_strip_header(out))) == 4
     assert _window_field(out) == "all history (--all)"
+
+# --- otlp extension sourcing (ADR-003 offline / vendored fallback) -----------
+
+import shutil as _shutil  # noqa: E402
+
+
+def test_otlp_source_defaults_to_community() -> None:
+    assert otelq._otlp_source() == ("community", "community")
+
+
+def test_otlp_source_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A mirror beats the community repository; an explicit file beats both."""
+    monkeypatch.setenv(otelq._EXTENSION_REPO_ENV, "https://mirror.example/")
+    assert otelq._otlp_source() == ("repository", "https://mirror.example/")
+    monkeypatch.setenv(otelq._EXTENSION_PATH_ENV, "/opt/otlp.duckdb_extension")
+    assert otelq._otlp_source() == ("file", "/opt/otlp.duckdb_extension")
+
+
+def test_otlp_source_ignores_blank_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exported-but-empty must not shadow the community default — a stray
+    `export OTELQ_OTLP_EXTENSION=` in a shell profile is not a configuration."""
+    monkeypatch.setenv(otelq._EXTENSION_PATH_ENV, "   ")
+    monkeypatch.setenv(otelq._EXTENSION_REPO_ENV, "")
+    assert otelq._otlp_source() == ("community", "community")
+
+
+def test_sql_str_quotes_extension_paths() -> None:
+    """INSTALL and LOAD take a literal, not a bind parameter, so the extension
+    path goes through the same quoter every other spliced path does."""
+    assert otelq._sql_str("/a/b.duckdb_extension") == "'/a/b.duckdb_extension'"
+    assert otelq._sql_str("/it's/here") == "'/it''s/here'"
+
+
+def test_extension_file_loads_off_disk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """OTELQ_OTLP_EXTENSION loads a binary straight off disk.
+
+    The copy lands somewhere DuckDB has never installed into, so a pass means
+    the file was loaded by path — the air-gapped / unsupported-platform path —
+    and not silently resolved from the extension cache."""
+    probe = duckdb.connect(":memory:")
+    probe.execute("INSTALL otlp FROM community")
+    installed = probe.execute(
+        "SELECT install_path FROM duckdb_extensions() WHERE extension_name = 'otlp'"
+    ).fetchone()
+    assert installed is not None
+    vendored = tmp_path / "vendor" / "otlp.duckdb_extension"
+    vendored.parent.mkdir()
+    _shutil.copy(str(installed[0]), vendored)
+
+    monkeypatch.setenv(otelq._EXTENSION_PATH_ENV, str(vendored))
+    conn = otelq._connect_with_otlp()
+    loaded = conn.execute(
+        "SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'otlp'"
+    ).fetchone()
+    assert loaded is not None and loaded[0]
+
+
+def test_missing_extension_file_fails_friendly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(
+        otelq._EXTENSION_PATH_ENV, str(tmp_path / "absent.duckdb_extension")
+    )
+    with pytest.raises(otelq.OtelqFailure) as excinfo:
+        otelq._connect_with_otlp()
+    # ADR-012: no answer was produced, and the caller misconfigured the source.
+    assert excinfo.value.code == 2
+    assert excinfo.value.reason == otelq.REASON_USAGE_ERROR
+    message = str(excinfo.value)
+    assert otelq._EXTENSION_PATH_ENV in message
+    assert "not a readable file" in message
+
+
+def test_unreachable_repository_fails_friendly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed install explains itself and names both escape hatches, rather
+    than surfacing DuckDB's raw HTTPException (fail FRIENDLY, not raw)."""
+    monkeypatch.setenv(otelq._EXTENSION_REPO_ENV, "https://mirror.invalid/ext")
+    with pytest.raises(otelq.OtelqFailure) as excinfo:
+        otelq._connect_with_otlp()
+    assert excinfo.value.code == 2
+    assert excinfo.value.reason == otelq.REASON_USAGE_ERROR
+    message = str(excinfo.value)
+    assert "could not load the 'otlp' DuckDB extension" in message
+    assert "https://mirror.invalid/ext" in message
+    assert otelq._EXTENSION_PATH_ENV in message
+    assert otelq._EXTENSION_REPO_ENV in message
+
+
+def test_community_failure_names_platform_and_where_to_look() -> None:
+    """The windows_amd64 / linux_amd64_musl case: no published build exists at
+    all. DuckDB's 404 names neither the platform nor a way forward, so the
+    wrapper has to carry both."""
+    conn = duckdb.connect(":memory:")
+    platform = conn.execute("PRAGMA platform").fetchone()
+    assert platform is not None
+    failure = otelq._otlp_failure(
+        conn, "community", "community", RuntimeError("HTTP Error: HTTP GET 404")
+    )
+    # Nothing the caller configured is wrong here — the platform has no build —
+    # so this is not a usage error, but it is still "no answer" (ADR-012).
+    assert failure.code == 2
+    assert failure.reason == otelq.REASON_INTERNAL_ERROR
+    message = str(failure)
+    assert str(platform[0]) in message
+    assert "community-extensions.duckdb.org" in message
+    assert "404" in message
+    assert otelq._EXTENSION_PATH_ENV in message
+    assert otelq._EXTENSION_REPO_ENV in message

@@ -1,8 +1,22 @@
 # Early-warning probe: verifies the pinned DuckDB still has a published
 # 'otlp' community extension build (the #1 fragility — see context/adr/ADR-003).
 #
-# If this goes red, the pinned DuckDB version no longer has a matching
-# duckdb-otlp build — see context/adr/ADR-003 before bumping.
+# The build is published per DuckDB version AND per platform, so each platform
+# is its own leg, and each leg asserts the state we believe it to be in:
+#
+#   expect: available   — ubuntu/macos. Red means the pinned DuckDB version has
+#       lost its matching duckdb-otlp build. See ADR-003 before bumping.
+#   expect: unavailable — windows. otlp 0.6.x publishes no windows_amd64 build
+#       at all, so `uvx otelq` installs cleanly there and then fails at the first
+#       INSTALL. This leg is GREEN while that is still true and RED on the day
+#       the build appears — that red is the good news, and the signal to run the
+#       ADR-003 pin-bump checklist. Upstream restored MSVC builds in
+#       smithclay/duckdb-otlp#67 (otlp 0.7.x, DuckDB v1.5.5), but nothing is
+#       published until that lands in duckdb/community-extensions.
+#
+# Either way a red leg means the platform's state changed and someone has to
+# look — which is the whole point of probing weekly rather than finding out
+# from a user.
 
 name: Extension Probe
 
@@ -13,12 +27,18 @@ on:
 
 jobs:
   probe:
-    name: otlp extension probe (${{ matrix.os }})
+    name: otlp probe (${{ matrix.os }}, expect ${{ matrix.expect }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            expect: available
+          - os: macos-latest
+            expect: available
+          - os: windows-latest
+            expect: unavailable
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -27,6 +47,42 @@ jobs:
         uses: astral-sh/setup-uv@v7
 
       - name: Probe otlp community extension for duckdb 1.5.4
-        # Fails loudly (non-zero exit) if INSTALL or LOAD raises.
+        shell: bash
+        env:
+          EXPECT: ${{ matrix.expect }}
         run: |
-          uv run --with "duckdb==1.5.4" python -c "import duckdb; c=duckdb.connect(); c.execute(\"INSTALL otlp FROM community\"); c.execute(\"LOAD otlp\"); print(\"otlp extension OK for duckdb 1.5.4\")"
+          uv run --with "duckdb==1.5.4" python - <<'PY'
+          import os
+          import sys
+
+          import duckdb
+
+          expect = os.environ.get("EXPECT", "available")
+          platform = duckdb.connect().execute("PRAGMA platform").fetchone()[0]
+          label = f"{platform} / duckdb {duckdb.__version__}"
+
+          try:
+              conn = duckdb.connect()
+              conn.execute("INSTALL otlp FROM community")
+              conn.execute("LOAD otlp")
+          except duckdb.Error as exc:
+              if expect == "unavailable":
+                  print(f"expected: still no published otlp build for {label}")
+                  print(f"  {exc}")
+                  sys.exit(0)
+              print(f"REGRESSION: otlp no longer installs or loads on {label}", file=sys.stderr)
+              print(f"  {exc}", file=sys.stderr)
+              print("  Read context/adr/ADR-003 before touching the pin.", file=sys.stderr)
+              sys.exit(1)
+
+          if expect == "unavailable":
+              print(f"otlp now LOADS on {label} — the platform gap has closed.", file=sys.stderr)
+              print("  This is the signal, not a failure. Next steps:", file=sys.stderr)
+              print("   1. Run the ADR-003 pin-bump checklist for this platform.", file=sys.stderr)
+              print("   2. Flip this leg to `expect: available`.", file=sys.stderr)
+              print("   3. Drop the platform caveat from the otelq.py header comment", file=sys.stderr)
+              print("      and from _connect_with_otlp's docstring.", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"otlp extension OK for {label}")
+          PY
