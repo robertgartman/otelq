@@ -6,13 +6,15 @@
 #
 #   expect: available   — ubuntu/macos. Red means the pinned DuckDB version has
 #       lost its matching duckdb-otlp build. See ADR-003 before bumping.
-#   expect: unavailable — windows. otlp 0.6.x publishes no windows_amd64 build
-#       at all, so `uvx otelq` installs cleanly there and then fails at the first
-#       INSTALL. This leg is GREEN while that is still true and RED on the day
-#       the build appears — that red is the good news, and the signal to run the
-#       ADR-003 pin-bump checklist. Upstream restored MSVC builds in
-#       smithclay/duckdb-otlp#67 (otlp 0.7.x, DuckDB v1.5.5), but nothing is
-#       published until that lands in duckdb/community-extensions.
+#   expect: unavailable — windows. The community repository publishes no
+#       windows_amd64 build of otlp 0.6.x at all, so `uvx otelq` installs cleanly
+#       there and then fails at the first INSTALL unless a binary is supplied.
+#       This leg is GREEN while that is still true and RED on the day a signed
+#       build appears — that red is the good news. Upstream restored MSVC builds
+#       in smithclay/duckdb-otlp#67 (otlp 0.7.x, DuckDB v1.5.5) and the pin is
+#       already on v1.5.5, so nothing is left but for that to land in
+#       duckdb/community-extensions. Until then Windows runs on upstream's own
+#       unsigned binary, loaded by file — see the test-windows job in ci.yml.
 #
 # Either way a red leg means the platform's state changed and someone has to
 # look — which is the whole point of probing weekly rather than finding out
@@ -46,12 +48,12 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
 
-      - name: Probe otlp community extension for duckdb 1.5.4
+      - name: Probe otlp community extension for duckdb 1.5.5
         shell: bash
         env:
           EXPECT: ${{ matrix.expect }}
         run: |
-          uv run --with "duckdb==1.5.4" python - <<'PY'
+          uv run --with "duckdb==1.5.5" python - <<'PY'
           import os
           import sys
 
@@ -78,10 +80,14 @@ jobs:
           if expect == "unavailable":
               print(f"otlp now LOADS on {label} — the platform gap has closed.", file=sys.stderr)
               print("  This is the signal, not a failure. Next steps:", file=sys.stderr)
-              print("   1. Run the ADR-003 pin-bump checklist for this platform.", file=sys.stderr)
+              print("   1. No pin bump is needed — confirm `uvx otelq summary` answers", file=sys.stderr)
+              print("      on this platform with no OTELQ_* variable set.", file=sys.stderr)
               print("   2. Flip this leg to `expect: available`.", file=sys.stderr)
-              print("   3. Drop the platform caveat from the otelq.py header comment", file=sys.stderr)
-              print("      and from _connect_with_otlp's docstring.", file=sys.stderr)
+              print("   3. Fold the platform into ci.yml's test matrix and drop the", file=sys.stderr)
+              print("      supplied-binary job (test-windows).", file=sys.stderr)
+              print("   4. Drop the platform caveat from the otelq.py header comment,", file=sys.stderr)
+              print("      _connect_with_otlp's docstring and the README; record it", file=sys.stderr)
+              print("      in ADR-003.", file=sys.stderr)
               sys.exit(1)
 
           print(f"otlp extension OK for {label}")

@@ -29,4 +29,107 @@ jobs:
         # community extension at runtime.
         env:
           PYTHONPATH: .
-        run: uv run --with pytest --with "duckdb==1.5.4" pytest tests/ -v
+        run: uv run --with pytest --with "duckdb==1.5.5" pytest tests/ -v
+
+  # Native Windows is a separate job, not a matrix leg, because it cannot take
+  # the same path: the community repository publishes no windows_amd64 build of
+  # otlp (ADR-003), so `INSTALL otlp FROM community` 404s there. Upstream does
+  # publish one — unsigned, attached to each release — and otelq loads it by
+  # file. This job is what makes "otelq works on native Windows" a verified
+  # statement instead of an inferred one.
+  #
+  # The binary is pinned by release tag AND archive checksum, so the run is
+  # deterministic and moving it is a deliberate act. An extension binary is
+  # locked to one DuckDB version: OTLP_MEMBER names it, and
+  # test_supplied_windows_binary_moves_with_the_pin fails if a pin bump leaves
+  # it behind (ADR-003 checklist item 4).
+  #
+  # When the probe's Windows leg goes red — a signed community build has
+  # appeared — drop the fetch step and fold windows-latest into the matrix above.
+  test-windows:
+    name: test (windows-latest, supplied otlp binary)
+    runs-on: windows-latest
+    env:
+      OTLP_RELEASE: v0.7.2
+      OTLP_ARCHIVE_SHA256: 791e79f9a8699effabe2adfadbab22fc6808b8c0b31abd1295c306f5b20b4b98
+      OTLP_MEMBER: v1.5.5/windows_amd64/otlp.duckdb_extension.gz
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Fetch the pinned upstream windows_amd64 otlp binary
+        shell: bash
+        run: |
+          uv run --no-project python - <<'PY'
+          import gzip
+          import hashlib
+          import os
+          import sys
+          import tarfile
+          import urllib.request
+          from pathlib import Path
+
+          release = os.environ["OTLP_RELEASE"]
+          expected = os.environ["OTLP_ARCHIVE_SHA256"]
+          member = os.environ["OTLP_MEMBER"]
+          url = (
+              "https://github.com/smithclay/duckdb-otlp/releases/download/"
+              f"{release}/extension-repository.tar.gz"
+          )
+
+          work = Path(os.environ["RUNNER_TEMP"]) / "otlp"
+          work.mkdir(parents=True, exist_ok=True)
+          archive = work / "extension-repository.tar.gz"
+          urllib.request.urlretrieve(url, archive)
+
+          actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+          if actual != expected:
+              print(f"checksum mismatch for {url}", file=sys.stderr)
+              print(f"  expected {expected}", file=sys.stderr)
+              print(f"  actual   {actual}", file=sys.stderr)
+              print("  The release asset changed. Do not just update the hash:", file=sys.stderr)
+              print("  find out why first (ADR-003).", file=sys.stderr)
+              sys.exit(1)
+
+          with tarfile.open(archive) as tar:
+              entry = next(
+                  (m for m in tar.getmembers() if m.name.removeprefix("./") == member),
+                  None,
+              )
+              if entry is None:
+                  sys.exit(f"{member} is not in {release}'s extension-repository.tar.gz")
+              packed = tar.extractfile(entry)
+              assert packed is not None
+              # DuckDB derives the extension's entry point from the file name, so
+              # it has to stay otlp.duckdb_extension wherever it lands.
+              binary = work / "otlp.duckdb_extension"
+              binary.write_bytes(gzip.decompress(packed.read()))
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"OTELQ_TEST_OTLP_EXTENSION={binary}\n")
+          print(f"otlp {release} -> {binary} ({binary.stat().st_size} bytes)")
+          PY
+
+      - name: Smoke — the CLI answers a real query through OTELQ_OTLP_EXTENSION
+        # The user-facing variable and the uv-run script path, exactly as a
+        # Windows user would run it. The fixtures are copied out first because a
+        # query writes its history next to the telemetry it reads.
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/smoke"
+          cp tests/testdata/*.jsonl "$RUNNER_TEMP/smoke/"
+          out=$(OTELQ_OTLP_EXTENSION="$OTELQ_TEST_OTLP_EXTENSION" \
+            uv run otelq.py --dir "$RUNNER_TEMP/smoke" --all --format json summary)
+          echo "$out"
+          grep -q '"service":"app-test"' <<<"$out"
+
+      - name: Pytest
+        # OTELQ_TEST_OTLP_EXTENSION (set by the fetch step) sends every reader
+        # connection in the suite to the supplied binary instead of the
+        # community repository — see hermetic_extension_env in tests/.
+        env:
+          PYTHONPATH: .
+        run: uv run --with pytest --with "duckdb==1.5.5" pytest tests/ -v

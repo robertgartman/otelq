@@ -35,7 +35,7 @@ body:
     attributes:
       label: Environment
       description: OS, `uv --version`, and the pinned `duckdb` version.
-      placeholder: macOS 15.5, uv 0.7.0, duckdb 1.5.3
+      placeholder: macOS 15.5, uv 0.7.0, duckdb 1.5.5
     validations:
       required: true
   - type: textarea

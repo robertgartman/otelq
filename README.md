@@ -515,9 +515,24 @@ The DuckDB runtime dependency is pinned exactly. This is deliberate. otelq reads
 
 ### Platform support
 
-The extension is built per **platform** as well as per version, and not every platform has a published build. As of `duckdb-otlp` 0.6.1 there is **no `windows_amd64` and no `linux_amd64_musl` build at all** — so on Windows, and on musl-based images such as Alpine, `uvx otelq` installs cleanly and then fails on its first query, when `INSTALL otlp FROM community` 404s. Linux (glibc, amd64/arm64) and macOS (Intel and Apple silicon) are covered. On Windows, WSL2 works today, because it resolves as `linux_amd64`.
+The extension is built per **platform** as well as per version, and not every platform has a community build. Linux (glibc, amd64/arm64) and macOS (Intel and Apple silicon) install it from the DuckDB community repository with no configuration. The community repository has **no `windows_amd64` and no `linux_amd64_musl` build** of `duckdb-otlp` 0.6.x — so on Windows, and on musl-based images such as Alpine, `uvx otelq` installs cleanly and then fails on its first query, when `INSTALL otlp FROM community` 404s.
 
-Upstream restored MSVC builds in [duckdb-otlp#67](https://github.com/smithclay/duckdb-otlp/pull/67) (otlp 0.7.x, DuckDB v1.5.5), but nothing is published until that lands in [`duckdb/community-extensions`](https://github.com/duckdb/community-extensions). The weekly extension probe watches for it and goes red on the day it appears.
+**Windows has a way through that does not need WSL2.** Upstream restored MSVC builds in [duckdb-otlp#67](https://github.com/smithclay/duckdb-otlp/pull/67) and publishes a `windows_amd64` binary for DuckDB v1.5.5 — the version otelq pins — in its own extension repository. That binary is **unsigned**, so otelq loads it only when you name the file:
+
+```powershell
+curl.exe -fLO https://smithclay.github.io/duckdb-otlp/v1.5.5/windows_amd64/otlp.duckdb_extension.gz
+uv run python -c "import gzip, shutil; shutil.copyfileobj(gzip.open('otlp.duckdb_extension.gz'), open('otlp.duckdb_extension', 'wb'))"
+$env:OTELQ_OTLP_EXTENSION = "$PWD\otlp.duckdb_extension"
+uvx otelq summary
+```
+
+- Keep the file name `otlp.duckdb_extension` — DuckDB derives the extension's entry point from it.
+- The `v1.5.5` in the URL is otelq's DuckDB pin. An extension binary is locked to the DuckDB version it was built for, and one built for any other version is refused.
+- Naming the file is the trust decision: this binary comes from the `duckdb-otlp` project, not from DuckDB's signed community repository.
+
+CI runs the full test suite on `windows-latest` against a pinned release of that binary. WSL2 works as well, because it resolves as `linux_amd64`. `linux_amd64_musl` has no build anywhere; the only route there is an extension you build yourself.
+
+Once the 0.7.x line lands in [`duckdb/community-extensions`](https://github.com/duckdb/community-extensions), a signed Windows build appears there and none of the above is needed. The weekly extension probe watches for it and goes red on the day it appears.
 
 ### Loading the extension from somewhere else
 
@@ -526,7 +541,7 @@ For an air-gapped machine, a deterministic CI run, or a platform with no publish
 | Variable | Effect |
 | --- | --- |
 | `OTELQ_OTLP_EXTENSION` | Load this `.duckdb_extension` file directly — no network, no install step. DuckDB's signature check is relaxed for it, because a self-built extension carries no signature: naming a file here is the trust decision. |
-| `OTELQ_EXTENSION_REPOSITORY` | `INSTALL` from this extension repository instead of the community one. It must serve `<repository>/v<duckdb-version>/<platform>/otlp.duckdb_extension`. |
+| `OTELQ_EXTENSION_REPOSITORY` | `INSTALL` from this extension repository instead of the community one. It must serve `<repository>/v<duckdb-version>/<platform>/otlp.duckdb_extension.gz`, and the builds must be **signed**: signature verification stays on for this path, so an unsigned repository — upstream's own included — is refused at install. Use the file variable for an unsigned binary. |
 
 An explicit file wins over a repository, which wins over the community default.
 

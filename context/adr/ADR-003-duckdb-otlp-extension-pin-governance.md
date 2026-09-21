@@ -69,7 +69,8 @@ extension**, and govern its version as follows:
 1. **Pin DuckDB to the exact version for which the extension is published.** The
    pin is `duckdb==1.5.3` — the latest DuckDB version with a published `otlp`
    community build at the time of writing. (Amended 2026-07-07: the pin is now
-   `duckdb==1.5.4`; see the amendment below.) This pin appears in **both** the PEP
+   `duckdb==1.5.4`; amended 2026-09-21: the pin is now `duckdb==1.5.5`; see the
+   amendments below.) This pin appears in **both** the PEP
    723 inline block and the package `pyproject`, kept in sync per
    [ADR-002](ADR-002-pep723-uv-single-file-distribution.md).
 2. **Govern the pin with CI.** A scheduled **extension-probe workflow** verifies
@@ -186,6 +187,75 @@ build appears — that red is the signal to run the checklist, not a regression.
 Without the per-platform expectation, adding Windows to the probe would only mean
 a permanently red job that nobody reads.
 
+### Amendment 2026-09-21 (second) — pin bumped to 1.5.5; Windows is reachable through a supplied binary
+
+The amendment above left Windows with one way forward: build the extension
+yourself. That was incomplete. A `windows_amd64` build of `otlp` **already
+exists** — published by the extension's own project rather than by the community
+repository — and it is built for DuckDB **v1.5.5 only**. Under `duckdb==1.5.4`
+DuckDB refuses it outright, because an extension binary is locked to the exact
+DuckDB version it was built against; and the community repository builds against
+the current DuckDB release, so no Windows build will ever appear under `v1.5.4`
+there either. **The pin was the blocker on every route to Windows**, which is why
+it moves now instead of waiting for the community entry to catch up.
+
+The pin-bump checklist was executed and the pin is now **`duckdb==1.5.5`**:
+
+1. **Published build confirmed on every supported platform** —
+   `community-extensions.duckdb.org/v1.5.5/<platform>/otlp.duckdb_extension.gz`
+   was fetched, not sampled, for `linux_amd64`, `linux_arm64`, `osx_amd64` and
+   `osx_arm64`. Each is a signed build whose metadata footer names DuckDB
+   `v1.5.5`, its own platform, and extension version `8e627d8` (otlp 0.6.1). No
+   supported platform is dropped. `windows_amd64`, `windows_amd64_mingw` and
+   `linux_amd64_musl` are 404 under `v1.5.5`, exactly as under `v1.5.4`.
+2. **Pin bumped everywhere together** — the PEP 723 inline block, `pyproject`
+   and its lockfile, and every place that repeats the pin (the `justfile` test
+   recipe, the pre-commit hook, and the CI, release and probe workflows).
+3. **Large single-call read re-validated** — a 300 000-row single-call
+   `read_otlp_traces` is complete and crash-free under 1.5.5, so the retired
+   2048-row workaround stays retired. The full suite passes under 1.5.5.
+
+otlp 0.6.0 → 0.6.1 is not a schema change; the data-model decisions of
+[ADR-010](ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md) carry over unchanged.
+
+**The supported-platform set, as of `duckdb==1.5.5`.** The community path is
+unchanged: `linux_amd64`, `linux_arm64`, `osx_amd64`, `osx_arm64`.
+`windows_amd64` becomes **supported through a supplied binary**: upstream
+`smithclay/duckdb-otlp#67` restored MSVC builds, and from otlp 0.7.1 the project
+publishes a `windows_amd64` binary for DuckDB `v1.5.5` in its own extension
+repository (served from GitHub Pages, and attached to each release as an
+archive). Loaded through the explicit-file variable, it runs otelq on native
+Windows without WSL2. `windows_amd64_mingw` and `linux_amd64_musl` still have no
+build anywhere.
+
+Two properties of that binary decide how it may be used:
+
+- **It is unsigned, so only the explicit-file path can load it.** The repository
+  path keeps signature verification (the decision above), and DuckDB refuses an
+  unsigned extension at install time. Pointing the repository variable at
+  upstream's own repository therefore does **not** work, on any platform.
+  Whether to add an explicit opt-in for unsigned repositories is a separate trust
+  decision and is **not** taken here.
+- **Version skew between platforms is accepted.** Windows loads otlp 0.7.x while
+  the community platforms load 0.6.1, until the community entry moves. The reader
+  surface otelq depends on is the same in both: the full suite and the
+  300 000-row read were run under 1.5.5 against 0.6.1 *and* 0.7.x and pass
+  identically.
+
+**Windows support is verified, not inferred.** CI gains a Windows job that loads
+a pinned upstream release binary — pinned by release tag *and* checksum, so the
+run is deterministic and moving it is a deliberate act — and runs the full suite
+against it. The statement "otelq works on native Windows" is exactly as true as
+that job is green. The suite otherwise forces the community path for hermeticity,
+which is precisely what does not exist on Windows, so it gains one explicit,
+test-only override that names a supplied binary.
+
+**The probe's Windows leg keeps `expect: unavailable`**, now against `v1.5.5`.
+When the community entry moves to otlp 0.7.x a signed `windows_amd64` build
+appears there and the leg goes red — and the response no longer involves the pin
+at all: flip the leg, move the Windows CI job onto the community path, and drop
+the supplied-binary caveats.
+
 ## Alternatives Considered
 
 - **Hand-write an OTLP-JSON parser.** Rejected. OTLP's JSON encoding (nested
@@ -219,6 +289,13 @@ a permanently red job that nobody reads.
   3. **Re-validate the 2048-row workaround** against the new DuckDB version, since
      that workaround depends on `read_otlp_*` behavior the new version could alter
      (see [ADR-006](../archive/ADR-006-read-otlp-extension-quirks.md)).
+  4. **Move the supplied-binary references with the pin** (added 2026-09-21). The
+     Windows route is locked to the pinned DuckDB version exactly as a community
+     build is: the Windows CI job's pinned upstream release and checksum, and the
+     download location the README gives Windows users, both name the DuckDB
+     version and must move in the same change. A bump to a DuckDB version for
+     which upstream publishes no `windows_amd64` binary drops Windows, and falls
+     under item 1 — a breaking change, recorded as one.
 - **A scheduled extension-probe workflow governs the pin continuously**, one leg
   per platform, each asserting whether a build is expected to exist. It is the
   early-warning system in both directions: a supported platform losing its build,
@@ -227,10 +304,15 @@ a permanently red job that nobody reads.
 - **An offline / air-gapped path is available and deterministic**, and as of the
   2026-09-21 amendment it is implemented rather than notional: the extension can
   be loaded from a supplied file or from a mirror instead of the community network
-  repository. The `otlp` project additionally publishes an **unsigned GitHub-Pages
-  repository**, which serves this case directly. This keeps CI and air-gapped runs
-  from depending on live community-repository availability — and it is the only
-  way to run otelq at all on a platform with no published build.
+  repository. The `otlp` project additionally publishes its own **unsigned**
+  extension repository (GitHub Pages, plus a per-release archive). Because it is
+  unsigned it is usable **only through the supplied-file path** — fetch the
+  binary, then name the file; the repository path keeps signature verification
+  and DuckDB refuses an unsigned extension at install. (Corrected 2026-09-21:
+  this bullet previously said that repository "serves this case directly", which
+  the implementation never allowed.) This keeps CI and air-gapped runs from
+  depending on live community-repository availability — and it is the only way to
+  run otelq at all on a platform with no published community build.
 - **The tool is agnostic to extension *acquisition*, not to the *pin*.** How the
   extension is loaded (community vs mirror vs vendored) can vary per environment,
   but the DuckDB version is fixed by the pin; the behavioral surface the loaded

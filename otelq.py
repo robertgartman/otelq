@@ -1,18 +1,21 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["duckdb==1.5.4"]
+# dependencies = ["duckdb==1.5.5"]
 # ///
 # duckdb is pinned exactly because otelq depends on the `otlp` *community*
 # extension (smithclay/duckdb-otlp), which is built per DuckDB version and lags
 # new releases. An open `>=` floats to the newest DuckDB, for which the
 # extension may not yet be published — `INSTALL otlp FROM community` then 404s
-# and every otelq command fails. 1.5.4 carries otlp v0.6.0
-# (community-extensions.duckdb.org/v1.5.4/<platform>/otlp...). Bump this only
+# and every otelq command fails. 1.5.5 carries otlp v0.6.1
+# (community-extensions.duckdb.org/v1.5.5/<platform>/otlp...). Bump this only
 # through the ADR-003 checklist, after confirming the extension exists for the
-# target version. Existence is per *platform* as well as per version: otlp
-# 0.6.x publishes no windows_amd64 and no linux_amd64_musl build at all, so
-# those platforms need the OTELQ_OTLP_EXTENSION / OTELQ_EXTENSION_REPOSITORY
-# fallback that _connect_with_otlp implements.
+# target version. Existence is per *platform* as well as per version: the
+# community repository publishes no windows_amd64 and no linux_amd64_musl build
+# of otlp 0.6.x at all, so those platforms need the OTELQ_OTLP_EXTENSION /
+# OTELQ_EXTENSION_REPOSITORY fallback that _connect_with_otlp implements.
+# Windows has a binary to supply: upstream publishes an unsigned windows_amd64
+# build for exactly this DuckDB version (otlp >= 0.7.1), which is why the pin
+# and that binary move together (ADR-003 checklist item 4).
 """otelq — query OTLP telemetry captured by the dev OTel Collector.
 
 Reads .telemetry/*.jsonl (OTLP JSONL written by the Collector fileexporter)
@@ -31,7 +34,7 @@ cold path. See context/spec/SPEC-otelq-incremental-cache.md.
 
 Reader schema adoption (ADR-010)
 --------------------------------
-otelq targets duckdb-otlp v0.6.0 (DuckDB 1.5.4) and adopts the extension's
+otelq targets duckdb-otlp v0.6.x (DuckDB 1.5.5) and adopts the extension's
 reader schema natively: the six relations carry the read_otlp_* columns
 verbatim (SELECT * at the read seam) — the upstream duckdb-otlp project docs
 are the reference for otelq's data model. Each relation's event-time is its
@@ -2074,9 +2077,10 @@ def _connect_with_otlp() -> duckdb.DuckDBPyConnection:
 
     ADR-003 pins DuckDB exactly so a matching community build of the extension
     exists — but existence is per platform as well as per version, and some
-    platforms have no published build at all (windows_amd64 and linux_amd64_musl,
+    platforms have no community build at all (windows_amd64 and linux_amd64_musl,
     as of otlp 0.6.1). This is ADR-003's offline/vendored fallback: the two env
     vars in _EXTENSION_HELP load the extension from a file or a mirror instead.
+    On Windows the file is upstream's own unsigned windows_amd64 build.
 
     Every otelq connection is created here, so the fallback and the friendly
     failure apply to all of them."""
