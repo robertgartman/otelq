@@ -4,6 +4,7 @@
 # ///
 """Tests for otelq. Run: just otelq-test"""
 
+import os
 import sys
 from argparse import Namespace
 from collections.abc import Iterable
@@ -45,16 +46,38 @@ def hermetic_git_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(var, raising=False)
 
 
+# The one sanctioned way to run the suite against a supplied otlp binary. It is a
+# test-only name on purpose: a developer's own OTELQ_OTLP_EXTENSION must never
+# leak into the suite, but a platform the community repository does not cover
+# (windows_amd64 — ADR-003) cannot run a single reader test without one.
+_TEST_EXTENSION_ENV = "OTELQ_TEST_OTLP_EXTENSION"
+
+
+def _supplied_extension() -> str:
+    """The binary named by OTELQ_TEST_OTLP_EXTENSION, or "" for the default."""
+    return os.environ.get(_TEST_EXTENSION_ENV, "").strip()
+
+
 @pytest.fixture(autouse=True)
 def hermetic_extension_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the otlp extension source to its default for every test.
+    """Pin the otlp extension source for every test.
 
     OTELQ_OTLP_EXTENSION / OTELQ_EXTENSION_REPOSITORY (ADR-003's offline
     fallback) are read fresh on every connection, so a developer who has either
     one exported would run the whole suite against a different extension than CI
-    does. The tests that exercise the fallback set them explicitly."""
-    monkeypatch.delenv(otelq._EXTENSION_PATH_ENV, raising=False)
+    does. The tests that exercise the fallback set them explicitly.
+
+    The default source is the community repository. OTELQ_TEST_OTLP_EXTENSION
+    replaces it with a supplied file for the whole run — that is how the Windows
+    CI job runs the suite at all. It is written to os.environ rather than through
+    `monkeypatch`, because a test that calls monkeypatch.undo() mid-way would
+    otherwise drop it and send its second half to a repository that 404s."""
     monkeypatch.delenv(otelq._EXTENSION_REPO_ENV, raising=False)
+    supplied = _supplied_extension()
+    if supplied:
+        os.environ[otelq._EXTENSION_PATH_ENV] = supplied
+    else:
+        monkeypatch.delenv(otelq._EXTENSION_PATH_ENV, raising=False)
 
 
 @pytest.fixture
@@ -1877,7 +1900,9 @@ def test_readme_help_dump_matches_live_help() -> None:
     # Drift guard: the README's `otelq --help` dump (## Commands) must match
     # the real output, so a future flag/epilog change is caught here instead
     # of the README silently rotting — as it had, before this test existed.
-    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+        encoding="utf-8"
+    )
     marker = "```text\n"
     start = readme.index(marker, readme.index("## Commands")) + len(marker)
     end = readme.index("\n```", start)
@@ -3774,6 +3799,13 @@ def _git_init(path: Path, branch: str = "main") -> None:
         _subprocess.run(["git", "-C", str(path), "config", *cfg], check=True, env=env)
 
 
+def _git_toplevel_of(path: Path) -> str:
+    """What `git rev-parse --show-toplevel` prints for `path` — the identity
+    FR-2 records verbatim. git normalizes through realpath and always uses
+    forward slashes, so on Windows it is `C:/...`, never str(path)."""
+    return path.resolve().as_posix()
+
+
 def _patch_identity(monkeypatch: pytest.MonkeyPatch, value: str | None) -> None:
     """Force otelq.resolve_worktree_identity to a fixed value. The integration
     scope tests run in-process with cwd at the repo root (itself a real git
@@ -3803,7 +3835,7 @@ def test_ac2_identity_from_git_when_no_env(tmp_path: Path) -> None:
     repo.mkdir()
     _git_init(repo)
     # git normalizes the toplevel through realpath; compare likewise.
-    assert otelq.resolve_worktree_identity(repo) == str(repo.resolve())
+    assert otelq.resolve_worktree_identity(repo) == _git_toplevel_of(repo)
 
 
 def test_ac2_identity_undefined_outside_git(tmp_path: Path) -> None:
@@ -3830,14 +3862,14 @@ def test_ac3_set_resource_attributes_writes_and_merges(
     assert code == 0
     env_path = repo / ".env.local"
     attrs = _read_attrs(env_path)
-    assert attrs["otelq.worktree.id"] == str(repo.resolve())
+    assert attrs["otelq.worktree.id"] == _git_toplevel_of(repo)
     assert attrs["otelq.worktree.branch"] == "feat"
 
     # FR-3: stdout echoes the resolved identity and a ready-to-paste
     # mine-or-untagged sql predicate referencing the reserved $WORKTREE_ID
     # parameter (no literal id embedded — FR-13).
     out = capsys.readouterr().out
-    assert str(repo.resolve()) in out
+    assert _git_toplevel_of(repo) in out
     assert "feat" in out
     assert otelq._worktree_scope_clause() in out
     assert "$WORKTREE_ID" in out
@@ -3850,7 +3882,7 @@ def test_ac3_set_resource_attributes_writes_and_merges(
     )
     assert otelq._run_set_resource_attributes(repo) == 0
     attrs2 = _read_attrs(env_path)
-    assert attrs2["otelq.worktree.id"] == str(repo.resolve())  # updated in place
+    assert attrs2["otelq.worktree.id"] == _git_toplevel_of(repo)  # updated in place
     assert attrs2["team"] == "blue"  # bespoke preserved
     assert "OTHER_VAR=keep" in env_path.read_text()  # other lines preserved
 
@@ -4129,7 +4161,7 @@ def test_ac13_empty_tag_and_corrupt_env_dont_raise(
     repo.mkdir()
     _git_init(repo)
     (repo / ".env.local").write_text("this is not = a valid attributes file\n\x00\n")
-    assert otelq.resolve_worktree_identity(repo) == str(repo.resolve())
+    assert otelq.resolve_worktree_identity(repo) == _git_toplevel_of(repo)
 
 
 # ---- identity independent of --dir (EC-2 / AC-14) ---------------------------
@@ -4166,6 +4198,7 @@ def _cli(*argv: str, cwd: Path | None = None) -> _subprocess.CompletedProcess[st
         [sys.executable, str(_OTELQ_PY), *argv],
         capture_output=True,
         text=True,
+        encoding="utf-8",  # otelq always writes UTF-8 (_utf8_stdio)
         cwd=str(cwd) if cwd is not None else None,
         timeout=300,
     )
@@ -4279,6 +4312,21 @@ def test_ac75_explicit_help_stays_on_stdout_exit_0() -> None:
     assert "--top" in _cli("help", "slow").stdout
 
 
+def test_output_is_utf8_even_when_the_stream_default_is_not(tmp_path: Path) -> None:
+    # A piped stdout on Windows defaults to a non-UTF-8 code page, which cannot
+    # encode the help's arrows or the response header's dashes — otelq crashed
+    # mid-write (exit 1, traceback). PYTHONIOENCODING=ascii reproduces such a
+    # default on any OS. (Row values are JSON-escaped, so the prose is the risk.)
+    env = {"PYTHONIOENCODING": "ascii"}
+    helped = _cli_env("help", cwd=tmp_path, env=env)
+    assert helped.returncode == 0, helped.stderr
+    assert "→" in helped.stdout
+    store = _seed(tmp_path / "store")
+    logged = _cli_env("--dir", str(store), "--all", "logs", cwd=tmp_path, env=env)
+    assert logged.returncode == 0, logged.stderr
+    assert "—" in logged.stdout
+
+
 @pytest.mark.parametrize(
     "argv",
     [
@@ -4324,7 +4372,8 @@ def test_ac77_doctor_keeps_verdict_exit_1(tmp_path: Path) -> None:
     proc = _cli("--dir", str(missing), "doctor")
     assert proc.returncode == 1, proc.stderr
     assert "FAIL" in proc.stdout
-    assert str(missing) in proc.stdout
+    # The detail is a JSON string, so a Windows path's backslashes are escaped.
+    assert _json.dumps(str(missing))[1:-1] in proc.stdout
     assert not missing.exists()
 
 
@@ -4980,6 +5029,17 @@ def test_ac10_empty_store_is_not_satisfaction(temp_telemetry: Path) -> None:
     assert elapsed >= 2, "returned before the deadline on an empty store"
 
 
+# Popen.send_signal can deliver only CTRL_C_EVENT / CTRL_BREAK_EVENT on Windows,
+# and only to a child in its own process group — SIGINT raises ValueError. The
+# interrupt contract (FR-11) is the same code on every platform; what is
+# POSIX-only is this harness's way of provoking it.
+_needs_posix_sigint = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Popen.send_signal cannot deliver SIGINT to a child on Windows",
+)
+
+
+@_needs_posix_sigint
 def test_ac11_interrupted_wait_is_exit_2(temp_telemetry: Path) -> None:
     # FR-11: never a traceback, and never a silent 0 a caller would read as
     # satisfied.
@@ -4996,6 +5056,7 @@ def test_ac11_interrupted_wait_is_exit_2(temp_telemetry: Path) -> None:
     assert _reason(err) == "interrupted"
 
 
+@_needs_posix_sigint
 @pytest.mark.parametrize("delay", [0.2, 0.5, 0.8, 1.2, 2.0])
 def test_ac11a_interrupt_exits_2_at_every_offset(
     temp_telemetry: Path, delay: float
@@ -5283,7 +5344,8 @@ def _cli_env(*argv: str, cwd: Path, env: dict[str, str] | None = None
     full.update(env or {})
     return _subprocess.run(
         [sys.executable, str(_OTELQ_PY), *argv],
-        capture_output=True, text=True, cwd=str(cwd), timeout=300, env=full,
+        capture_output=True, text=True, encoding="utf-8", cwd=str(cwd), timeout=300,
+        env=full,
     )
 
 
@@ -5671,12 +5733,14 @@ def test_ac116_all_history_is_unaffected_by_the_clock(
 import shutil as _shutil  # noqa: E402
 
 
-def test_otlp_source_defaults_to_community() -> None:
+def test_otlp_source_defaults_to_community(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(otelq._EXTENSION_PATH_ENV, raising=False)  # a supplied-binary run
     assert otelq._otlp_source() == ("community", "community")
 
 
 def test_otlp_source_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     """A mirror beats the community repository; an explicit file beats both."""
+    monkeypatch.delenv(otelq._EXTENSION_PATH_ENV, raising=False)  # a supplied-binary run
     monkeypatch.setenv(otelq._EXTENSION_REPO_ENV, "https://mirror.example/")
     assert otelq._otlp_source() == ("repository", "https://mirror.example/")
     monkeypatch.setenv(otelq._EXTENSION_PATH_ENV, "/opt/otlp.duckdb_extension")
@@ -5706,15 +5770,18 @@ def test_extension_file_loads_off_disk(
     The copy lands somewhere DuckDB has never installed into, so a pass means
     the file was loaded by path — the air-gapped / unsupported-platform path —
     and not silently resolved from the extension cache."""
-    probe = duckdb.connect(":memory:")
-    probe.execute("INSTALL otlp FROM community")
-    installed = probe.execute(
-        "SELECT install_path FROM duckdb_extensions() WHERE extension_name = 'otlp'"
-    ).fetchone()
-    assert installed is not None
+    source = _supplied_extension()
+    if not source:
+        probe = duckdb.connect(":memory:")
+        probe.execute("INSTALL otlp FROM community")
+        installed = probe.execute(
+            "SELECT install_path FROM duckdb_extensions() WHERE extension_name = 'otlp'"
+        ).fetchone()
+        assert installed is not None
+        source = str(installed[0])
     vendored = tmp_path / "vendor" / "otlp.duckdb_extension"
     vendored.parent.mkdir()
-    _shutil.copy(str(installed[0]), vendored)
+    _shutil.copy(source, vendored)
 
     monkeypatch.setenv(otelq._EXTENSION_PATH_ENV, str(vendored))
     conn = otelq._connect_with_otlp()
@@ -5745,6 +5812,7 @@ def test_unreachable_repository_fails_friendly(
 ) -> None:
     """A failed install explains itself and names both escape hatches, rather
     than surfacing DuckDB's raw HTTPException (fail FRIENDLY, not raw)."""
+    monkeypatch.delenv(otelq._EXTENSION_PATH_ENV, raising=False)  # a supplied-binary run
     monkeypatch.setenv(otelq._EXTENSION_REPO_ENV, "https://mirror.invalid/ext")
     with pytest.raises(otelq.OtelqFailure) as excinfo:
         otelq._connect_with_otlp()
@@ -5777,3 +5845,52 @@ def test_community_failure_names_platform_and_where_to_look() -> None:
     assert "404" in message
     assert otelq._EXTENSION_PATH_ENV in message
     assert otelq._EXTENSION_REPO_ENV in message
+
+
+# --- the DuckDB pin is one decision, written down many times (ADR-002/ADR-003) --
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_PIN_RE = _re.compile(r"duckdb==(\d+\.\d+\.\d+)")
+
+# Every file that repeats the pin. A bump that misses one leaves that path
+# installing a DuckDB the otlp extension may not exist for — and each of these
+# runs somewhere the others do not (uvx, the venv, the hook, CI, the release).
+_PIN_FILES = (
+    "otelq.py",
+    "pyproject.toml",
+    "justfile",
+    "lefthook.yml",
+    ".github/workflows/ci.yml",
+    ".github/workflows/release.yml",
+    ".github/workflows/extension-probe.yml",
+)
+
+
+def _pinned_duckdb() -> str:
+    pins = _PIN_RE.findall((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert len(set(pins)) == 1, f"pyproject.toml must pin duckdb exactly once: {pins}"
+    return pins[0]
+
+
+def test_duckdb_pin_is_identical_everywhere() -> None:
+    """ADR-002: the pins are the same decision expressed more than once, and
+    must move together (ADR-003 checklist item 2)."""
+    pin = _pinned_duckdb()
+    for name in _PIN_FILES:
+        found = _PIN_RE.findall((_REPO_ROOT / name).read_text(encoding="utf-8"))
+        assert found, f"{name} no longer states the duckdb pin — update _PIN_FILES"
+        assert set(found) == {pin}, f"{name} pins duckdb {sorted(set(found))}, not {pin}"
+    lock = (_REPO_ROOT / "uv.lock").read_text(encoding="utf-8")
+    locked = _re.search(r'^name = "duckdb"\nversion = "([^"]+)"', lock, _re.MULTILINE)
+    assert locked is not None and locked.group(1) == pin, "uv.lock is behind the pin"
+
+
+def test_supplied_windows_binary_moves_with_the_pin() -> None:
+    """ADR-003 checklist item 4: an extension binary is locked to one DuckDB
+    version, so the Windows route — the binary CI loads, and the one the README
+    tells Windows users to fetch — must name the pinned version. A pin bump that
+    leaves either behind breaks Windows without breaking any other platform."""
+    segment = f"v{_pinned_duckdb()}/windows_amd64/"
+    for name in (".github/workflows/ci.yml", "README.md"):
+        text = (_REPO_ROOT / name).read_text(encoding="utf-8")
+        assert segment in text, f"{name} does not reference {segment}"

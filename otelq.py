@@ -1,18 +1,21 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["duckdb==1.5.4"]
+# dependencies = ["duckdb==1.5.5"]
 # ///
 # duckdb is pinned exactly because otelq depends on the `otlp` *community*
 # extension (smithclay/duckdb-otlp), which is built per DuckDB version and lags
 # new releases. An open `>=` floats to the newest DuckDB, for which the
 # extension may not yet be published — `INSTALL otlp FROM community` then 404s
-# and every otelq command fails. 1.5.4 carries otlp v0.6.0
-# (community-extensions.duckdb.org/v1.5.4/<platform>/otlp...). Bump this only
+# and every otelq command fails. 1.5.5 carries otlp v0.6.1
+# (community-extensions.duckdb.org/v1.5.5/<platform>/otlp...). Bump this only
 # through the ADR-003 checklist, after confirming the extension exists for the
-# target version. Existence is per *platform* as well as per version: otlp
-# 0.6.x publishes no windows_amd64 and no linux_amd64_musl build at all, so
-# those platforms need the OTELQ_OTLP_EXTENSION / OTELQ_EXTENSION_REPOSITORY
-# fallback that _connect_with_otlp implements.
+# target version. Existence is per *platform* as well as per version: the
+# community repository publishes no windows_amd64 and no linux_amd64_musl build
+# of otlp 0.6.x at all, so those platforms need the OTELQ_OTLP_EXTENSION /
+# OTELQ_EXTENSION_REPOSITORY fallback that _connect_with_otlp implements.
+# Windows has a binary to supply: upstream publishes an unsigned windows_amd64
+# build for exactly this DuckDB version (otlp >= 0.7.1), which is why the pin
+# and that binary move together (ADR-003 checklist item 4).
 """otelq — query OTLP telemetry captured by the dev OTel Collector.
 
 Reads .telemetry/*.jsonl (OTLP JSONL written by the Collector fileexporter)
@@ -31,7 +34,7 @@ cold path. See context/spec/SPEC-otelq-incremental-cache.md.
 
 Reader schema adoption (ADR-010)
 --------------------------------
-otelq targets duckdb-otlp v0.6.0 (DuckDB 1.5.4) and adopts the extension's
+otelq targets duckdb-otlp v0.6.x (DuckDB 1.5.5) and adopts the extension's
 reader schema natively: the six relations carry the read_otlp_* columns
 verbatim (SELECT * at the read seam) — the upstream duckdb-otlp project docs
 are the reference for otelq's data model. Each relation's event-time is its
@@ -1370,6 +1373,11 @@ def _self_heal(telemetry_dir: Path) -> Cursor:
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if sys.platform == "win32":
+        # Never os.kill here: on Windows signal 0 IS CTRL_C_EVENT, so the
+        # "probe" delivers a real Ctrl+C to every process on the console —
+        # this one included — and, where it cannot, raises for a live pid.
+        return _pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1377,8 +1385,48 @@ def _pid_alive(pid: int) -> bool:
     except PermissionError:
         return True  # exists, owned by another user
     except OSError:
-        return False  # Windows raises OSError for a dead pid
+        return False
     return True
+
+
+def _pid_alive_windows(pid: int) -> bool:
+    """Liveness without signalling: open the process for query and read its
+    exit code. STILL_ACTIVE means running; a process that exited with code 259
+    reads as live, which the lock's hard ceiling already bounds."""
+    if sys.platform != "win32":  # callers gate on this; it also scopes the
+        return False  # win32-only ctypes API below for the type checker
+    import ctypes  # lazy: only the Windows lock path needs it
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    error_access_denied = 5
+    still_active = 259
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # Declared, not defaulted: ctypes' implicit c_int return would truncate a
+    # 64-bit HANDLE.
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    open_process.restype = wintypes.HANDLE
+    get_exit_code = kernel32.GetExitCodeProcess
+    get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    get_exit_code.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle: int | None = open_process(process_query_limited_information, False, pid)
+    if not handle:
+        # No such process -> ERROR_INVALID_PARAMETER. Access denied means it
+        # exists but belongs to someone we may not query: live, as on POSIX.
+        return ctypes.get_last_error() == error_access_denied
+    try:
+        code = wintypes.DWORD()
+        if not get_exit_code(handle, ctypes.byref(code)):
+            return True  # opened but unreadable: it exists, so never reap it
+        return code.value == still_active
+    finally:
+        close_handle(handle)
 
 
 def _lock_held_by_live_pid(cdir: Path) -> bool:
@@ -2074,9 +2122,10 @@ def _connect_with_otlp() -> duckdb.DuckDBPyConnection:
 
     ADR-003 pins DuckDB exactly so a matching community build of the extension
     exists — but existence is per platform as well as per version, and some
-    platforms have no published build at all (windows_amd64 and linux_amd64_musl,
+    platforms have no community build at all (windows_amd64 and linux_amd64_musl,
     as of otlp 0.6.1). This is ADR-003's offline/vendored fallback: the two env
     vars in _EXTENSION_HELP load the extension from a file or a mirror instead.
+    On Windows the file is upstream's own unsigned windows_amd64 build.
 
     Every otelq connection is created here, so the fallback and the friendly
     failure apply to all of them."""
@@ -5671,7 +5720,22 @@ def _help_for(parser: argparse.ArgumentParser, topic: str | None) -> int:
     return 0
 
 
+def _utf8_stdio() -> None:
+    """Emit UTF-8 on stdout/stderr whatever the platform's default. On Windows a
+    piped stream — every agent or script capturing otelq — defaults to the ANSI
+    code page rather than UTF-8, which cannot encode the help text's arrows or any
+    non-Latin telemetry value, so the write raised mid-output: a traceback and
+    exit 1 instead of an answer. A console stream is already UTF-8 (no-op)."""
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper) and stream.encoding.lower() not in (
+            "utf-8",
+            "utf8",
+        ):
+            stream.reconfigure(encoding="utf-8")
+
+
 def main(argv: list[str] | None = None) -> int:
+    _utf8_stdio()
     parser = build_parser()
     args: argparse.Namespace | None = None
     try:
