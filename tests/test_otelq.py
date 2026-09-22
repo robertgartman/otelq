@@ -1900,7 +1900,9 @@ def test_readme_help_dump_matches_live_help() -> None:
     # Drift guard: the README's `otelq --help` dump (## Commands) must match
     # the real output, so a future flag/epilog change is caught here instead
     # of the README silently rotting — as it had, before this test existed.
-    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+        encoding="utf-8"
+    )
     marker = "```text\n"
     start = readme.index(marker, readme.index("## Commands")) + len(marker)
     end = readme.index("\n```", start)
@@ -3797,6 +3799,13 @@ def _git_init(path: Path, branch: str = "main") -> None:
         _subprocess.run(["git", "-C", str(path), "config", *cfg], check=True, env=env)
 
 
+def _git_toplevel_of(path: Path) -> str:
+    """What `git rev-parse --show-toplevel` prints for `path` — the identity
+    FR-2 records verbatim. git normalizes through realpath and always uses
+    forward slashes, so on Windows it is `C:/...`, never str(path)."""
+    return path.resolve().as_posix()
+
+
 def _patch_identity(monkeypatch: pytest.MonkeyPatch, value: str | None) -> None:
     """Force otelq.resolve_worktree_identity to a fixed value. The integration
     scope tests run in-process with cwd at the repo root (itself a real git
@@ -3826,7 +3835,7 @@ def test_ac2_identity_from_git_when_no_env(tmp_path: Path) -> None:
     repo.mkdir()
     _git_init(repo)
     # git normalizes the toplevel through realpath; compare likewise.
-    assert otelq.resolve_worktree_identity(repo) == str(repo.resolve())
+    assert otelq.resolve_worktree_identity(repo) == _git_toplevel_of(repo)
 
 
 def test_ac2_identity_undefined_outside_git(tmp_path: Path) -> None:
@@ -3853,14 +3862,14 @@ def test_ac3_set_resource_attributes_writes_and_merges(
     assert code == 0
     env_path = repo / ".env.local"
     attrs = _read_attrs(env_path)
-    assert attrs["otelq.worktree.id"] == str(repo.resolve())
+    assert attrs["otelq.worktree.id"] == _git_toplevel_of(repo)
     assert attrs["otelq.worktree.branch"] == "feat"
 
     # FR-3: stdout echoes the resolved identity and a ready-to-paste
     # mine-or-untagged sql predicate referencing the reserved $WORKTREE_ID
     # parameter (no literal id embedded — FR-13).
     out = capsys.readouterr().out
-    assert str(repo.resolve()) in out
+    assert _git_toplevel_of(repo) in out
     assert "feat" in out
     assert otelq._worktree_scope_clause() in out
     assert "$WORKTREE_ID" in out
@@ -3873,7 +3882,7 @@ def test_ac3_set_resource_attributes_writes_and_merges(
     )
     assert otelq._run_set_resource_attributes(repo) == 0
     attrs2 = _read_attrs(env_path)
-    assert attrs2["otelq.worktree.id"] == str(repo.resolve())  # updated in place
+    assert attrs2["otelq.worktree.id"] == _git_toplevel_of(repo)  # updated in place
     assert attrs2["team"] == "blue"  # bespoke preserved
     assert "OTHER_VAR=keep" in env_path.read_text()  # other lines preserved
 
@@ -4152,7 +4161,7 @@ def test_ac13_empty_tag_and_corrupt_env_dont_raise(
     repo.mkdir()
     _git_init(repo)
     (repo / ".env.local").write_text("this is not = a valid attributes file\n\x00\n")
-    assert otelq.resolve_worktree_identity(repo) == str(repo.resolve())
+    assert otelq.resolve_worktree_identity(repo) == _git_toplevel_of(repo)
 
 
 # ---- identity independent of --dir (EC-2 / AC-14) ---------------------------
@@ -4347,7 +4356,8 @@ def test_ac77_doctor_keeps_verdict_exit_1(tmp_path: Path) -> None:
     proc = _cli("--dir", str(missing), "doctor")
     assert proc.returncode == 1, proc.stderr
     assert "FAIL" in proc.stdout
-    assert str(missing) in proc.stdout
+    # The detail is a JSON string, so a Windows path's backslashes are escaped.
+    assert _json.dumps(str(missing))[1:-1] in proc.stdout
     assert not missing.exists()
 
 

@@ -1373,6 +1373,11 @@ def _self_heal(telemetry_dir: Path) -> Cursor:
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if sys.platform == "win32":
+        # Never os.kill here: on Windows signal 0 IS CTRL_C_EVENT, so the
+        # "probe" delivers a real Ctrl+C to every process on the console —
+        # this one included — and, where it cannot, raises for a live pid.
+        return _pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1380,8 +1385,48 @@ def _pid_alive(pid: int) -> bool:
     except PermissionError:
         return True  # exists, owned by another user
     except OSError:
-        return False  # Windows raises OSError for a dead pid
+        return False
     return True
+
+
+def _pid_alive_windows(pid: int) -> bool:
+    """Liveness without signalling: open the process for query and read its
+    exit code. STILL_ACTIVE means running; a process that exited with code 259
+    reads as live, which the lock's hard ceiling already bounds."""
+    if sys.platform != "win32":  # callers gate on this; it also scopes the
+        return False  # win32-only ctypes API below for the type checker
+    import ctypes  # lazy: only the Windows lock path needs it
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    error_access_denied = 5
+    still_active = 259
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # Declared, not defaulted: ctypes' implicit c_int return would truncate a
+    # 64-bit HANDLE.
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    open_process.restype = wintypes.HANDLE
+    get_exit_code = kernel32.GetExitCodeProcess
+    get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    get_exit_code.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle: int | None = open_process(process_query_limited_information, False, pid)
+    if not handle:
+        # No such process -> ERROR_INVALID_PARAMETER. Access denied means it
+        # exists but belongs to someone we may not query: live, as on POSIX.
+        return ctypes.get_last_error() == error_access_denied
+    try:
+        code = wintypes.DWORD()
+        if not get_exit_code(handle, ctypes.byref(code)):
+            return True  # opened but unreadable: it exists, so never reap it
+        return code.value == still_active
+    finally:
+        close_handle(handle)
 
 
 def _lock_held_by_live_pid(cdir: Path) -> bool:
