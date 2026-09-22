@@ -12,11 +12,11 @@ must_not_contain:
   - implementation_walkthroughs
   - reversible_decisions
 created: 2026-06-23
-last_updated: 2026-09-21
+last_updated: 2026-09-22
 related_documents:
   - ADR-002-pep723-uv-single-file-distribution
   - ADR-006-read-otlp-extension-quirks
-  - ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0
+  - ADR-010-native-otlp-reader-schema
   - ADR-001-host-cli-reads-bind-mounted-files
   - SPEC-otelq-cli
 supersedes: null
@@ -121,7 +121,7 @@ repository. The pin-bump checklist was executed and the pin is now
 
 v0.6.0 is a **breaking schema change** with new failure modes; how otelq
 absorbs it is decided in
-[ADR-010](ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md), which supersedes
+[ADR-010](ADR-010-native-otlp-reader-schema.md), which supersedes
 [ADR-006](../archive/ADR-006-read-otlp-extension-quirks.md). The governance
 model of this ADR — exact pin, CI probe, offline fallback, checklist-gated
 bumps — is unchanged and applies to all future bumps.
@@ -216,7 +216,7 @@ The pin-bump checklist was executed and the pin is now **`duckdb==1.5.5`**:
    2048-row workaround stays retired. The full suite passes under 1.5.5.
 
 otlp 0.6.0 → 0.6.1 is not a schema change; the data-model decisions of
-[ADR-010](ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md) carry over unchanged.
+[ADR-010](ADR-010-native-otlp-reader-schema.md) carry over unchanged.
 
 **The supported-platform set, as of `duckdb==1.5.5`.** The community path is
 unchanged: `linux_amd64`, `linux_arm64`, `osx_amd64`, `osx_arm64`.

@@ -12,10 +12,10 @@ must_not_contain:
   - implementation_walkthroughs
   - reversible_decisions
 created: 2026-08-13
-last_updated: 2026-08-13
+last_updated: 2026-09-22
 related_documents:
   - ADR-003-duckdb-otlp-extension-pin-governance
-  - ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0
+  - ADR-010-native-otlp-reader-schema
   - SPEC-otelq-cli
   - PRD-otelq
 supersedes: null

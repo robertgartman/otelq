@@ -12,11 +12,11 @@ must_not_contain:
   - architectural_rationale
   - api_schema_definitions
 created: 2026-06-22
-last_updated: 2026-07-07
+last_updated: 2026-09-22
 related_documents:
   - ADR-015-wall-clock-query-window
   - ADR-008-unified-cache-first-read-and-retention
-  - ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0
+  - ADR-010-native-otlp-reader-schema
   - ADR-005-incremental-parquet-cache
   - ADR-004-collector-in-docker-bind-mount
   - SPEC-otelq-cli
@@ -222,7 +222,7 @@ rationale for the cache (see
   partially-written or otherwise undecodable trailing JSON line without failing
   the run, re-reading it once complete on a later run. Because the reader
   extension hard-errors on unparsable input (see
-  [ADR-010](../adr/ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md)), undecodable lines
+  [ADR-010](../adr/ADR-010-native-otlp-reader-schema.md)), undecodable lines
   **must** be filtered out before bytes reach the extension, and the sanitized
   content handed to it **must** respect the extension's per-file size cap. No
   batch-size-based skip is permitted: export batches of any record count

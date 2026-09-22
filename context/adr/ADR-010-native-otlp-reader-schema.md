@@ -12,7 +12,7 @@ must_not_contain:
   - implementation_walkthroughs
   - reversible_decisions
 created: 2026-07-07
-last_updated: 2026-07-07
+last_updated: 2026-09-22
 related_documents:
   - ADR-003-duckdb-otlp-extension-pin-governance
   - ADR-006-read-otlp-extension-quirks
@@ -34,7 +34,7 @@ semantic_tags:
   - observability
 ---
 
-# ADR-010 — Adopt DuckDB 1.5.4 + duckdb-otlp v0.6.0
+# ADR-010 — Adopt the duckdb-otlp reader schema natively
 
 ## Context
 

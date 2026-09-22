@@ -12,7 +12,7 @@ must_not_contain:
   - architectural_rationale
   - external_data_schemas
 created: 2026-06-23
-last_updated: 2026-09-05
+last_updated: 2026-09-22
 related_documents:
   - ADR-015-wall-clock-query-window
   - PRD-otelq
@@ -23,7 +23,7 @@ related_documents:
   - ADR-014-span-tree-traversal-in-core-sql
   - ADR-011-worktree-telemetry-identity
   - CONTRACT-telemetry-directory
-  - ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0
+  - ADR-010-native-otlp-reader-schema
   - ADR-009-query-history-triage-store
   - ADR-012-exit-codes-as-public-contract
 ai_summary: "otelq CLI base behavior: the query relations/columns it exposes, its subcommands (incl. history/triage over the query-history store), global flags and argument order, its exit-code contract, and its friendly read-only failure handling."
@@ -57,7 +57,7 @@ queries is specified in
 [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md); how otelq
 adopts the `duckdb-otlp` reader extension's schema natively as the relations
 below is recorded in
-[ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0](../adr/ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md).
+[ADR-010-native-otlp-reader-schema](../adr/ADR-010-native-otlp-reader-schema.md).
 Product intent lives in [PRD-otelq](../prd/PRD-otelq.md).
 
 ## Scope
@@ -81,7 +81,7 @@ input — see [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-dire
 the parquet cache mechanics, sealing, eviction, and cache-first read routing (see
 [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md)); the
 `duckdb-otlp` extension itself and the rationale for adopting its schema (see
-[ADR-010](../adr/ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md)); and the OTel Collector
+[ADR-010](../adr/ADR-010-native-otlp-reader-schema.md)); and the OTel Collector
 configuration that produces the raw files.
 
 ### Definitions
@@ -158,7 +158,7 @@ configuration that produces the raw files.
 - **FR-2 — Relation columns.** The six stored relations **must** carry the
   `duckdb-otlp` v0.6.0 reader columns **verbatim** — names, types, and units as
   published by the upstream extension (see
-  [ADR-010](../adr/ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md)); the upstream
+  [ADR-010](../adr/ADR-010-native-otlp-reader-schema.md)); the upstream
   project's documentation is the semantic reference for these columns. The
   `sql` cheat-sheet subset each relation **must** present:
   - **`traces`**: `start_time_unix_nano` (`TIMESTAMP_NS` event-time),
@@ -457,7 +457,7 @@ configuration that produces the raw files.
   `TIMESTAMP_NS` values in the relations' `*_unix_nano` columns (FR-2), and the
   `timestamp` column every command's output presents **must** render as the
   real wall-clock date/time of the event (see
-  [ADR-010](../adr/ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md)); a raw 2026 event
+  [ADR-010](../adr/ADR-010-native-otlp-reader-schema.md)); a raw 2026 event
   **must not** render as a far-future year. A single implausible far-future
   event-time (a clock-skewed producer or a unit mistake) **must not** blank out
   otherwise-valid queries: the window's upper bound is a plausible ceiling
@@ -565,7 +565,7 @@ configuration that produces the raw files.
   read in full regardless of its record count; no size-based skip or warning is
   permitted. (Revised 2026-07-07: the former reader 2048-row limit and its
   skip-with-warning behavior are obsolete — see
-  [ADR-010](../adr/ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md); the cache path shares
+  [ADR-010](../adr/ADR-010-native-otlp-reader-schema.md); the cache path shares
   this behavior per
   [SPEC-otelq-incremental-cache](SPEC-otelq-incremental-cache.md) FR-15.)
 - **FR-21 — Partial trailing line is skipped.** A partially-written trailing

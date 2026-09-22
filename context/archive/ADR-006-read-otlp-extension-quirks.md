@@ -12,16 +12,16 @@ must_not_contain:
   - implementation_walkthroughs
   - reversible_decisions
 created: 2026-06-23
-last_updated: 2026-07-07
+last_updated: 2026-09-22
 related_documents:
   - ADR-003-duckdb-otlp-extension-pin-governance
   - ADR-004-collector-in-docker-bind-mount
   - ADR-005-incremental-parquet-cache
   - ADR-008-unified-cache-first-read-and-retention
-  - ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0
+  - ADR-010-native-otlp-reader-schema
   - SPEC-otelq-incremental-cache
 supersedes: null
-superseded_by: ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0
+superseded_by: ADR-010-native-otlp-reader-schema
 ai_summary: "Two centralized client-side mitigations for duckdb-otlp reader bugs: <=2000-row chunking around the 2048-row crash, and a timestamp 1000x correction."
 semantic_tags:
   - otelq
@@ -36,7 +36,7 @@ semantic_tags:
 # ADR-006 — read_otlp Extension Quirks
 
 > **Superseded 2026-07-07 by
-> [ADR-010](../adr/ADR-010-adopt-duckdb-1.5.4-otlp-0.6.0.md).** Upstream
+> [ADR-010](../adr/ADR-010-native-otlp-reader-schema.md).** Upstream
 > duckdb-otlp v0.6.0 (DuckDB 1.5.4) fixes both defects mitigated here; the
 > chunk-and-union pass, the oversized-batch skip, and the timestamp `REPLACE`
 > are retired. Kept for the historical record.
