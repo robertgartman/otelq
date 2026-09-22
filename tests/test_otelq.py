@@ -4198,6 +4198,7 @@ def _cli(*argv: str, cwd: Path | None = None) -> _subprocess.CompletedProcess[st
         [sys.executable, str(_OTELQ_PY), *argv],
         capture_output=True,
         text=True,
+        encoding="utf-8",  # otelq always writes UTF-8 (_utf8_stdio)
         cwd=str(cwd) if cwd is not None else None,
         timeout=300,
     )
@@ -4309,6 +4310,21 @@ def test_ac75_explicit_help_stays_on_stdout_exit_0() -> None:
         assert "usage: otelq" in proc.stdout
         assert not [ln for ln in proc.stderr.splitlines() if _re.match(r"^otelq: [a-z_]+: ", ln)]
     assert "--top" in _cli("help", "slow").stdout
+
+
+def test_output_is_utf8_even_when_the_stream_default_is_not(tmp_path: Path) -> None:
+    # A piped stdout on Windows defaults to a non-UTF-8 code page, which cannot
+    # encode the help's arrows or the response header's dashes — otelq crashed
+    # mid-write (exit 1, traceback). PYTHONIOENCODING=ascii reproduces such a
+    # default on any OS. (Row values are JSON-escaped, so the prose is the risk.)
+    env = {"PYTHONIOENCODING": "ascii"}
+    helped = _cli_env("help", cwd=tmp_path, env=env)
+    assert helped.returncode == 0, helped.stderr
+    assert "→" in helped.stdout
+    store = _seed(tmp_path / "store")
+    logged = _cli_env("--dir", str(store), "--all", "logs", cwd=tmp_path, env=env)
+    assert logged.returncode == 0, logged.stderr
+    assert "—" in logged.stdout
 
 
 @pytest.mark.parametrize(
@@ -5328,7 +5344,8 @@ def _cli_env(*argv: str, cwd: Path, env: dict[str, str] | None = None
     full.update(env or {})
     return _subprocess.run(
         [sys.executable, str(_OTELQ_PY), *argv],
-        capture_output=True, text=True, cwd=str(cwd), timeout=300, env=full,
+        capture_output=True, text=True, encoding="utf-8", cwd=str(cwd), timeout=300,
+        env=full,
     )
 
 

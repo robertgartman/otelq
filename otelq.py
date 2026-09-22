@@ -5720,7 +5720,22 @@ def _help_for(parser: argparse.ArgumentParser, topic: str | None) -> int:
     return 0
 
 
+def _utf8_stdio() -> None:
+    """Emit UTF-8 on stdout/stderr whatever the platform's default. On Windows a
+    piped stream — every agent or script capturing otelq — defaults to the ANSI
+    code page rather than UTF-8, which cannot encode the help text's arrows or any
+    non-Latin telemetry value, so the write raised mid-output: a traceback and
+    exit 1 instead of an answer. A console stream is already UTF-8 (no-op)."""
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper) and stream.encoding.lower() not in (
+            "utf-8",
+            "utf8",
+        ):
+            stream.reconfigure(encoding="utf-8")
+
+
 def main(argv: list[str] | None = None) -> int:
+    _utf8_stdio()
     parser = build_parser()
     args: argparse.Namespace | None = None
     try:
