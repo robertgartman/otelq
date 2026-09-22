@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.1.0](https://github.com/robertgartman/otelq/compare/v2.0.0...v2.1.0) (2026-09-22)
+
+
+### Features
+
+* add .DS_Store to .gitignore for MacOS compatibility ([e4ebaab](https://github.com/robertgartman/otelq/commit/e4ebaab4e4540de46a6854c56383a6e259d575e8))
+* **cli:** --since accepts an absolute UTC instant as the window's lower bound ([81393dd](https://github.com/robertgartman/otelq/commit/81393ddd96f532f1e703aa01603ccfc60fce54b8))
+* update language server configuration for LSP backend ([989e36d](https://github.com/robertgartman/otelq/commit/989e36d6cf68b126c70dca6818442dd3d7f6afb5))
+
+
+### Bug Fixes
+
+* bump the DuckDB pin to 1.5.5 so Windows has an otlp build to load ([#42](https://github.com/robertgartman/otelq/issues/42)) ([cccf946](https://github.com/robertgartman/otelq/commit/cccf9460c531ea75cdeadafcecdb37aaca98c3e1))
+* **cli:** tighten the --since instant grammar, its errors, and what it discloses ([4090e6d](https://github.com/robertgartman/otelq/commit/4090e6d38118270af78a774113c72b5fa7f5b621))
+* give unsupported platforms a way to load the otlp extension ([6e34dda](https://github.com/robertgartman/otelq/commit/6e34ddaf0129aafbc183506d621297f50f48b9cb))
+
 ## [2.0.0](https://github.com/robertgartman/otelq/compare/v1.0.0...v2.0.0) (2026-08-13)
 
 
