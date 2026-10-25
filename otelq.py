@@ -3969,9 +3969,9 @@ together, run from the project root:
 uvx otelq@latest skill install
 ```
 
-`doctor` reports an `otelq skill` row that warns when this file and the CLI
-disagree, and an `otelq release` row that says when a newer otelq is out. When
-it reports a newer release, tell the user and let them decide: never upgrade
+`uvx otelq@@OTELQ_VERSION@ doctor` reports an `otelq skill` row that warns
+when this file and the CLI disagree, and an `otelq release` row that says when a
+newer otelq is out. When it reports a newer release, tell the user and let them decide: never upgrade
 otelq or this skill on your own, because the upgrade changes files the project
 commits.
 
@@ -4340,7 +4340,7 @@ what you asked** — so a script never has to guess whether a query ran.
 | Exit | Meaning |
 |------|---------|
 | `0` | Answered. Includes zero rows and an empty-but-present store. |
-| `1` | Answered, verdict negative (`doctor` on an unhealthy store). |
+| `1` | Answered, verdict negative (`otelq doctor` on an unhealthy store). |
 | `2` | **No answer**: bad flag, bare invocation, missing store, unreadable store, bad SQL. |
 
 On exit `2`, stdout is empty and stderr carries one
