@@ -13,10 +13,11 @@ must_not_contain:
   - architectural_decisions
   - step_by_step_behavior
 created: 2026-06-23
-last_updated: 2026-06-23
+last_updated: 2026-10-25
 related_documents:
   - SPEC-otelq-cli
   - ADR-001-host-cli-reads-bind-mounted-files
+  - ADR-016-cli-carries-versioned-agent-skill
 ai_summary: Why otelq exists — a zero-infrastructure CLI to see and query the OpenTelemetry a local app actually emitted, in the inner loop and in CI, for humans and AI agents alike.
 semantic_tags:
   - otelq
@@ -59,6 +60,7 @@ Underlying all three: the existing tools are observability *platforms*, optimize
 - **Be equally usable by humans and AI agents.** Produce output in both human-readable text and machine-parseable JSON, so a person reading a terminal and an automated agent reading structured output are both well served by the same tool.
 - **Stay instant and local.** Keep the time from "the app emitted something" to "I can query it" in the range of seconds, and keep `otelq` itself a fast, self-contained command rather than a service.
 - **Work the same everywhere developers work.** Behave identically across Linux, macOS, and Windows-via-WSL2, so a team and its agents get the same answers regardless of workstation.
+- **Adopt and stay current without friction.** An agent user can bring `otelq` into a project, and later upgrade it, without cloning the `otelq` repository, and the agent's instructions for `otelq` never silently fall out of step with the `otelq` version they drive.
 - **Speak only OpenTelemetry.** Operate on standard OTLP signals — traces, logs, and metrics — and on no bespoke or proprietary telemetry format, so `otelq` fits any OpenTelemetry-instrumented codebase without lock-in.
 
 ## Non-Goals
@@ -87,6 +89,7 @@ Targets are qualitative; the point is the felt experience, not a dashboard numbe
 - **One command answers an agent's verification question.** An AI agent can answer a question like "what errored in the last ten minutes?" or "did the expected operation emit a span?" with a single `otelq` invocation returning structured output it can act on.
 - **No standing processes.** Beyond a stock OpenTelemetry Collector container, there are zero long-lived processes required to capture and query local telemetry — nothing to keep running, watch, or tear down.
 - **Verification becomes routine.** Because the cost of checking is near zero, developers and agents actually verify instrumentation as part of the inner loop rather than skipping it — the qualitative signal that the friction problem is solved.
+- **Instructions and tool never drift silently.** A project's agent instructions for `otelq` always name the `otelq` version they were written for, and a mismatch is reported to the user rather than discovered through a failed command.
 - **Same answers on every platform.** A developer on macOS, a teammate on Linux, and a teammate on WSL2 get identical results from identical telemetry, so the tool is trusted as a shared source of truth.
 
 ## Constraints

@@ -12,7 +12,7 @@ must_not_contain:
   - architectural_rationale
   - external_data_schemas
 created: 2026-06-23
-last_updated: 2026-09-22
+last_updated: 2026-10-25
 related_documents:
   - ADR-015-wall-clock-query-window
   - PRD-otelq
@@ -26,7 +26,8 @@ related_documents:
   - ADR-010-native-otlp-reader-schema
   - ADR-009-query-history-triage-store
   - ADR-012-exit-codes-as-public-contract
-ai_summary: "otelq CLI base behavior: the query relations/columns it exposes, its subcommands (incl. history/triage over the query-history store), global flags and argument order, its exit-code contract, and its friendly read-only failure handling."
+  - ADR-016-cli-carries-versioned-agent-skill
+ai_summary: "otelq CLI base behavior: the query relations/columns it exposes, its subcommands (incl. history/triage over the query-history store), global flags and argument order, its exit-code contract, its friendly read-only failure handling, and the skill command that installs its own agent skill."
 semantic_tags:
   - otelq
   - cli
@@ -74,7 +75,10 @@ the presented output; the response header printed before the six signal-bearing
 commands' results, naming the command, format, signal, and UTC time range; the
 UTC convention for `timestamp` literals a caller writes into `sql`; and
 otelq's exit-code and stderr behavior when telemetry is absent, partial, or
-malformed.
+malformed; and the `skill` command that prints and installs otelq's own
+version-pinned agent skill, with the `doctor` check that reports when a
+project's installed skill has drifted from the running CLI
+([ADR-016](../adr/ADR-016-cli-carries-versioned-agent-skill.md)).
 
 **Not covered:** the raw telemetry directory and OTLP JSONL schema (an external
 input — see [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md));
@@ -600,8 +604,8 @@ configuration that produces the raw files.
   **must** filter the result of `summary`, `errors`, `slow`, `trace`, `logs`,
   and `metric` (the FR-29 header-bearing commands; **not** `sql` — already
   supports regex natively via DuckDB's `~`/`regexp_matches` — nor
-  `collector-config`/`doctor`/`troubleshoot`, which are not telemetry query
-  results) to only the rows where `pattern` matches at least one of the row's
+  `collector-config`/`doctor`/`troubleshoot`/`skill`, which are not telemetry
+  query results) to only the rows where `pattern` matches at least one of the row's
   own cell values, applied **before** the FR-10 rendering so formatting
   artifacts (JSON escaping, CSV quoting, table padding) **must not** affect
   match precision. `pattern` **must** be a standard Python `re` pattern,
@@ -630,7 +634,7 @@ configuration that produces the raw files.
   identical everywhere it appears within a single invocation — the header
   `Session:` line and the session footer below. Additionally, on **every**
   command invocation (including the header-less `sql`/`doctor`/`history`/
-  `collector-config`/`troubleshoot`), otelq **must** print a **session footer**
+  `collector-config`/`troubleshoot`/`skill`), otelq **must** print a **session footer**
   to **stderr** — preceded by a blank line — that names the resolved id and
   instructs the caller to pass `--session-id <id>` on consecutive related
   invocations to keep the analysis correlated. The footer **must** be on stderr,
@@ -679,7 +683,8 @@ configuration that produces the raw files.
   permit injection; every filesystem path spliced into SQL **must** be escaped or
   bound. This holds identically on the cache and `--no-cache` paths.
 - **FR-29 — Response header.** For `summary`, `errors`, `slow`, `trace`, `logs`,
-  and `metric` — **not** `sql`, `collector-config`, `troubleshoot`, or `doctor` —
+  and `metric` — **not** `sql`, `collector-config`, `troubleshoot`, `doctor`, or
+  `skill` —
   otelq **must** print a fixed-format response header to **stdout**, immediately
   before the command's rendered result, for **every** `--format` value:
   ```
@@ -864,7 +869,7 @@ configuration that produces the raw files.
     `summary`, `errors`, `slow`, `trace`, `logs`, `metric` — so one flag scopes
     the whole correlation spine regardless of signal. Supplying it to any other
     command (`sql`, `doctor`, `collector-config`, `troubleshoot`, `history`,
-    `triage`, `set_resource_attributes`) **must** be a real error
+    `triage`, `set_resource_attributes`, `skill`) **must** be a real error
     (`usage_error`, exit `2`, FR-37), never a silent no-op; for `sql` the message
     **must** name the FR-41 macro as the supported route.
   - A malformed argument — an empty key, or `<key>=` with an empty value —
@@ -1071,6 +1076,7 @@ configuration that produces the raw files.
   | `query_error` | A query failed to execute — malformed SQL (FR-9), an empty query, or a reader/DuckDB error |
   | `usage_error` | The invocation was not understood — bad or misplaced flag, unknown subcommand, unknown `help` topic, malformed `--since` or `--regex`, an ambiguous `trace` id prefix, bare invocation (FR-39) |
   | `internal_error` | Any otherwise-unhandled error |
+  | `write_error` | A file otelq was asked to write could not be written — `skill install` (FR-48) |
   | `interrupted` | A bounded wait was signalled ([SPEC-otelq-await](SPEC-otelq-await.md) FR-11) |
   | `timeout` | A bounded wait reached its deadline unsatisfied — exit `1`, a verdict (SPEC-otelq-await FR-6) |
 
@@ -1112,7 +1118,7 @@ configuration that produces the raw files.
 
   This rule **must not** apply to commands that do not read a store — `--help`,
   `help`, `--version`, `collector-config`, `troubleshoot`,
-  `set_resource_attributes` — nor to **`doctor`**, whose purpose is to diagnose
+  `set_resource_attributes`, `skill` — nor to **`doctor`**, whose purpose is to diagnose
   the store: `doctor` **must** continue to report a missing directory as a `FAIL`
   row and exit `1` (a verdict, FR-26), not `2`.
 
@@ -1127,6 +1133,61 @@ configuration that produces the raw files.
   a success code alongside output that is not the answer to any question it
   asked. Explicitly requested help (FR-22) keeps stdout and exit `0`, because
   there the help *is* the answer.
+
+### Agent skill delivery (ADR-016)
+
+- **FR-48 — `skill` command.** otelq **must** expose a `skill` command with two
+  actions:
+
+  - `skill print` **must** write the canonical otelq query skill — the full
+    `SKILL.md` text, rendered for the running version (FR-49) — to stdout and
+    exit `0`. Its output is the file content verbatim; `--format` does not
+    change it.
+  - `skill install [--target DIR]` **must** install that skill into the project
+    rooted at `DIR` (default: the current working directory) by writing exactly
+    two files: the canonical skill at `DIR/.agents/skills/otelq/SKILL.md` and a
+    Claude Code pointer at `DIR/.claude/skills/otelq/SKILL.md` whose body directs
+    the agent to the canonical file. It **must** create missing parent
+    directories, and **must not** write anything else.
+
+  `skill install` **must** be idempotent. For each file it **must** report one
+  row `(file, action)`, where `file` is the absolute path and `action` is
+  `created` (the file was absent), `updated` (it existed with different
+  content, which is replaced), or `unchanged` (it was byte-identical, and is not
+  rewritten). The rows **must** be rendered through the global `--format`
+  (FR-10) and exit `0`. Each file **must** be replaced atomically, so a reader
+  never observes a half-written skill.
+
+  `skill` reads no telemetry store: it is exempt from FR-38, prints no response
+  header (FR-29), records no history (FR-34), and rejects `--regex` (FR-32) and
+  `--resource-attr`/`--attr` (FR-40, FR-42) as `usage_error`. A missing action
+  is a `usage_error` (exit `2`).
+
+- **FR-49 — The installed skill pins the CLI.** The skill text that FR-48 prints
+  and installs **must** name the running otelq version in two places: a
+  `metadata.otelq_version` entry in its YAML frontmatter, and every otelq
+  invocation it teaches, written as `uvx otelq@<version>`. `<version>` **must**
+  equal the version FR-24 reports. The text **must** tell the agent how to
+  upgrade otelq and the skill together.
+
+- **FR-50 — `doctor` reports the installed skill.** In addition to FR-26,
+  `doctor` **must** inspect the project's canonical skill file at
+  `<root>/.agents/skills/otelq/SKILL.md`, where `<root>` is the git top-level of
+  the working directory, or the working directory itself outside a git
+  checkout. It **must** report exactly one row named `otelq skill`:
+
+  | Condition | Status |
+  |-----------|--------|
+  | The file is absent | `INFO`, naming the install command |
+  | The file carries no readable `otelq_version` marker | `WARN`, naming the refresh command |
+  | The marker names a different version than the running otelq | `WARN`, naming both versions and the refresh command |
+  | The marker matches, but the content differs from FR-48's text for that version | `WARN`, stating the file was edited and naming the refresh command |
+  | The marker matches and the content is identical | `OK` |
+
+  The refresh command **must** be `uvx otelq@latest skill install`. These rows
+  **must** be reported even when the telemetry directory is missing, and
+  **must not** change `doctor`'s exit code, which stays governed by the
+  telemetry-contract validation (FR-26, FR-17).
 
 ## Edge Cases & Failure Modes
 
@@ -1298,6 +1359,20 @@ configuration that produces the raw files.
   `.otelq-history/` parquet yields an **empty** `history` report and routes
   `triage` to its honest-refusal path — never a traceback, and never any
   effect on the telemetry query commands themselves. (FR-34, FR-35, FR-17)
+
+- **EC-38 — `skill install` cannot write.** When either skill file, or a parent
+  directory it needs, cannot be written (for example a read-only target),
+  `skill install` exits `2` with reason `write_error` (FR-37), names the path
+  that failed and any file it had already written, and leaves stdout empty
+  (INV-7). It never reports a partial install as success. (FR-48, FR-37)
+- **EC-39 — Target outside git.** `skill install --target DIR` where `DIR` is
+  not inside a git checkout installs normally; git is not required. `doctor`
+  run outside a git checkout inspects the working directory itself. (FR-48,
+  FR-50)
+- **EC-40 — Target is not a directory.** `skill install --target DIR` where
+  `DIR` does not exist, or is not a directory, exits `2` with reason
+  `usage_error` and creates nothing; otelq never creates the project root
+  itself. (FR-48, FR-37)
 
 ## Acceptance Criteria
 
@@ -2080,6 +2155,60 @@ configuration that produces the raw files.
   *Verification hint:
   `test_f2_instant_older_than_hot_window_is_disclosed_under_verbose`.*
 
+- **AC-123** (Verifies FR-48, FR-49): Given any working directory, when
+  `otelq skill print` runs, then stdout is the canonical skill text for the
+  running version, it is identical for every `--format`, no response header is
+  printed, and the exit code is `0`.
+  *Verification hint: `test_fr48_skill_print_is_the_rendered_skill`.*
+
+- **AC-124** (Verifies FR-48): Given an empty project directory, when
+  `skill install --target` runs, then exactly the two skill files exist and two
+  rows report `created`; a second run reports `unchanged` for both and does not
+  rewrite them; after one file is edited, a third run reports `updated` for that
+  file only and restores its content; `--format json` renders the same rows.
+  *Verification hint: `test_fr48_skill_install_is_idempotent`.*
+
+- **AC-125** (Verifies FR-49): Given the rendered skill, then its frontmatter
+  `metadata.otelq_version` equals the `--version` output, every otelq invocation
+  in it is `uvx otelq@<that version>`, no unpinned `uvx otelq ` invocation
+  remains, and it names `uvx otelq@latest skill install` as the upgrade path.
+  *Verification hint: `test_fr49_rendered_skill_pins_running_version`.*
+
+- **AC-126** (Verifies FR-50, FR-26): Given a project without the skill, when
+  `doctor` runs from it, then an `otelq skill` row reports `INFO`; after
+  `skill install` it reports `OK`; with the marker rewritten to another version,
+  or removed, or the body edited, it reports `WARN` naming
+  `uvx otelq@latest skill install`; in every case `doctor`'s exit code equals
+  the exit code it has without the skill row, including for a missing telemetry
+  directory.
+  *Verification hint: `test_fr50_doctor_reports_installed_skill`.*
+
+- **AC-127** (Verifies EC-38, FR-37, INV-7): Given a target whose skill
+  directories cannot be created, when `skill install --target` runs, then it
+  exits `2`, stderr carries `otelq: write_error:` naming the failing path, and
+  stdout is empty.
+  *Verification hint: `test_ec38_skill_install_write_failure_is_write_error`.*
+
+- **AC-128** (Verifies EC-39): Given a target that is not a git checkout, when
+  `skill install --target` runs, then both files are created and the exit code
+  is `0`.
+  *Verification hint: `test_fr48_skill_install_is_idempotent` (uses a non-git
+  temp dir).*
+
+- **AC-129** (Verifies EC-40, FR-48): Given `--target` naming a path that does
+  not exist, or a regular file, when `skill install` runs, then it exits `2`
+  with `otelq: usage_error:` on stderr and creates nothing; `otelq skill` with no
+  action, and `otelq --regex x skill print`, exit `2` with `usage_error`.
+  *Verification hint: `test_ec40_skill_install_bad_target_is_usage_error`.*
+
+- **AC-130** (Verifies INV-8, FR-49): Given the otelq repository, then its
+  `.agents/skills/otelq/SKILL.md` and `.claude/skills/otelq/SKILL.md` are
+  byte-identical to what `skill install` writes, and every otelq version pin in
+  the repository's setup skill and plugin manifest equals the `--version`
+  output.
+  *Verification hint: `test_inv8_repo_skill_copies_match_embedded_skill`,
+  `test_inv8_release_pins_are_in_lockstep`.*
+
 ### Examples
 
 - **Argument order (FR-11).** `just otelq --format json errors` succeeds;
@@ -2137,5 +2266,9 @@ configuration that produces the raw files.
 - **INV-6** — Header is additive, not substitutive: the FR-29 response header is
   prepended to stdout for its six governed commands but never changes the
   columns/rows a command returns (INV-3) nor the FR-10 rendering of the payload
-  that follows it. For `sql`, `collector-config`, `troubleshoot`, and `doctor`,
-  stdout is unchanged from FR-10's payload rendering — no header is printed.
+  that follows it. For `sql`, `collector-config`, `troubleshoot`, `doctor`, and
+  `skill`, stdout is unchanged from FR-10's payload rendering — no header is printed.
+- **INV-8** — One skill, one version: the agent skill otelq installs is a pure
+  function of the running otelq version, and the copies committed in the otelq
+  repository are identical to it. A skill never names an otelq version other
+  than the one that produced it.

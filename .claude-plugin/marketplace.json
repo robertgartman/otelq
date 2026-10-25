@@ -6,11 +6,8 @@
   "plugins": [
     {
       "name": "otelq",
-      "source": {
-        "type": "git",
-        "url": "https://github.com/robertgartman/otelq.git"
-      },
-      "description": "otelq dev-telemetry skill + CLI guidance."
+      "source": "./",
+      "description": "Setup skill that wires otelq into a project and installs its version-pinned query skill."
     }
   ]
 }

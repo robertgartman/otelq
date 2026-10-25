@@ -75,6 +75,12 @@ otelq *ARGS:
 otelq-sql QUERY:
     uv run otelq.py sql "{{QUERY}}"
 
+# Regenerate the repo's otelq query skill (.agents + Claude pointer) from the
+# text embedded in otelq.py. Edit the skill in otelq.py, never the copies;
+# a test holds the copies byte-identical to it (ADR-016, INV-8).
+skill-sync:
+    uv run otelq.py skill install --target .
+
 # Run the otelq test suite
 otelq-test:
     uv run --with pytest --with "duckdb==1.5.5" pytest tests/ -v

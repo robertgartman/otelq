@@ -5894,3 +5894,239 @@ def test_supplied_windows_binary_moves_with_the_pin() -> None:
     for name in (".github/workflows/ci.yml", "README.md"):
         text = (_REPO_ROOT / name).read_text(encoding="utf-8")
         assert segment in text, f"{name} does not reference {segment}"
+
+
+# --- agent skill delivery: FR-48..FR-50, EC-38..EC-40, INV-8 (ADR-016) -------
+
+_CANONICAL_SKILL = Path(".agents/skills/otelq/SKILL.md")
+_CLAUDE_SKILL_SHIM = Path(".claude/skills/otelq/SKILL.md")
+_SETUP_SKILL = Path(".agents/skills/target-project-setup/SKILL.md")
+_SKILL_PIN_RE = _re.compile(r"otelq@(\d+\.\d+\.\d+)")
+_UNPINNED_UVX_RE = _re.compile(r"uvx otelq(?!@)")
+_SEMVER_RE = _re.compile(r"\d+\.\d+\.\d+")
+_REFRESH_CMD = "uvx otelq@latest skill install"
+
+
+def _main_io(argv: list[str]) -> tuple[int, str, str]:
+    """Run the CLI in-process; return (exit code, stdout, stderr)."""
+    import io as _io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    out, err = _io.StringIO(), _io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = otelq.main(argv)
+    return code, out.getvalue(), err.getvalue()
+
+
+def test_fr48_skill_print_is_the_rendered_skill() -> None:
+    # AC-123: the file content verbatim, whatever --format says, no header.
+    expected = otelq.render_skill()
+    for fmt in ("compact", "json", "table"):
+        code, out, _ = _main_io(["--format", fmt, "skill", "print"])
+        assert code == 0
+        assert out == expected
+
+
+def test_fr48_skill_install_is_idempotent(tmp_path: Path) -> None:
+    # AC-124 / AC-128: created -> unchanged (not rewritten) -> updated, in a
+    # target that is not a git checkout.
+    target = tmp_path / "proj"
+    target.mkdir()
+    root = target.resolve()
+    canonical, shim = root / _CANONICAL_SKILL, root / _CLAUDE_SKILL_SHIM
+
+    def install() -> dict[str, str]:
+        code, out, err = _main_io(
+            ["--format", "json", "skill", "install", "--target", str(target)]
+        )
+        assert code == 0, err
+        rows: list[dict[str, Any]] = _json.loads(out)
+        return {str(r["file"]): str(r["action"]) for r in rows}
+
+    assert install() == {str(canonical): "created", str(shim): "created"}
+    assert canonical.read_text(encoding="utf-8") == otelq.render_skill()
+    assert shim.read_text(encoding="utf-8") == otelq.render_skill_shim()
+    before = {p: (p.stat().st_ino, p.stat().st_mtime_ns) for p in (canonical, shim)}
+
+    assert install() == {str(canonical): "unchanged", str(shim): "unchanged"}
+    assert {p: (p.stat().st_ino, p.stat().st_mtime_ns) for p in (canonical, shim)} == before
+
+    shim.write_text("edited by hand\n", encoding="utf-8")
+    assert install() == {str(canonical): "unchanged", str(shim): "updated"}
+    assert shim.read_text(encoding="utf-8") == otelq.render_skill_shim()
+    # Nothing but the two skill files was written.
+    written = sorted(p.relative_to(root) for p in root.rglob("*") if p.is_file())
+    assert written == sorted([_CANONICAL_SKILL, _CLAUDE_SKILL_SHIM])
+
+
+def test_fr49_rendered_skill_pins_running_version() -> None:
+    # AC-125: the frontmatter marker and every invocation name this version.
+    text = otelq.render_skill()
+    version = otelq.__version__
+    assert text.startswith("---\n")
+    frontmatter = text.split("---", 2)[1]
+    marker = _re.search(r'^\s+otelq_version:\s*"([^"]+)"\s*$', frontmatter, _re.MULTILINE)
+    assert marker is not None and marker.group(1) == version
+    assert "\nmetadata:\n" in frontmatter
+    pins = _SKILL_PIN_RE.findall(text)
+    assert pins and set(pins) == {version}
+    assert not _UNPINNED_UVX_RE.search(text)
+    assert _REFRESH_CMD in text
+
+
+def _doctor_skill_row(telemetry_dir: Path) -> tuple[int, dict[str, Any]]:
+    code, out, err = _main_io(["--dir", str(telemetry_dir), "--format", "json", "doctor"])
+    rows: list[dict[str, Any]] = _json.loads(out)
+    skill_rows = [r for r in rows if r["check"] == "otelq skill"]
+    assert len(skill_rows) == 1, (rows, err)
+    return code, skill_rows[0]
+
+
+def test_fr50_doctor_reports_installed_skill(
+    tmp_path: Path, temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AC-126: INFO -> OK -> WARN (version / no marker / edited); doctor's exit
+    # code is the telemetry verdict alone, also for a missing telemetry dir.
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base)])
+    missing = tmp_path / "no-telemetry-here"
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    monkeypatch.chdir(proj)
+    canonical = proj / _CANONICAL_SKILL
+    version = otelq.__version__
+
+    def check(status: str, *needles: str) -> None:
+        for telemetry_dir, verdict in ((temp_telemetry, 0), (missing, 1)):
+            code, row = _doctor_skill_row(telemetry_dir)
+            assert code == verdict
+            assert row["status"] == status, row
+            for needle in needles:
+                assert needle in row["detail"], row
+
+    check("INFO", "skill install")
+
+    assert _main_io(["skill", "install"])[0] == 0
+    check("OK", version)
+
+    pinned = f'otelq_version: "{version}"'
+    text = canonical.read_text(encoding="utf-8")
+    canonical.write_text(text.replace(pinned, 'otelq_version: "0.0.1"'), encoding="utf-8")
+    check("WARN", "0.0.1", version, _REFRESH_CMD)
+
+    canonical.write_text(text.replace(pinned + "\n", ""), encoding="utf-8")
+    check("WARN", _REFRESH_CMD)
+
+    canonical.write_text(text + "\nlocal addition\n", encoding="utf-8")
+    check("WARN", "edited", _REFRESH_CMD)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="needs POSIX permissions that bind a non-root user",
+)
+def test_ec38_skill_install_write_failure_is_write_error(tmp_path: Path) -> None:
+    # AC-127: a write that cannot complete is a failure to answer — exit 2,
+    # write_error, empty stdout — and names a file it had already written.
+    target = tmp_path / "proj"
+    target.mkdir()
+    blocked = target / ".claude"
+    blocked.mkdir()
+    blocked.chmod(0o500)
+    try:
+        code, out, err = _main_io(["skill", "install", "--target", str(target)])
+    finally:
+        blocked.chmod(0o700)
+    assert code == 2
+    assert out == ""
+    assert "otelq: write_error: " in err
+    assert str(blocked.resolve()) in err
+    assert str((target / _CANONICAL_SKILL).resolve()) in err
+
+
+def test_ec40_skill_install_bad_target_is_usage_error(tmp_path: Path) -> None:
+    # AC-129: otelq never creates the project root; malformed `skill` calls
+    # are usage errors.
+    missing = tmp_path / "nope"
+    a_file = tmp_path / "a-file"
+    a_file.write_text("x", encoding="utf-8")
+    for target in (missing, a_file):
+        code, out, err = _main_io(["skill", "install", "--target", str(target)])
+        assert code == 2
+        assert out == ""
+        assert "otelq: usage_error: " in err
+    assert not missing.exists()
+    for argv in (["skill"], ["--regex", "x", "skill", "print"]):
+        code, out, err = _main_io(argv)
+        assert code == 2
+        assert out == ""
+        assert "otelq: usage_error: " in err
+
+
+def test_inv8_repo_skill_copies_match_embedded_skill() -> None:
+    # AC-130: the repo's copies are generated (`just skill-sync`), never edited.
+    assert (_REPO_ROOT / _CANONICAL_SKILL).read_text(encoding="utf-8") == otelq.render_skill()
+    assert (_REPO_ROOT / _CLAUDE_SKILL_SHIM).read_text(
+        encoding="utf-8"
+    ) == otelq.render_skill_shim()
+
+
+def test_inv8_release_pins_are_in_lockstep() -> None:
+    # AC-130: every version pin release tooling owns equals __version__, and
+    # release-please is configured to move each of them.
+    version = otelq.__version__
+    plugin: dict[str, Any] = _json.loads(
+        (_REPO_ROOT / ".claude-plugin/plugin.json").read_text(encoding="utf-8")
+    )
+    assert plugin["version"] == version
+    declared: Any = plugin["skills"]
+    skill_dirs: list[str] = [declared] if isinstance(declared, str) else list(declared)
+    assert skill_dirs
+    for rel in skill_dirs:
+        assert rel.startswith("./")
+        resolved = (_REPO_ROOT / rel).resolve()
+        assert resolved.is_relative_to(_REPO_ROOT.resolve())
+        assert (resolved / "SKILL.md").is_file() or any(resolved.glob("*/SKILL.md"))
+
+    setup = (_REPO_ROOT / _SETUP_SKILL).read_text(encoding="utf-8")
+    pins = _SKILL_PIN_RE.findall(setup)
+    assert pins and set(pins) == {version}
+    assert not _UNPINNED_UVX_RE.search(setup)
+    # Every version the setup skill names (the CLI pin and the pinned release
+    # URL it fetches reference files from) is this release.
+    assert set(_SEMVER_RE.findall(setup)) == {version}
+
+    config: dict[str, Any] = _json.loads(
+        (_REPO_ROOT / "release-please-config.json").read_text(encoding="utf-8")
+    )
+    extra: list[dict[str, Any]] = config["packages"]["."]["extra-files"]
+    owned = {str(e["path"]) for e in extra}
+    assert {
+        "otelq.py",
+        ".claude-plugin/plugin.json",
+        _CANONICAL_SKILL.as_posix(),
+        _SETUP_SKILL.as_posix(),
+    } <= owned
+
+
+def test_release_please_blocks_cover_every_skill_pin() -> None:
+    # release-please's generic updater rewrites only versions inside an
+    # x-release-please block, and only the FIRST one on each line: a pin outside
+    # a block, or a second version on one line, would silently stay behind.
+    for rel in (_CANONICAL_SKILL, _SETUP_SKILL):
+        inside = False
+        blocks = 0
+        for number, line in enumerate(
+            (_REPO_ROOT / rel).read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if "x-release-please-start-version" in line:
+                inside, blocks = True, blocks + 1
+                continue
+            if "x-release-please-end" in line:
+                inside = False
+                continue
+            found = _SEMVER_RE.findall(line)
+            if found:
+                assert inside, f"{rel}:{number} has a version outside a release block"
+                assert len(found) == 1, f"{rel}:{number} has more than one version"
+        assert blocks == 1 and not inside, f"{rel} needs exactly one closed release block"

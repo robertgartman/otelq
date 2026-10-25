@@ -520,6 +520,7 @@ REASON_STORE_UNREADABLE = "store_unreadable"
 REASON_QUERY_ERROR = "query_error"
 REASON_USAGE_ERROR = "usage_error"
 REASON_INTERNAL_ERROR = "internal_error"
+REASON_WRITE_ERROR = "write_error"
 REASON_INTERRUPTED = "interrupted"
 REASON_TIMEOUT = "timeout"
 
@@ -3887,6 +3888,626 @@ def render_troubleshooting() -> str:
     )
 
 
+# --- agent skill (ADR-016) ----------------------------------------------------
+# otelq carries its own agent skill, so the skill a project receives is, by
+# construction, the one written for the CLI that installed it. `skill print`
+# and `skill install` render it (FR-48); every otelq invocation in it, and the
+# frontmatter marker `doctor` reads (FR-50), name the running version (FR-49).
+# The repository's own copies are generated from this text (`just skill-sync`)
+# and a test holds them byte-identical to it (INV-8). Edit the skill HERE.
+#
+# The rendered skill carries release-tooling block markers so a release rewrites
+# the version pins in the repository's committed copy. They are tokens here and
+# assembled from two halves at render time, so the release tooling, which also
+# scans this file, never sees a block in otelq.py itself.
+
+SKILL_CANONICAL_PATH = Path(".agents/skills/otelq/SKILL.md")
+SKILL_CLAUDE_SHIM_PATH = Path(".claude/skills/otelq/SKILL.md")
+SKILL_REFRESH_COMMAND = "uvx otelq@latest skill install"
+_SKILL_CHECK = "otelq skill"
+_SKILL_VERSION_TOKEN = "@OTELQ_VERSION@"
+_RELEASE_BLOCK_START_TOKEN = "@RELEASE_BLOCK_START@"
+_RELEASE_BLOCK_END_TOKEN = "@RELEASE_BLOCK_END@"
+_RELEASE_MARKER = "x-release-" + "please"
+_SKILL_VERSION_MARKER_RE = re.compile(r'^\s+otelq_version:\s*"?([^"\s]+)"?\s*$', re.MULTILINE)
+_SKILL_DESCRIPTION_RE = re.compile(r"^description: (.+)$", re.MULTILINE)
+
+_SKILL_TEMPLATE = r"""---
+name: otelq
+description: "This is the **default** tool for accessing logs, metrics, and traces generated from project codebase and infrastructure. Use otelq CLI to query telemetry captured by the OpenTelemetry Collector. Triggers: otel, OpenTelemetry, RCA, root cause."
+# @RELEASE_BLOCK_START@ - release tooling moves every otelq pin in this file
+metadata:
+  otelq_version: "@OTELQ_VERSION@"
+---
+
+# Query Telemetry
+
+Inspect real OpenTelemetry signals to close the loop after a change or for troubleshooting: run the
+code, then confirm from telemetry that it behaved as intended. If infrastructure is feeding into OpenTelemetry, you can also query that data to understand its behavior.
+
+## Run
+
+```
+uvx otelq@@OTELQ_VERSION@ --format compact summary
+```
+
+**`--dir` is not required.** otelq resolves the store itself:
+
+1. `--dir <path>` — wins over everything
+2. `$OTELQ_DIR` — one value two cooperating scripts can share, so they cannot
+   silently read different stores
+3. the nearest `.telemetry/` at or above your working directory — and from a
+   **linked git worktree**, the *main checkout's* store (see below)
+
+Every response header reports what it read and why:
+
+```
+OTEL source dir: /path/to/repo/.telemetry
+OTEL source resolved by: CWD or an ancestor
+```
+
+Compare those two lines across invocations to **prove** two commands read the
+same store. If nothing resolves, otelq exits `2` with `store_not_found` and
+names every path it tried — it never creates a store.
+
+## Keep the version pin
+
+Every command in this skill runs `otelq@@OTELQ_VERSION@`, the version this skill was
+written for. Keep the pin: an unpinned invocation runs whichever version uv
+cached first, which may lack the flags described here. To upgrade otelq and this skill
+together, run from the project root:
+
+```
+uvx otelq@latest skill install
+```
+
+`doctor` reports an `otelq skill` row that warns when this file and the CLI
+disagree.
+
+## Git worktrees are handled for you
+
+One host runs one Collector on fixed ports, so **every worktree exports into the
+main checkout's `.telemetry/`**. Run otelq from a linked worktree and it reads
+the main checkout's store automatically, reporting:
+
+```
+OTEL source resolved by: git main checkout (worktree 'my-feature', default branch 'main')
+```
+
+This matters because a linked worktree often has its own *empty* `.telemetry/`.
+Reading that would report "no telemetry captured" — truthfully, about the wrong
+store — while your data sits in the main checkout. Pass `--dir` explicitly if you
+really do want the worktree's own directory.
+
+## Start every investigation with `triage`
+
+**The first instruction of an investigation is `triage`, not `summary`.**
+otelq records every telemetry query it runs (locally, in `.otelq-history/`
+under the telemetry dir), and `triage` acts on that history:
+
+```
+uvx otelq@@OTELQ_VERSION@ --format compact triage
+```
+
+What it does, in order:
+
+1. **Detects where you are.** Pass `--session-id <id>` to continue a chain —
+   triage anchors on that session's last query. Without the flag you are
+   **always** starting fresh: the session id is the only chain signal
+   (timestamps are never trusted — other agents may be querying the same
+   store concurrently), which is why carrying the id matters.
+2. **Auto-runs the best next query** when history is convincing (a Markov step
+   over past investigation sessions: enough recent evidence, majority
+   agreement, and a concrete template). You get the query's normal output —
+   banner first, so you know triage chose it.
+3. **Suggests the follow-up as its last output line** — a full
+   `otelq --dir … --session-id … <query>` invocation to run next. Run it (or
+   adapt any `?` placeholders) to keep the chain going.
+4. **Grounds or admits ignorance** when history has no strong candidate: if
+   this session hasn't run `summary` yet, triage runs it for you (RCA step 1 —
+   read its output and proceed with step 2). If the session is already
+   grounded, triage says it doesn't know and prints the ranked template list
+   (`score` = recent-frequency × success; `terminal_pct` = how often the
+   template *ended* a burst with usable rows). Pick one that matches your
+   symptom, or fall through to the RCA guide below.
+
+`history --top 20` prints the ranked list directly; the raw tables are `sql`
+views (`history_queries`, `history_invocations` — sessions are `session_id`
+groups ONLY; id-less rows belong to no session). History never records
+`triage`/`history`/`doctor`/meta commands, and `OTELQ_HISTORY=0` disables it.
+
+## How to investigate (RCA guide)
+
+A fixed procedure beats free-form exploration: SOP-guided agents roughly
+double free-form ReAct's accuracy on RCA benchmarks (Flow-of-Action, WWW'25),
+and the documented LLM failure modes are skipping grounding, anchoring on the
+first plausible cause, and stopping at a propagated symptom instead of its
+origin (FORGE'26). Follow the steps in order; each step's output is the next
+step's input. The ordering is adapted to otelq's dev-environment corpus:
+logs here are small, local, and rich — go to them earlier than production
+RCA lore suggests.
+
+**Standing rule — constrain every query.** Default to a tight `--since`
+window (the repro run, not the whole session) and an aggressive `--regex` on
+anything list-shaped; the header's `Rows removed by regex` tells you what the
+filter cost, so over-filtering is visible and correctable. Widening a window
+or dropping a filter is one retry; flooding your context is unrecoverable.
+
+**Standing rule — carry one session id through the whole investigation.** The
+first call of an RCA stamps a `Session:` line in its response header and prints
+a footer naming a session id; pass that exact id as `--session-id <id>` on every
+follow-up call of the same investigation, so the run is correlated end-to-end.
+Start a fresh investigation → let otelq generate a new id (omit the flag on the
+first call); continue one → reuse the id it already gave you.
+
+**0 · FRAME.** Before any query, state the symptom and the time window.
+Tighten `--since` to the anomaly (e.g. `30s`/`10m` right after a repro run) —
+never "look at everything."
+
+**1 · GROUND with `summary`** *(skip when `triage` already ran a grounding
+query for you — build on its output instead of re-grounding)*. One cheap call
+maps the terrain: which signals
+have data at all, per-level log counts (any ERROR/FATAL?), the `>1s` span
+bucket, metric types, and each subset's time span. Its second block —
+`** List of services in telemetry data **`, a `service`/`count` table ordered
+most-active-first — tells you which service dominates the window and is the
+first candidate to zoom in on (scope later queries with its name via
+`--service` / a `--regex` / a `sql WHERE service_name = '…'`). Skip `summary`
+only when you already hold a trace_id or an exact target. Target signal at 0
+rows? Fix capture first (`troubleshoot`) — don't query a void.
+
+**2 · TRIAGE — commit to ONE signal per symptom.** Each command below is a
+pre-built aggregate; don't hand-roll `sql` for these:
+
+| Symptom | Command |
+| --- | --- |
+| exception / failure | `errors` — error spans + ERROR/FATAL logs, newest-first |
+| slow / latency | `slow` — spans by duration desc, carries trace_id |
+| wrong or missing behavior | `logs --grep <token>` (literal, case-insensitive body contains) or `--regex` (pattern) — dev logs are rich, use them early |
+| resource / counter anomaly | `metric <name>` — names come from `summary` |
+
+Nothing in the window? Widen once (`--all`); still nothing means the
+telemetry never captured it — say so instead of exploring sideways.
+
+**3 · LOCALIZE with `trace <trace_id>`** (a unique id prefix is enough;
+`errors`, `slow`, and `logs` rows all carry trace_id — pivot directly).
+One full tree beats ten partial fetches. Read it with two heuristics:
+
+- **Latency origin** = the span with the largest **self** time (its
+  `duration_ms` minus its children's) — *not* the longest span; the root is
+  long because it contains everyone.
+- **Error origin** = the **deepest** error span whose children are *not* all
+  errors. A span whose children all errored is merely propagating — keep
+  descending.
+
+**4 · EXPLAIN with scoped logs** — never a free-text sweep of the window:
+`sql "SELECT timestamp, severity_text, body FROM logs WHERE trace_id = '<id>'"`.
+Custom app attributes live in the `*_attributes` JSON columns — run
+`sql "DESCRIBE logs"` first, then filter on what actually exists.
+
+**5 · STOP** when you hold all three: the origin span, the log/exception that
+explains it, and the service/attribute saying where. State the hypothesis
+with that evidence. Do not keep exploring past this point.
+
+**Token discipline** (why the order above): aggregates before rows — `summary`
+or `sql "SELECT count(*), min(timestamp), max(timestamp) FROM …"` costs a
+fraction of the rows themselves; filter server-side (`--since` / `--regex` /
+`--top` / `--service` / `--level` / `--grep`) rather than fetching broadly and
+post-filtering; carry only {window, signal, trace_id, span_id} between steps.
+
+## What did it actually search, and is the data fresh?
+
+Two header lines answer different questions. **Do not confuse them:**
+
+```
+Rows time range: 2026-08-13T13:58:02.114Z - 2026-08-13T14:01:47.903Z
+Query window:    2026-08-13T13:32:11.000Z - 2026-08-13T14:02:11.000Z (30m, default)
+```
+
+- `Rows time range:` — the span of the rows you got back. It is `n/a - n/a`
+  when nothing matched.
+- `Query window:` — the range that was **searched**, and which rule chose the
+  width: `--since` (you asked), `default` (otelq's built-in window), `--all`, or
+  `command default`. It is populated **even when there are no rows** — an empty
+  answer is meaningless without knowing what was looked at.
+
+Unbounded queries say so: `all history (--all)`.
+
+**Before concluding "it didn't happen", check the window.** A default window
+applies when you pass no `--since`, so an empty result may simply mean the
+event is older than the range that was searched.
+
+### Is anything still arriving?
+
+`summary` ends with a freshness block:
+
+```
+** Newest record per signal **
+signal   newest                     age
+traces   2026-08-13T14:01:47.903Z   4s
+logs     2026-08-13T13:59:12.204Z   2m39s
+```
+
+This is **not** window-scoped — it reports the newest record per signal
+regardless of what you queried, which is exactly what distinguishes **"nothing
+happened"** from **"the collector has not flushed yet"**. An `await` that times
+out prints the same thing:
+
+```
+otelq: timeout: not satisfied within 30s (waited 30012ms over 30 polls)
+otelq: newest record: traces 2s ago, logs 4s ago
+```
+
+Traces arriving 2s ago while your predicate never matched means the step ran and
+your predicate is wrong. `no records captured` means nothing is reaching the
+collector at all — check the exporter, not your query.
+
+otelq reports the **age, never a verdict** — there is no `STALE` label, because
+which lag is acceptable is your decision, not otelq's.
+
+## Timestamps are UTC
+
+**All timestamps are UTC** — every `timestamp` otelq prints, and every one you
+write into a `sql` filter. Each response also restates this up front. For
+`sql` literals, write them bare (`'2026-07-01 10:00:00'`) or `Z`-suffixed
+(`'2026-07-01T10:00:00Z'`); never a `+02:00`-style offset — DuckDB silently
+drops it instead of converting, so the comparison would be silently wrong.
+
+## Pick the fewest-token format
+
+**Default to `--format compact` for anything you parse yourself.** It returns one
+lossless object — column names once, then each row as a positional array:
+
+```
+{"columns":["timestamp","service_name","body"],"rows":[["2026-…","api","hi"]]}
+```
+
+Read each row by position, or rebuild objects with `zip(columns, row)`. Versus
+`--format json` (an array of per-row objects) it drops the repeated keys —
+typically ~40–60% fewer tokens on the same rows, identical data.
+
+| Format | Use it for |
+| --- | --- |
+| `compact` | **your own analysis** — smallest, lossless (prefer this) |
+| `json` / `jsonl` | only when a downstream consumer needs self-describing rows |
+| `csv` | spreadsheet / interchange |
+| `table` | only when showing output to a human |
+
+`--format` is a **global** flag: it (and `--all`, `--no-cache`, `--since`,
+`--regex`, `--session-id`) goes **before** the subcommand; per-command flags
+(`--top`, `--service`, `--level`, `--grep`) go **after**:
+
+```
+uvx otelq@@OTELQ_VERSION@ --since 10m --format compact errors --top 20
+```
+
+## Filter inside otelq (`--regex` / `--grep`), not shell `| grep`
+
+Piping otelq's output through shell `grep` is blind to what got filtered away.
+Use otelq-native filtering instead:
+
+- `--regex PATTERN` (summary/errors/slow/trace/logs/metric): regex over rendered
+  cell values, reported in the header with rows removed.
+- `logs --grep TOKEN` (logs only): literal, case-insensitive substring match on
+  `body`.
+
+Both avoid shell-postprocessing ambiguity. `--regex` is the general mechanism;
+`--grep` is a logs-only convenience when you want literal substring matching
+without regex escaping.
+
+`--regex` is applied to the already `--top`-capped result, while `logs --grep`
+filters in the SQL query before capping. So for logs, `--grep` can surface the
+latest matching rows without first raising `--top`.
+
+Example:
+
+```
+uvx otelq@@OTELQ_VERSION@ --regex "timeout|ECONNRESET" errors
+```
+
+Case-sensitive by default (use inline `(?i)` for case-insensitive). Only
+`summary`/`errors`/`slow`/`trace`/`logs`/`metric` support it — not `sql`
+(use `WHERE col ~ 'pattern'` instead) or `doctor`/`collector-config`/
+`troubleshoot`. It filters the same already-`--top`-capped result; raise
+`--top` if you need to search further back.
+
+## Commands
+
+`summary`, `errors`, `slow`, `trace <id>`, `logs`, `metric <name>`,
+`sql "<query>"`. Narrow the window with `--since 30s|10m|2h|1d` (or `--all` for
+full history); cap rows with `--top N`. Full reference (incl. the `sql` view
+columns):
+
+```
+uvx otelq@@OTELQ_VERSION@ --help
+```
+
+`--help`'s `sql` column list is a curated subset. For the full live schema —
+including `*_attributes` columns carrying whatever custom OTel tags an app
+actually emits — use standard DuckDB introspection:
+
+```
+uvx otelq@@OTELQ_VERSION@ sql "DESCRIBE traces"
+uvx otelq@@OTELQ_VERSION@ sql "PRAGMA table_info('logs')"
+```
+
+## Wait for something to arrive (`await`)
+
+Telemetry lands seconds after it is emitted (Collector batch + flush). Do **not**
+sleep-and-retry from the shell — otelq polls in-process, so the budget is real:
+
+```
+uvx otelq@@OTELQ_VERSION@ --resource-attr smoke.run_id=abc123 \
+  await --timeout 60s --poll 1s logs --attr smoke.step=pair-node
+```
+
+Exit `0` satisfied (the result is printed, with `Waited: <n>ms`), `1` the
+deadline passed unsatisfied, `2` the store or query failed. `--timeout` is
+required; the first poll runs immediately; total may exceed the timeout by at
+most one poll, since an in-flight query is not interrupted.
+
+Two things to get right:
+
+- **Await log records, not spans, for "did X start?"** An SDK exports a span on
+  span *end*, so a span cannot signal that work began — and a step that hangs
+  forever emits no span at all.
+- **A count is judged by value, not by row count.** `await sql "SELECT count(*)
+  …"` waits until the count is non-zero. It does not fire instantly just because
+  an aggregate always returns one row.
+
+A store error during a wait exits `2` immediately rather than burning the
+budget, so a timeout always means "not yet" and never "otelq was broken".
+
+## Correlate by Resource attribute (`--resource-attr`)
+
+An OTel **Resource** attribute is the spine that ties one run's traces, logs and
+metrics together. Filter on it directly — never by grepping the raw JSON:
+
+```
+uvx otelq@@OTELQ_VERSION@ --resource-attr smoke.run_id=abc123 errors
+uvx otelq@@OTELQ_VERSION@ --resource-attr service.namespace=api --resource-attr deployment.environment=dev logs
+```
+
+Repeatable (terms AND together), **exact** match, dotted keys need no escaping.
+Omit `=VALUE` to match any non-empty value. Works on `summary`, `errors`,
+`slow`, `trace`, `logs`, `metric`, and is echoed in the response header so you
+can see what was filtered.
+
+`--resource-attr` matches the **producer**; `--attr` matches the **record**
+(span/log/metric attributes, column chosen by signal). Use `--resource-attr` for
+"which run", `--attr` for "which event within it". They never cross, so a
+mis-instrumented producer cannot read as a false positive.
+
+Exact match matters: `--resource-attr run=abc` must not pick up `abc-2`. Do
+**not** substitute `LIKE '%abc%'` — a run id that prefixes another id then
+selects the wrong run.
+
+In `sql` (never rewritten, so filter yourself) use the otelq-defined macro —
+not `json_extract_string`, which needs escaping and raises on a malformed row:
+
+```
+uvx otelq@@OTELQ_VERSION@ sql "SELECT * FROM logs
+  WHERE resource_attr(resource_attributes, 'smoke.run_id') = 'abc123'"
+```
+
+## Did these spans actually connect? (`span_tree`)
+
+**Sharing a `trace_id` does not mean connected.** A dangling parent — a span
+whose parent was never exported — leaves spans in one trace split into separate
+components. Ask with `root_id`, not `trace_id`:
+
+```
+uvx otelq@@OTELQ_VERSION@ sql "SELECT span_id, root_id, depth, is_orphan FROM span_tree"
+```
+
+| Relation | Use |
+|---|---|
+| `span_edges` | `span_id, parent_span_id, trace_id` — only edges whose parent exists in the **same** trace |
+| `span_tree` | `span_id, trace_id, root_id, depth, is_orphan` — two spans connect iff their `root_id` match |
+
+`is_orphan` marks a span whose parent was **named but never exported** (sampled
+away, still in flight, or a non-exporting service) — a broken link, as distinct
+from a genuine root, which has an empty parent.
+
+When checking that a set of spans formed one chain, separate the two faults —
+they have different causes and different fixes:
+
+- **missing** — a member was never observed at all ⇒ that step never ran, or
+  isn't instrumented.
+- **disconnected** — every member observed, but split across `root_id`s ⇒ a hop
+  lost W3C trace context.
+
+otelq reports structure and never a verdict on it: write the predicate yourself,
+then gate it with the exit code, and wrap it in `await` if the answer may not
+have arrived yet. `otelq --help` carries a copy-pasteable version of that query.
+
+## Exit codes (scripting otelq)
+
+otelq's exit code is a stable contract. **Exit `0` means stdout is the answer to
+what you asked** — so a script never has to guess whether a query ran.
+
+| Exit | Meaning |
+|------|---------|
+| `0` | Answered. Includes zero rows and an empty-but-present store. |
+| `1` | Answered, verdict negative (`doctor` on an unhealthy store). |
+| `2` | **No answer**: bad flag, bare invocation, missing store, unreadable store, bad SQL. |
+
+On exit `2`, stdout is empty and stderr carries one
+`otelq: <reason>: <message>` line — `store_not_found`, `store_unreadable`,
+`query_error`, `usage_error`, `internal_error`. Under `--format json|jsonl|compact`
+a JSON object follows it on stderr, with `otelq_version`, `ok`, `reason`, `store.dir`.
+
+Do **not** write `otelq ... 2>/dev/null || echo 0` — that is the pattern this
+contract exists to kill. Branch on the exit code:
+
+```bash
+hits=$(uvx otelq@@OTELQ_VERSION@ --format compact \
+         sql "SELECT count(*) FROM logs WHERE severity_text = 'ERROR'") || {
+  echo "otelq failed — do not treat this as zero errors" >&2; exit 2; }
+```
+
+A count query returns a row whether the count is `0` or `500`; the *value* is
+the answer and exit `0` is your guarantee it is real. A missing `--dir` is exit
+`2`, not an empty store — and otelq never creates the directory, so a typo
+cannot hide.
+
+## Not seeing data?
+
+```
+uvx otelq@@OTELQ_VERSION@ troubleshoot
+```
+
+<!-- @RELEASE_BLOCK_END@ -->
+"""
+
+_SKILL_SHIM_TEMPLATE = """\
+---
+name: otelq
+description: @SKILL_DESCRIPTION@
+allowed-tools: Bash, Read
+---
+
+# Query Telemetry
+
+First, read the canonical instructions at `.agents/skills/otelq/SKILL.md` and follow them exactly.
+
+This Claude Code entry is only a pointer. `otelq skill install` writes both files
+from the same otelq release, so the two cannot drift.
+"""
+
+
+def render_skill() -> str:
+    """The canonical otelq query skill for the running version (FR-48, FR-49)."""
+    return (
+        _SKILL_TEMPLATE.replace(_SKILL_VERSION_TOKEN, __version__)
+        .replace(_RELEASE_BLOCK_START_TOKEN, _RELEASE_MARKER + "-start-version")
+        .replace(_RELEASE_BLOCK_END_TOKEN, _RELEASE_MARKER + "-end")
+    )
+
+
+def render_skill_shim() -> str:
+    """The Claude Code pointer to the canonical skill; Claude Code reads
+    `.claude/skills/`, not the cross-agent `.agents/skills/` (FR-48)."""
+    match = _SKILL_DESCRIPTION_RE.search(_SKILL_TEMPLATE)
+    description = match.group(1) if match else '"otelq"'
+    return _SKILL_SHIM_TEMPLATE.replace("@SKILL_DESCRIPTION@", description)
+
+
+def _write_if_changed(path: Path, content: str) -> str:
+    """Atomically make `path` hold `content`; return created/updated/unchanged.
+    An unchanged file is not rewritten. OSError propagates to the caller."""
+    data = content.encode("utf-8")
+    try:
+        if path.read_bytes() == data:
+            return "unchanged"
+        action = "updated"
+    except FileNotFoundError:
+        action = "created"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return action
+
+
+def _run_skill_install(target: Path | None, fmt: str) -> int:
+    """`skill install` (FR-48): write the canonical skill and the Claude Code
+    pointer under the project root. Never creates the root itself (EC-40); a
+    write that cannot complete is a failure to answer, not a partial success
+    (EC-38, ADR-012)."""
+    root = target if target is not None else Path.cwd()
+    if not root.is_dir():
+        _fail(
+            REASON_USAGE_ERROR,
+            f"--target {root} is not an existing directory "
+            "(otelq never creates the project root)",
+        )
+    root = root.resolve()
+    planned = (
+        (root / SKILL_CANONICAL_PATH, render_skill()),
+        (root / SKILL_CLAUDE_SHIM_PATH, render_skill_shim()),
+    )
+    rows: list[Row] = []
+    written: list[str] = []
+    for path, content in planned:
+        try:
+            action = _write_if_changed(path, content)
+        except OSError as exc:
+            done = f" (already written: {', '.join(written)})" if written else ""
+            _fail(REASON_WRITE_ERROR, f"could not write {path}: {exc}{done}")
+        if action != "unchanged":
+            written.append(str(path))
+        rows.append((str(path), action))
+    print(format_output(["file", "action"], rows, fmt))
+    if written:
+        print(
+            "otelq: reload your agent session so it picks up the new skill",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _skill_frontmatter(text: str) -> str:
+    if not text.startswith("---"):
+        return ""
+    return text.split("\n---", 1)[0]
+
+
+def doctor_skill_rows(cwd: Path) -> list[Row]:
+    """`doctor`'s `otelq skill` row (FR-50): is the project's installed skill
+    the one this otelq would install? Diagnostic only (INFO/WARN/OK), never a
+    verdict, so it never moves doctor's exit code."""
+    top = _git_toplevel(cwd)
+    path = (Path(top) if top else cwd) / SKILL_CANONICAL_PATH
+    refresh = f"refresh it with `{SKILL_REFRESH_COMMAND}`"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return [
+            (
+                _SKILL_CHECK,
+                "INFO",
+                f"not installed at {path} — install it with "
+                f"`uvx otelq@{__version__} skill install`",
+            )
+        ]
+    except (OSError, UnicodeDecodeError) as exc:
+        return [(_SKILL_CHECK, "WARN", f"{path} is unreadable ({exc}) — {refresh}")]
+    marker = _SKILL_VERSION_MARKER_RE.search(_skill_frontmatter(text))
+    if marker is None:
+        return [
+            (
+                _SKILL_CHECK,
+                "WARN",
+                f"{path} has no otelq_version marker (written by an older otelq "
+                f"or by hand) — {refresh}",
+            )
+        ]
+    found = marker.group(1)
+    if found != __version__:
+        return [
+            (
+                _SKILL_CHECK,
+                "WARN",
+                f"{path} is written for otelq {found}, but this is otelq "
+                f"{__version__} — {refresh}",
+            )
+        ]
+    if text != render_skill():
+        return [
+            (
+                _SKILL_CHECK,
+                "WARN",
+                f"{path} differs from the canonical skill for otelq {__version__} "
+                f"(edited by hand?) — {refresh}",
+            )
+        ]
+    return [(_SKILL_CHECK, "OK", f"{path} matches otelq {__version__}")]
+
+
 def _validate_active_file(path: Path, signal: str) -> tuple[str, str]:
     """Check one signal's active .jsonl against the contract framing."""
     if not path.exists():
@@ -4231,6 +4852,16 @@ def build_parser() -> argparse.ArgumentParser:
               read/write local files via read_csv/COPY), so treat untrusted
               queries with the same care as a shell command.
 
+            agent skill:
+              skill install [--target DIR]  write otelq's agent skill into a
+                                   project (.agents/skills/otelq, plus a Claude
+                                   Code pointer), pinned to this otelq version;
+                                   idempotent
+              skill print          print that SKILL.md to stdout
+              Upgrade otelq and the skill together, from the project root:
+                uvx otelq@latest skill install
+              `doctor` warns when a project's skill and the CLI disagree.
+
             Run `otelq troubleshoot` for the capture → query loop and common fixes.
             """
         ),
@@ -4427,6 +5058,28 @@ def build_parser() -> argparse.ArgumentParser:
         "set_resource_attributes",
         help="write git-derived otelq.worktree.id/branch into ./.env.local "
         "(opt-in worktree tagging; source it before launching the app)",
+    )
+    p_skill = sub.add_parser(
+        "skill",
+        help="print or install otelq's agent skill, pinned to this version",
+    )
+    skill_sub = p_skill.add_subparsers(
+        dest="skill_action", required=True, metavar="{print,install}"
+    )
+    skill_sub.add_parser(
+        "print", help="print the skill (SKILL.md) for this otelq version to stdout"
+    )
+    p_skill_install = skill_sub.add_parser(
+        "install",
+        help="write .agents/skills/otelq/SKILL.md and a Claude Code pointer "
+        "into a project (idempotent)",
+    )
+    p_skill_install.add_argument(
+        "--target",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="project root to install into (default: the current directory)",
     )
     p_help = sub.add_parser("help", help="show help for otelq or a command")
     p_help.add_argument(
@@ -5395,12 +6048,21 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "troubleshoot":
         print(render_troubleshooting())
         return 0
+    if args.command == "skill":
+        # A meta command (FR-48): reads no store, so it is exempt from FR-38.
+        if args.skill_action == "print":
+            sys.stdout.write(render_skill())
+            return 0
+        return _run_skill_install(args.target, args.format)
     if args.command == "doctor":
         # Exempt from the FR-38 store gate: diagnosing the store IS doctor's
         # job, so an absent directory is an ANSWER (a FAIL row, exit 1 — the
         # verdict tier of ADR-012), not a failure to answer. It reads with
         # is_dir() and creates nothing.
         rows, ok = doctor_report(args.dir)
+        # FR-50: the installed-skill row is diagnostic only; `ok` stays the
+        # telemetry-contract verdict.
+        rows.extend(doctor_skill_rows(Path.cwd()))
         print(format_output(["check", "status", "detail"], rows, args.format))
         return 0 if ok else 1
     # Everything below this line reads (and may provision `.otelq-*` inside)
