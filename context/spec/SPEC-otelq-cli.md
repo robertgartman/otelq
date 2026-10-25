@@ -27,6 +27,7 @@ related_documents:
   - ADR-009-query-history-triage-store
   - ADR-012-exit-codes-as-public-contract
   - ADR-016-cli-carries-versioned-agent-skill
+  - ADR-017-doctor-release-check
 ai_summary: "otelq CLI base behavior: the query relations/columns it exposes, its subcommands (incl. history/triage over the query-history store), global flags and argument order, its exit-code contract, its friendly read-only failure handling, and the skill command that installs its own agent skill."
 semantic_tags:
   - otelq
@@ -78,7 +79,9 @@ otelq's exit-code and stderr behavior when telemetry is absent, partial, or
 malformed; and the `skill` command that prints and installs otelq's own
 version-pinned agent skill, with the `doctor` check that reports when a
 project's installed skill has drifted from the running CLI
-([ADR-016](../adr/ADR-016-cli-carries-versioned-agent-skill.md)).
+([ADR-016](../adr/ADR-016-cli-carries-versioned-agent-skill.md)), and the
+`doctor` check that reports when a newer otelq has been released
+([ADR-017](../adr/ADR-017-doctor-release-check.md)).
 
 **Not covered:** the raw telemetry directory and OTLP JSONL schema (an external
 input — see [CONTRACT-telemetry-directory](../contract/CONTRACT-telemetry-directory.md));
@@ -1189,6 +1192,37 @@ configuration that produces the raw files.
   **must not** change `doctor`'s exit code, which stays governed by the
   telemetry-contract validation (FR-26, FR-17).
 
+- **FR-51 — `doctor` reports a newer release.** In addition to FR-26 and
+  FR-50, `doctor` **must** report exactly one row named `otelq release`, based on
+  one request for the otelq package's latest published version from the Python
+  package index:
+
+  | Condition | Status |
+  |-----------|--------|
+  | `OTELQ_RELEASE_CHECK` is `0`, `false`, `off`, or `no` (case-insensitive) | `INFO`, stating the check is disabled; **no request is made** |
+  | The request fails, times out, or returns no readable version | `INFO`, stating the check could not run, naming the cause and the opt-out variable |
+  | The latest release is newer than the running otelq | `INFO`, naming both versions and the upgrade command for how this otelq is run (below) |
+  | The latest release equals, or is older than, the running otelq | `OK`, naming the running version |
+
+  The upgrade command **must** be, in order of precedence:
+  `uvx otelq@latest skill install` when the project has the canonical skill file
+  that FR-50 inspects, so the CLI pin and the skill move together;
+  `pipx upgrade otelq` when otelq runs from a pipx-installed environment;
+  `uv tool upgrade otelq` when it runs from a `uv tool install` environment;
+  updating the `otelq.py` source when it runs from a file outside any installed
+  package, such as a checkout; and otherwise `uvx otelq@latest`.
+
+  The request **must** time out within 3 seconds, **must not** send telemetry or
+  any project data, and **must** be made only by `doctor` — no other command
+  reaches the network for this. `doctor` **must not** write any file for this
+  check. The row **must** be reported even when the telemetry directory is
+  missing, and **must not** change `doctor`'s exit code (FR-26, FR-17).
+
+- **FR-52 — The skill keeps upgrades with the user.** The skill text that FR-48
+  prints and installs **must** instruct the agent that, when `doctor` reports a
+  newer otelq release, it tells the user and does not upgrade otelq or the skill
+  on its own.
+
 ## Edge Cases & Failure Modes
 
 - **EC-1 — Nothing captured.** No matching `*.jsonl` files exist (Collector down
@@ -1373,6 +1407,15 @@ configuration that produces the raw files.
   `DIR` does not exist, or is not a directory, exits `2` with reason
   `usage_error` and creates nothing; otelq never creates the project root
   itself. (FR-48, FR-37)
+
+- **EC-41 — Release index unreachable.** With no network, a proxy that refuses
+  the connection, a timeout, an HTTP error, or a response that is not the
+  expected JSON, `doctor` prints its rows with `otelq release` as `INFO`, prints
+  no traceback, and exits with the code its telemetry verdict alone dictates.
+  (FR-51, FR-17)
+- **EC-42 — Running a build newer than the latest release.** A development or
+  unreleased build whose version is above the latest release reports `OK`, never
+  an available "upgrade" to an older version. (FR-51)
 
 ## Acceptance Criteria
 
@@ -2208,6 +2251,47 @@ configuration that produces the raw files.
   output.
   *Verification hint: `test_inv8_repo_skill_copies_match_embedded_skill`,
   `test_inv8_release_pins_are_in_lockstep`.*
+
+- **AC-131** (Verifies FR-51, FR-26): Given the release index reports a version
+  newer than the running otelq, when `doctor` runs, then the `otelq release` row
+  is `INFO` naming both versions and `uvx otelq@latest skill install`; given it
+  reports the running version, the row is `OK`; in both cases `doctor` exits `0`
+  for a valid store and `1` for a missing one.
+  *Verification hint: `test_fr51_doctor_reports_newer_release`.*
+
+- **AC-137** (Verifies FR-51): Given a newer release, then the upgrade command
+  `doctor` names follows FR-51's precedence: the skill command for a project
+  with the skill installed, whatever the install method; otherwise
+  `pipx upgrade otelq`, `uv tool upgrade otelq`, the source update for a
+  checkout, or `uvx otelq@latest`, according to how otelq is run.
+  *Verification hint: `test_fr51_upgrade_hint_follows_install_method`.*
+
+- **AC-132** (Verifies EC-41, FR-51): Given the request raises a network error,
+  times out, or yields a payload without a version, when `doctor` runs, then the
+  `otelq release` row is `INFO` stating the check could not run and naming
+  `OTELQ_RELEASE_CHECK`, stderr carries no traceback, and the exit code is
+  unchanged.
+  *Verification hint: `test_ec41_release_check_failure_is_info`.*
+
+- **AC-133** (Verifies FR-51): Given `OTELQ_RELEASE_CHECK=off`, when `doctor`
+  runs, then no request is made and the `otelq release` row is `INFO` stating
+  the check is disabled.
+  *Verification hint: `test_fr51_release_check_opt_out_makes_no_request`.*
+
+- **AC-134** (Verifies EC-42): Given the release index reports a version older
+  than the running otelq, when `doctor` runs, then the `otelq release` row is
+  `OK`.
+  *Verification hint: `test_fr51_doctor_reports_newer_release`.*
+
+- **AC-135** (Verifies FR-51): Given the release index answers with JSON, then
+  the reported version is read from it; given JSON without a version string,
+  the fetch fails as a payload error rather than returning a value.
+  *Verification hint: `test_fr51_fetch_latest_release_reads_index_json`.*
+
+- **AC-136** (Verifies FR-52): Given the rendered skill, then it instructs the
+  agent to report a newer release reported by `doctor` to the user and not to
+  upgrade on its own.
+  *Verification hint: `test_fr52_skill_keeps_upgrades_with_the_user`.*
 
 ### Examples
 

@@ -168,6 +168,14 @@ __all__ = [
     "_worktree_scope_clause",
     "_run_set_resource_attributes",
     "_execute_sql",
+    # agent skill delivery (ADR-016) and the doctor release check (ADR-017)
+    "render_skill",
+    "render_skill_shim",
+    "doctor_skill_rows",
+    "doctor_release_rows",
+    "RELEASE_CHECK_TIMEOUT_SECS",
+    "_fetch_latest_release",
+    "_upgrade_hint",
 ]
 
 # Default to ./.telemetry under the *current working directory* so the zero-config
@@ -3962,7 +3970,10 @@ uvx otelq@latest skill install
 ```
 
 `doctor` reports an `otelq skill` row that warns when this file and the CLI
-disagree.
+disagree, and an `otelq release` row that says when a newer otelq is out. When
+it reports a newer release, tell the user and let them decide: never upgrade
+otelq or this skill on your own, because the upgrade changes files the project
+commits.
 
 ## Git worktrees are handled for you
 
@@ -4456,12 +4467,17 @@ def _skill_frontmatter(text: str) -> str:
     return text.split("\n---", 1)[0]
 
 
+def _project_root(cwd: Path) -> Path:
+    """The project a meta command acts on: the git top-level, else the cwd."""
+    top = _git_toplevel(cwd)
+    return Path(top) if top else cwd
+
+
 def doctor_skill_rows(cwd: Path) -> list[Row]:
     """`doctor`'s `otelq skill` row (FR-50): is the project's installed skill
     the one this otelq would install? Diagnostic only (INFO/WARN/OK), never a
     verdict, so it never moves doctor's exit code."""
-    top = _git_toplevel(cwd)
-    path = (Path(top) if top else cwd) / SKILL_CANONICAL_PATH
+    path = _project_root(cwd) / SKILL_CANONICAL_PATH
     refresh = f"refresh it with `{SKILL_REFRESH_COMMAND}`"
     try:
         text = path.read_text(encoding="utf-8")
@@ -4506,6 +4522,134 @@ def doctor_skill_rows(cwd: Path) -> list[Row]:
             )
         ]
     return [(_SKILL_CHECK, "OK", f"{path} matches otelq {__version__}")]
+
+
+# --- release check (ADR-017) ---------------------------------------------------
+# `doctor`, and only doctor, asks the package index for otelq's latest release,
+# so a project pinned to an old otelq learns that an upgrade exists (FR-51). It
+# is one bounded GET of public metadata: nothing is sent, nothing is written,
+# and every failure is an INFO row. The stdlib network modules are imported
+# lazily because they pull in ssl, which every other command would otherwise
+# pay for at startup.
+
+RELEASE_CHECK_ENV = "OTELQ_RELEASE_CHECK"
+RELEASE_CHECK_TIMEOUT_SECS = 2.0
+RELEASE_INDEX_URL = "https://pypi.org/pypi/otelq/json"
+_RELEASE_CHECK = "otelq release"
+# Same spellings as OTELQ_HISTORY's opt-out.
+_RELEASE_CHECK_OFF_VALUES = frozenset({"0", "false", "off", "no"})
+_RELEASE_KEY_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def _fetch_latest_release(timeout: float = RELEASE_CHECK_TIMEOUT_SECS) -> str:
+    """otelq's latest version on the package index. Raises OSError,
+    http.client.HTTPException or ValueError when it cannot say."""
+    import urllib.request
+
+    request = urllib.request.Request(
+        RELEASE_INDEX_URL,
+        headers={"Accept": "application/json", "User-Agent": f"otelq/{__version__} doctor"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body: bytes = response.read()
+    payload: object = json.loads(body.decode("utf-8"))
+    info: object = (
+        cast(dict[str, object], payload).get("info") if isinstance(payload, dict) else None
+    )
+    version: object = (
+        cast(dict[str, object], info).get("version") if isinstance(info, dict) else None
+    )
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("the index answer carries no version")
+    return version.strip()
+
+
+def _release_key(version: str) -> tuple[int, int, int] | None:
+    match = _RELEASE_KEY_RE.match(version)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def _upgrade_hint(skill_installed: bool, prefix: Path, module_file: Path) -> str:
+    """The upgrade command for how THIS otelq is run (FR-51). A project with the
+    otelq skill upgrades through it, so the CLI pin and the skill move together;
+    otherwise the hint follows the install method visible from the interpreter
+    prefix and the location of this file."""
+    if skill_installed:
+        return f"`{SKILL_REFRESH_COMMAND}` in the project root, then commit the skill"
+    if prefix.name == "otelq" and prefix.parent.name == "venvs":
+        return "`pipx upgrade otelq`"
+    if prefix.name == "otelq" and prefix.parent.name == "tools":
+        return "`uv tool upgrade otelq`"
+    if "site-packages" not in module_file.parts:
+        return "a newer otelq.py (`git pull` in your otelq checkout)"
+    return (
+        "`uvx otelq@latest …` (an unpinned `uvx otelq` keeps the version it "
+        "cached first)"
+    )
+
+
+def doctor_release_rows(cwd: Path) -> list[Row]:
+    """`doctor`'s `otelq release` row (FR-51): is a newer otelq published?
+    Diagnostic only (INFO/OK), so it never moves doctor's exit code."""
+    import http.client
+
+    setting = os.environ.get(RELEASE_CHECK_ENV, "").strip()
+    if setting.lower() in _RELEASE_CHECK_OFF_VALUES:
+        return [
+            (
+                _RELEASE_CHECK,
+                "INFO",
+                f"disabled by {RELEASE_CHECK_ENV}={setting} — no request was made",
+            )
+        ]
+    try:
+        latest = _fetch_latest_release()
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        reason = str(exc) or type(exc).__name__
+        return [
+            (
+                _RELEASE_CHECK,
+                "INFO",
+                f"could not check the package index for a newer otelq ({reason}); "
+                f"set {RELEASE_CHECK_ENV}=off to skip this check",
+            )
+        ]
+    running_key, latest_key = _release_key(__version__), _release_key(latest)
+    if running_key is None or latest_key is None:
+        if latest == __version__:
+            return [(_RELEASE_CHECK, "OK", f"otelq {__version__} is the latest release")]
+        return [
+            (
+                _RELEASE_CHECK,
+                "INFO",
+                f"the latest otelq release is {latest} (this is otelq {__version__})",
+            )
+        ]
+    if latest_key > running_key:
+        hint = _upgrade_hint(
+            (_project_root(cwd) / SKILL_CANONICAL_PATH).is_file(),
+            Path(sys.prefix),
+            Path(__file__).resolve(),
+        )
+        return [
+            (
+                _RELEASE_CHECK,
+                "INFO",
+                f"otelq {latest} is available (this is otelq {__version__}) — "
+                f"upgrade with {hint}",
+            )
+        ]
+    if latest_key == running_key:
+        return [(_RELEASE_CHECK, "OK", f"otelq {__version__} is the latest release")]
+    return [
+        (
+            _RELEASE_CHECK,
+            "OK",
+            f"otelq {__version__} is newer than the latest release {latest}",
+        )
+    ]
 
 
 def _validate_active_file(path: Path, signal: str) -> tuple[str, str]:
@@ -4860,7 +5004,10 @@ def build_parser() -> argparse.ArgumentParser:
               skill print          print that SKILL.md to stdout
               Upgrade otelq and the skill together, from the project root:
                 uvx otelq@latest skill install
-              `doctor` warns when a project's skill and the CLI disagree.
+              `doctor` warns when a project's skill and the CLI disagree, and
+              asks the package index whether a newer otelq is out. Apart from
+              the one-time extension download, that is otelq's only network
+              request; OTELQ_RELEASE_CHECK=off skips it.
 
             Run `otelq troubleshoot` for the capture → query loop and common fixes.
             """
@@ -5048,7 +5195,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.add_parser(
         "doctor",
-        help="check that --dir satisfies the telemetry contract",
+        help="check that --dir satisfies the telemetry contract, and that the "
+        "project's skill and otelq itself are current",
     )
     sub.add_parser(
         "troubleshoot",
@@ -6063,6 +6211,7 @@ def _dispatch(args: argparse.Namespace) -> int:
         # FR-50: the installed-skill row is diagnostic only; `ok` stays the
         # telemetry-contract verdict.
         rows.extend(doctor_skill_rows(Path.cwd()))
+        rows.extend(doctor_release_rows(Path.cwd()))  # FR-51 / ADR-017
         print(format_output(["check", "status", "detail"], rows, args.format))
         return 0 if ok else 1
     # Everything below this line reads (and may provision `.otelq-*` inside)

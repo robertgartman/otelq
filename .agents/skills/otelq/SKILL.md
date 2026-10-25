@@ -48,7 +48,10 @@ uvx otelq@latest skill install
 ```
 
 `doctor` reports an `otelq skill` row that warns when this file and the CLI
-disagree.
+disagree, and an `otelq release` row that says when a newer otelq is out. When
+it reports a newer release, tell the user and let them decide: never upgrade
+otelq or this skill on your own, because the upgrade changes files the project
+commits.
 
 ## Git worktrees are handled for you
 

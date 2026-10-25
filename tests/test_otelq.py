@@ -46,6 +46,14 @@ def hermetic_git_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(var, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def no_release_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep `doctor`'s release check (FR-51) off the network in every test,
+    including the subprocess ones, which inherit os.environ. The FR-51 tests
+    re-enable it and replace the fetch."""
+    monkeypatch.setenv("OTELQ_RELEASE_CHECK", "off")
+
+
 # The one sanctioned way to run the suite against a supplied otlp binary. It is a
 # test-only name on purpose: a developer's own OTELQ_OTLP_EXTENSION must never
 # leak into the suite, but a platform the community repository does not cover
@@ -6130,3 +6138,181 @@ def test_release_please_blocks_cover_every_skill_pin() -> None:
                 assert inside, f"{rel}:{number} has a version outside a release block"
                 assert len(found) == 1, f"{rel}:{number} has more than one version"
         assert blocks == 1 and not inside, f"{rel} needs exactly one closed release block"
+
+
+# --- doctor release check: FR-51, FR-52, EC-41, EC-42 (ADR-017) --------------
+
+import http.client as _http_client  # noqa: E402
+import urllib.request as _urllib_request  # noqa: E402
+
+
+def _doctor_release_row(telemetry_dir: Path) -> tuple[int, dict[str, Any], str]:
+    code, out, err = _main_io(["--dir", str(telemetry_dir), "--format", "json", "doctor"])
+    rows: list[dict[str, Any]] = _json.loads(out)
+    release_rows = [r for r in rows if r["check"] == "otelq release"]
+    assert len(release_rows) == 1, (rows, err)
+    return code, release_rows[0], err
+
+
+def _valid_store(temp_telemetry: Path) -> Path:
+    base = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+    write_jsonl(temp_telemetry / "traces.jsonl", [make_span(base)])
+    return temp_telemetry
+
+
+def test_fr51_doctor_reports_newer_release(
+    tmp_path: Path, temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AC-131 / AC-134: newer -> INFO with both versions and the upgrade
+    # command; same or older -> OK; doctor's exit code is the store verdict.
+    monkeypatch.delenv("OTELQ_RELEASE_CHECK")
+    store = _valid_store(temp_telemetry)
+    missing = tmp_path / "no-telemetry-here"
+    running = otelq.__version__
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    monkeypatch.chdir(proj)
+    assert _main_io(["skill", "install"])[0] == 0  # skill present -> skill hint
+    latest = {"value": "99.0.0"}
+
+    def fake_fetch(timeout: float = otelq.RELEASE_CHECK_TIMEOUT_SECS) -> str:
+        assert timeout <= 3
+        return latest["value"]
+
+    monkeypatch.setattr(otelq, "_fetch_latest_release", fake_fetch)
+    for telemetry_dir, verdict in ((store, 0), (missing, 1)):
+        code, row, _ = _doctor_release_row(telemetry_dir)
+        assert code == verdict
+        assert row["status"] == "INFO"
+        for needle in ("99.0.0", running, "uvx otelq@latest skill install"):
+            assert needle in row["detail"], row
+
+    latest["value"] = running
+    code, row, _ = _doctor_release_row(store)
+    assert (code, row["status"]) == (0, "OK")
+    assert running in row["detail"]
+
+    latest["value"] = "0.0.1"
+    code, row, _ = _doctor_release_row(store)
+    assert (code, row["status"]) == (0, "OK")
+    assert "0.0.1" in row["detail"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(OSError("<urlopen error [Errno 8] nodename nor servname>"), id="offline"),
+        pytest.param(TimeoutError("timed out"), id="timeout"),
+        pytest.param(ValueError("no version in the index answer"), id="bad-payload"),
+        pytest.param(_http_client.IncompleteRead(b""), id="truncated"),
+    ],
+)
+def test_ec41_release_check_failure_is_info(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    # AC-132: an unreachable or confused index is a diagnostic, never an error.
+    monkeypatch.delenv("OTELQ_RELEASE_CHECK")
+
+    def failing_fetch(timeout: float = otelq.RELEASE_CHECK_TIMEOUT_SECS) -> str:
+        raise failure
+
+    monkeypatch.setattr(otelq, "_fetch_latest_release", failing_fetch)
+    code, row, err = _doctor_release_row(_valid_store(temp_telemetry))
+    assert code == 0
+    assert row["status"] == "INFO"
+    assert "could not check" in row["detail"]
+    assert "OTELQ_RELEASE_CHECK" in row["detail"]
+    assert "Traceback" not in err
+
+
+def test_fr51_release_check_opt_out_makes_no_request(
+    temp_telemetry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AC-133: the opt-out makes no request at all.
+    def must_not_fetch(timeout: float = otelq.RELEASE_CHECK_TIMEOUT_SECS) -> str:
+        raise AssertionError("the release check reached the network while disabled")
+
+    monkeypatch.setattr(otelq, "_fetch_latest_release", must_not_fetch)
+    for value in ("off", "0", "FALSE", "no"):
+        monkeypatch.setenv("OTELQ_RELEASE_CHECK", value)
+        code, row, _ = _doctor_release_row(_valid_store(temp_telemetry))
+        assert code == 0
+        assert row["status"] == "INFO"
+        assert "disabled" in row["detail"]
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def test_fr51_fetch_latest_release_reads_index_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    # AC-135: the version comes from the index JSON; anything else is a
+    # payload error, not a value. The request is bounded by the timeout.
+    seen: dict[str, Any] = {}
+    bodies = {"value": b'{"info": {"version": "3.4.5"}, "releases": {}}'}
+
+    def fake_urlopen(request: Any, timeout: float) -> _FakeResponse:
+        seen["url"] = request.full_url
+        seen["timeout"] = timeout
+        return _FakeResponse(bodies["value"])
+
+    monkeypatch.setattr(_urllib_request, "urlopen", fake_urlopen)
+    assert otelq._fetch_latest_release() == "3.4.5"
+    assert seen["url"] == "https://pypi.org/pypi/otelq/json"
+    assert 0 < seen["timeout"] <= 3
+
+    for body in (b'{"info": {}}', b'{"info": []}', b"[]", b"not json"):
+        bodies["value"] = body
+        with pytest.raises(ValueError):
+            otelq._fetch_latest_release()
+
+
+def test_fr52_skill_keeps_upgrades_with_the_user() -> None:
+    # AC-136: the agent reports an available release; the user decides.
+    text = otelq.render_skill()
+    assert "otelq release" in text
+    assert "tell the user" in text
+    assert "never upgrade" in text
+
+
+@pytest.mark.parametrize(
+    ("skill_installed", "prefix", "module_file", "expected"),
+    [
+        pytest.param(
+            True, "/home/u/.local/pipx/venvs/otelq", "/x/site-packages/otelq.py",
+            "uvx otelq@latest skill install", id="skill-wins",
+        ),
+        pytest.param(
+            False, "/home/u/.local/pipx/venvs/otelq", "/x/site-packages/otelq.py",
+            "pipx upgrade otelq", id="pipx",
+        ),
+        pytest.param(
+            False, "/home/u/.local/share/uv/tools/otelq", "/x/site-packages/otelq.py",
+            "uv tool upgrade otelq", id="uv-tool",
+        ),
+        pytest.param(
+            False, "/home/u/.cache/uv/environments-v2/otelq-abc", "/src/otelq/otelq.py",
+            "git pull", id="checkout",
+        ),
+        pytest.param(
+            False, "/home/u/.cache/uv/archive-v0/abc", "/x/lib/site-packages/otelq.py",
+            "uvx otelq@latest …", id="uvx",
+        ),
+    ],
+)
+def test_fr51_upgrade_hint_follows_install_method(
+    skill_installed: bool, prefix: str, module_file: str, expected: str
+) -> None:
+    # AC-137: the hint names the command that upgrades THIS otelq.
+    hint = otelq._upgrade_hint(skill_installed, Path(prefix), Path(module_file))
+    assert expected in hint
