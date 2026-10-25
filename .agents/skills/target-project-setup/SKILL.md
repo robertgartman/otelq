@@ -1,24 +1,26 @@
 ---
 name: target-project-setup
-description: "Use from the otelq repo to idempotently wire otelq into your project on the same host — adds otelq's file-export pipeline to your project's existing OpenTelemetry Collector (or scaffolds one) only when missing or drifted, verifies the wiring, and installs the otelq query skill into the target so its AI agent can drive the otelq CLI. Asks for the target project's absolute path."
+description: "Idempotently wire otelq into a project on this host — adds otelq's file-export pipeline to your project's existing OpenTelemetry Collector (or scaffolds one) only when missing or drifted, verifies the wiring, and installs the version-pinned otelq query skill into the target so its AI agent can drive the otelq CLI. Asks for the target project's absolute path."
+# x-release-please-start-version - release tooling moves every otelq pin in this file
 ---
 
 # Integrate otelq with your project's Collector
 
-**Direction (important):** this skill runs **from the otelq repository** and
-operates on a **different target project elsewhere on the same host**. otelq is
-the tool; the *target project* is where the integration happens. You are not
-integrating a Collector into otelq — you are adding otelq's file-export pipeline
-to the **target project's** Collector so otelq can read what that project emits.
+**Direction (important):** this skill operates on a **target project elsewhere
+on the same host**. otelq is the tool; the *target project* is where the
+integration happens. You are not integrating a Collector into otelq — you are
+adding otelq's file-export pipeline to the **target project's** Collector so
+otelq can read what that project emits. The skill needs **no clone of otelq**:
+everything it uses comes from the version-pinned otelq CLI or a version-pinned
+otelq release URL.
 
 **Before doing anything, ask the user for the absolute path to the target
 project** (the project whose Collector should be wired up), e.g.
 `/Users/me/dev/my-service`. Call it `$TARGET`. Every file you **edit** in the steps
-below lives under `$TARGET` — **never** edit files inside the otelq repo for this
-task. (One step *reads* a file from the otelq repo — the canonical query skill — and
-copies it into `$TARGET`; reading the otelq repo is fine, editing it is not.) The
-only otelq command you run is `otelq collector-config` (and the read-only `doctor` /
-`summary` checks).
+below lives under `$TARGET` — if this skill was loaded from a clone of the otelq
+repository, **never** edit that clone. The otelq commands you run are
+`otelq collector-config`, `otelq skill install` (which writes the query skill into
+`$TARGET`), and the read-only `doctor` / `summary` checks.
 
 otelq reads OTLP signals as JSONL from a shared `.telemetry/` directory — that
 directory is the entire contract (see
@@ -28,7 +30,7 @@ right files works; otelq does not need to own the Collector.
 **Idempotence requirement:** treat this skill as safe to run repeatedly. If
 `$TARGET` is already compliant with these setup instructions, the correct result
 is **no file edits, no duplicate config entries, no new commit, and no Collector
-restart**. Inspect first, compare against the canonical otelq fragments/skill, and
+restart**. Inspect first, compare against the canonical otelq fragments, and
 only change files that are missing required setup or have drifted from the current
 contract. When everything already matches, report that the target is already wired
 for otelq and proceed only to optional read-only verification (`doctor` /
@@ -53,16 +55,19 @@ truncates the JSONL files).
 ## Running otelq
 
 Throughout this skill, **`otelq …`** is shorthand for running the CLI straight
-from PyPI with `uvx` — no clone, no global install:
+from PyPI with `uvx`, pinned to the otelq version this skill ships with — no
+clone, no global install:
 
 ```
-uvx otelq …
+uvx otelq@2.1.0 …
 ```
 
-The first run downloads otelq and fetches the DuckDB `otlp` community extension
-(network once, then cached). For the `doctor` / `summary` checks below, pass
-`--dir $TARGET/.telemetry` so otelq reads the target project's output folder. To
-pin a version: `uvx otelq@0.1.0 …`.
+Keep the pin. An unpinned invocation runs whichever otelq version uv cached
+first, and the query skill installed below is pinned to this same version, so
+the two would disagree. The first run downloads otelq and fetches the DuckDB
+`otlp` community extension (network once, then cached). For the `doctor` /
+`summary` checks below, pass `--dir $TARGET/.telemetry` so otelq reads the
+target project's output folder.
 
 ## Step 0 — Ask for `$TARGET`, secure its working tree, then preflight
 
@@ -120,7 +125,7 @@ pin a version: `uvx otelq@0.1.0 …`.
    to the `-contrib` image at the same tag — otherwise the config below fails to
    start.
 
-3. **Get the canonical fragment** (run from the otelq repo):
+3. **Get the canonical fragment:**
 
    ```sh
    otelq collector-config
@@ -194,7 +199,15 @@ otelq), modelled on otelq's reference producer:
 
 1. Copy otelq's `otel-collector-dev.yaml` into `$TARGET` as the starting Collector
    config (it is the contract-locked reference: OTLP in → three `file/*` exporters
-   with the pinned rotation). Drop the `debug` exporter if the project does not want
+   with the pinned rotation). Fetch it from the release that matches the pinned
+   CLI, so the config and the CLI come from the same otelq version:
+
+   ```sh
+   curl -fsSL -o "$TARGET/otel-collector-dev.yaml" \
+     https://raw.githubusercontent.com/robertgartman/otelq/v2.1.0/otel-collector-dev.yaml
+   ```
+
+   Drop the `debug` exporter if the project does not want
    console spam.
 2. Add a Collector service to `$TARGET`'s Compose (create `compose.yaml` if absent),
    using the `otel/opentelemetry-collector-contrib` image, mounting that config and
@@ -323,83 +336,66 @@ Wiring the Collector only gets telemetry onto disk. For `$TARGET`'s AI coding ag
 to actually *use* otelq — to know the `otelq` commands and the query loop — the
 target project needs the **otelq query skill** as well. Without it the CLI is wired
 up but the agent has no instructions for it, so the `otelq` command is effectively
-dead weight in that project. Install a **verbatim copy** of this repo's canonical
-query skill, `.agents/skills/otelq/SKILL.md`, into `$TARGET`.
+dead weight in that project.
 
-This is the one step that **reads** files inside the otelq repo (the canonical
-skill and its Claude Code shim) and **writes** them into `$TARGET` — it still never
-*edits* anything in the otelq repo, and otelq stays the master for the skill's
-content.
+The pinned otelq CLI carries the query skill for its own version and installs it.
+Nothing is copied from an otelq clone, and every command in the installed skill is
+pinned to the same otelq version as the CLI that wrote it:
 
-This skill is **agnostic about which AI coding agent `$TARGET` uses**, and that is
-exactly why placing the file on disk is *not* the finish line: each agent discovers
-skills in a different place, so a skill that is present but in a directory the
-agent never scans is invisible — wired-up-but-dead, the same failure mode as a
-wired Collector with no skill at all. So drive this step from the agent, and treat
-**"the agent can actually load it"** as the acceptance criterion (verified below),
-not "the file exists."
+```sh
+otelq skill install --target "$TARGET"
+```
+
+It writes exactly two files and reports one row per file — `created`, `updated`, or
+`unchanged`. A re-run on a compliant target reports `unchanged` for both and
+rewrites nothing.
+
+- `$TARGET/.agents/skills/otelq/SKILL.md` — the canonical skill. Agents that read
+  the cross-agent `.agents/skills` directory (Codex, Cursor, Gemini CLI, GitHub
+  Copilot and others) load it natively.
+- `$TARGET/.claude/skills/otelq/SKILL.md` — a thin pointer for **Claude Code**,
+  which reads `.claude/skills/` and **not** `.agents/skills/`. Its body directs the
+  agent to the canonical file.
+
+Do not edit either file by hand. otelq is the master for both, and `doctor` reports
+a hand-edited copy as drift.
+
+Placing the files is *not* the finish line. A skill in a directory the agent never
+scans is invisible — wired-up-but-dead, the same failure mode as a wired Collector
+with no skill at all. So treat **"the agent can actually load it"** as the
+acceptance criterion:
 
 1. **Ask the user which AI coding agent `$TARGET` uses** (Claude Code, Cursor,
-   Windsurf, Copilot, Codex, another, or several) — *then derive the skills
-   architecture from that answer*, rather than only asking for a path. From the
-   otelq repo we cannot know the target's agent, and the right install layout
-   depends entirely on it.
+   Windsurf, Copilot, Codex, another, or several).
+2. **Confirm that agent scans one of the two installed locations.** Claude Code
+   uses the pointer; the agents listed above read `.agents/skills`. For an agent
+   that reads neither, ask the user for that agent's project-scoped skills
+   directory, and add a pointer there in the same shape: a directory named `otelq`
+   containing a `SKILL.md` whose body says *"read the canonical instructions at
+   `.agents/skills/otelq/SKILL.md` and follow them exactly."* Install
+   project-scoped inside `$TARGET`, never in a global or user skills directory.
+3. **Check the result.** `git -C "$TARGET" status` should show the new skill files,
+   so they commit alongside the integration. Run
+   `otelq --dir "$TARGET/.telemetry" doctor` from inside `$TARGET`: its
+   `otelq skill` row must be `OK`. A freshly added skill usually needs the agent to
+   **reload or restart its session** before it appears. Only once the skill
+   resolves in the user's actual agent is this step done — then tell the user the
+   `otelq` command is usable by `$TARGET`'s agent.
 
-2. **Pick the skills architecture for that agent.** otelq is the master for the
-   skill *content*; how it is surfaced is per-agent:
-   - **The canonical body always lives at `.agents/skills/otelq/SKILL.md`** — the
-     cross-agent `.agents/skills` standard, project-scoped inside `$TARGET` so it
-     travels with the repo. Install it there regardless of agent; it is the single
-     source of truth a shim can point at.
-   - **If the chosen agent reads `.agents/skills` natively**, that one file is
-     enough — no shim.
-   - **If the chosen agent has its own skills dir** (e.g. **Claude Code →
-     `.claude/skills/otelq/SKILL.md`**), it will **not** see `.agents/skills`, so
-     also install a **thin pointer shim** in the agent's own dir whose body just
-     says *"read the canonical instructions at `.agents/skills/otelq/SKILL.md` and
-     follow them exactly."* This is the pattern the otelq repo uses on itself: see
-     `.claude/skills/otelq/SKILL.md` — copy it verbatim as the shim. It keeps a
-     single canonical body while making the skill discoverable. Match whatever shim
-     convention `$TARGET` already uses for its other skills if it has one.
-   - **For multiple agents**, install one canonical body plus one shim per agent
-     that needs its own dir.
-   - **An agent you do not recognise** → ask the user for that agent's
-     project-scoped skills directory and the shape it expects, rather than guessing.
+## Upgrading otelq in `$TARGET`
 
-   Whatever the layout, keep the trailing `otelq/SKILL.md` shape (a directory named
-   `otelq` containing `SKILL.md`) and install **project-scoped inside `$TARGET`**
-   (never a global/user skills dir).
+The installed skill pins the otelq version it was written for, so `$TARGET` keeps
+running that version until someone upgrades it deliberately. To move otelq and the
+skill forward together, run from inside `$TARGET`:
 
-3. **Copy verbatim** from the otelq repo into the chosen location(s) under `$TARGET`.
-   Do not rewrite, trim, or "adapt" the content — otelq is the master for both the
-   canonical skill and the shim, exactly as it is for the `collector-config`
-   fragment, so a copy that drifts is a bug. If a destination file already exists and
-   is byte-for-byte identical, leave it untouched; if it exists but differs, replace
-   it with the canonical copy:
+```sh
+uvx otelq@latest skill install
+```
 
-   ```sh
-   # canonical body (always)
-   DEST="$TARGET/.agents/skills/otelq"
-   mkdir -p "$DEST"
-   cp .agents/skills/otelq/SKILL.md "$DEST/SKILL.md"
-
-   # plus a per-agent shim when the agent has its own dir, e.g. Claude Code:
-   SHIM="$TARGET/.claude/skills/otelq"
-   mkdir -p "$SHIM"
-   cp .claude/skills/otelq/SKILL.md "$SHIM/SKILL.md"
-   ```
-
-4. **Acceptance check — confirm the agent can discover it, not just that the file
-   landed.** `git -C "$TARGET" status` should show the new skill/shim file(s) (so
-   they commit alongside the integration). Then verify discoverability *for the
-   named agent*: the skill sits in a directory **that agent actually scans**
-   (canonical body in `.agents/skills` only suffices for agents that read it; Claude
-   Code needs the `.claude/skills` shim). Note that a freshly added skill usually
-   requires the agent to **reload/restart its session** before it appears, and that
-   `$TARGET`'s git status should be clean afterwards (idempotent: a byte-identical
-   skill already present is a no-op, not a re-copy). Only once the skill resolves in
-   the user's actual agent is this step done — then tell the user the `otelq` command
-   is usable by `$TARGET`'s agent.
+Then commit the changed skill files. `otelq doctor`, run inside `$TARGET`, reports
+an `otelq skill` row that warns whenever the installed skill and the running CLI
+disagree. Re-run this setup skill after an upgrade when the otelq release notes
+mention Collector changes, since the `collector-config` fragment may have changed.
 
 ## When something is off
 
@@ -415,7 +411,12 @@ not "the file exists."
   **same Compose project** (so service-name DNS resolves) and that you used the
   Collector's **service** name, not its `container_name`.
 - The skill file is present but **the agent never offers/loads otelq** — it is in a
-  directory that agent does not scan. Most common with Claude Code, which reads
-  `.claude/skills` and **not** `.agents/skills`: add the thin `.claude/skills/otelq`
-  shim pointing at the canonical body (see the install step), then reload the agent
-  session so it re-scans skills.
+  directory that agent does not scan. `otelq skill install` writes the Claude Code
+  pointer to `.claude/skills/otelq`; for any other agent, add a pointer in the
+  directory it scans (see the install step), then reload the agent session so it
+  re-scans skills.
+- `doctor`'s `otelq skill` row is `WARN` — the installed skill names a different
+  otelq version than the CLI you ran, or was edited by hand. Run
+  `uvx otelq@latest skill install` inside `$TARGET` and commit the result.
+
+<!-- x-release-please-end -->

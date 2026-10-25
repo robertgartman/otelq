@@ -19,28 +19,46 @@ otelq is a tiny command-line tool that turns the OpenTelemetry signals your appl
 ### Install
 
 1. Install [Astral `uv`](https://docs.astral.sh/uv/getting-started/installation/).
-2. Clone otelq locally:
+2. Get the setup skill into your agent, one of:
 
-   ```sh
-   git clone https://github.com/robertgartman/otelq
-   ```
+   - **Claude Code plugin** — no clone needed:
 
-3. From inside the clone, open your favourite agentic coding tool and invoke the skill — it wires otelq into the target project's Collector and installs the otelq query skill there:
+     ```text
+     /plugin marketplace add robertgartman/otelq
+     /plugin install otelq@otelq
+     ```
+
+   - **A clone**, for any agentic coding tool:
+
+     ```sh
+     git clone https://github.com/robertgartman/otelq
+     ```
+
+3. Invoke the setup skill. It wires otelq into the target project's Collector and installs the otelq query skill there. It runs only when you invoke it; your agent never loads it on its own:
 
    ```text
-   /target-project-setup <path-to-the-repo-you-want-to-use-with-otelq>
+   /otelq:target-project-setup <path-to-your-project>     # from the plugin
+   /target-project-setup <path-to-your-project>           # from inside the clone
    ```
+
+The query skill on its own is one command, with no clone. It writes `.agents/skills/otelq/SKILL.md` plus a Claude Code pointer, and every command in it is pinned to the otelq version that wrote it:
+
+```sh
+uvx otelq@latest skill install --target <path-to-your-project>
+```
+
+Run the same command inside the project later to upgrade otelq and the skill together. `otelq doctor` warns when a project's skill and the CLI disagree.
 
 ### Run
 
-**(1) Through your AI coding agent (the main path)** — this is what otelq is built for. Once the `otelq` query skill is installed in your project (step 3 above), just ask your agent in plain language — *"did the last run error?"*, *"what was slow?"*, *"show me trace X"*, *"otel RCA on the last error"* — and it drives the `otelq` CLI for you, reading the skill for the commands and query loop. You rarely type otelq yourself; the agent runs it in the same loop it codes in. If you want to nudge the flow, run `/otelq summary`.
+**(1) Through your AI coding agent (the main path)** — this is what otelq is built for. Once the `otelq` query skill is installed in your project (see Install above), just ask your agent in plain language — *"did the last run error?"*, *"what was slow?"*, *"show me trace X"*, *"otel RCA on the last error"* — and it drives the `otelq` CLI for you, reading the skill for the commands and query loop. You rarely type otelq yourself; the agent runs it in the same loop it codes in. If you want to nudge the flow, run `/otelq summary`.
 
 The two paths below are the same CLI invoked by hand — useful for a quick check or for the agent under the hood.
 
 **(2a) Zero-install via PyPI (recommended)** — run otelq straight from [PyPI](https://pypi.org/project/otelq/) with `uvx`; no clone, no install. This is what the skill-based AI workflow uses:
 
 ```sh
-uvx otelq summary             # pin a version with: uvx otelq@0.1.0 summary
+uvx otelq summary             # pin a version with: uvx otelq@<version> summary
 ```
 
 **(2b) From the repo or a local clone** — `otelq.py` is a [PEP 723](https://peps.python.org/pep-0723/) single-file script, so `uv` can run it directly:
@@ -160,7 +178,7 @@ The bind-mounted directory is the entire contract: the Collector writes `traces.
 
 otelq is a pure *consumer* of the telemetry directory — it never owns or runs a Collector. In any real setup the Collector belongs to **your** project: it is the one your application already sends OTLP to. You connect otelq by **teeing that Collector's output to a directory otelq can read** — add otelq's `file` exporters to the Collector so it also writes `traces.jsonl` / `logs.jsonl` / `metrics.jsonl`, then point otelq at that directory. otelq never starts, stops, or cleans that Collector; it only reads the files and owns its `.otelq-cache/` subtree.
 
-The _direction_ of integration matters: you work **from the otelq repo** and integrate otelq **into your target project** (identified by its absolute path, e.g. `/Users/me/dev/my-service`) — not the other way around. You invoke *your* coding agent onto a `target-project-setup` skill in *this* repo.
+The _direction_ of integration matters: you integrate otelq **into your target project** (identified by its absolute path, e.g. `/Users/me/dev/my-service`) — not the other way around. You invoke *your* coding agent onto the `target-project-setup` skill, from a clone of this repo or from the otelq Claude Code plugin.
 
 ```sh
 # otelq runs straight from PyPI via uvx — no clone, no install:
@@ -267,13 +285,13 @@ usage: otelq [-h] [--version] [--dir DIR]
              [--verbose] [--since SINCE] [--regex REGEX]
              [--session-id SESSION_ID] [--resource-attr KEY[=VALUE]]
              [--attr KEY[=VALUE]] [--all-worktrees]
-             {summary,sql,errors,slow,trace,logs,metric,await,history,triage,collector-config,doctor,troubleshoot,set_resource_attributes,help}
+             {summary,sql,errors,slow,trace,logs,metric,await,history,triage,collector-config,doctor,troubleshoot,set_resource_attributes,skill,help}
              ...
 
 Query OTLP telemetry captured by the dev OTel Collector.
 
 positional arguments:
-  {summary,sql,errors,slow,trace,logs,metric,await,history,triage,collector-config,doctor,troubleshoot,set_resource_attributes,help}
+  {summary,sql,errors,slow,trace,logs,metric,await,history,triage,collector-config,doctor,troubleshoot,set_resource_attributes,skill,help}
     summary             counts and time span per signal
     sql                 run an ad-hoc SQL query
     errors              error spans and ERROR/FATAL logs
@@ -301,6 +319,8 @@ positional arguments:
                         write git-derived otelq.worktree.id/branch into
                         ./.env.local (opt-in worktree tagging; source it
                         before launching the app)
+    skill               print or install otelq's agent skill, pinned to this
+                        version
     help                show help for otelq or a command
 
 options:
@@ -503,6 +523,16 @@ sql views (for `otelq sql "<query>"`):
   read/write local files via read_csv/COPY), so treat untrusted
   queries with the same care as a shell command.
 
+agent skill:
+  skill install [--target DIR]  write otelq's agent skill into a
+                       project (.agents/skills/otelq, plus a Claude
+                       Code pointer), pinned to this otelq version;
+                       idempotent
+  skill print          print that SKILL.md to stdout
+  Upgrade otelq and the skill together, from the project root:
+    uvx otelq@latest skill install
+  `doctor` warns when a project's skill and the CLI disagree.
+
 Run `otelq troubleshoot` for the capture → query loop and common fixes.
 ```
 
@@ -561,8 +591,9 @@ This repo is built to be developed with AI engineering:
 
 - **[`AGENTS.md`](AGENTS.md)** — start here. The entry point for agents working in this repo.
 - **[`context/CONTEXT.md`](context/CONTEXT.md)** — the documentation system (PRD / SPEC / ADR / CONTRACT routing rules).
-- **[`.agents/skills/otelq`](.agents/skills/otelq/SKILL.md)** — the otelq skill: capture OTEL signals from the dev Collector and query them with otelq. A `.claude` shim (`.claude/skills/otelq`) mirrors it for Claude Code.
-- **[`.agents/skills/target-project-setup`](.agents/skills/target-project-setup/SKILL.md)** — the target-project-setup skill: run from this repo to wire otelq's file-export pipeline into *another* project's existing Collector (the integrated setup above). It asks for the target project's absolute path and verifies the result with `otelq doctor`.
+- **[`.agents/skills/otelq`](.agents/skills/otelq/SKILL.md)** — the otelq skill: capture OTEL signals from the dev Collector and query them with otelq. A `.claude` shim (`.claude/skills/otelq`) points Claude Code at it. Both are **generated**: the skill text lives in `otelq.py`, `otelq skill install` writes it into any project, and `just skill-sync` regenerates this repo's copies.
+- **[`.agents/skills/target-project-setup`](.agents/skills/target-project-setup/SKILL.md)** — the target-project-setup skill: wires otelq's file-export pipeline into *another* project's existing Collector (the integrated setup above) and installs the query skill there. It asks for the target project's absolute path, verifies the result with `otelq doctor`, and runs only when a human invokes it.
+- **[`.claude-plugin/`](.claude-plugin/plugin.json)** — a Claude Code plugin that ships only the setup skill. It is derived packaging: its version moves with each release, and the skills themselves are the source of truth.
 
 ## Contributing
 

@@ -7,7 +7,23 @@
       "include-component-in-tag": false,
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
-        { "type": "generic", "path": "otelq.py" }
+        {
+          "type": "generic",
+          "path": "otelq.py"
+        },
+        {
+          "type": "generic",
+          "path": ".agents/skills/otelq/SKILL.md"
+        },
+        {
+          "type": "generic",
+          "path": ".agents/skills/target-project-setup/SKILL.md"
+        },
+        {
+          "type": "json",
+          "path": ".claude-plugin/plugin.json",
+          "jsonpath": "$.version"
+        }
       ]
     }
   }

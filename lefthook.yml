@@ -35,6 +35,10 @@ pre-commit:
     #                    — these define how the code is validated. A mistake
     #                      here disables the checks themselves, which is exactly
     #                      the failure that must not pass silently.
+    #   - skill copies, .claude-plugin/*.json, release-please-config.json
+    #                    — pinned by the ADR-016 lockstep tests: a hand edit to a
+    #                      generated skill, or a version pin left behind, breaks
+    #                      the suite.
 
     ruff-check:
       priority: 1
@@ -66,4 +70,8 @@ pre-commit:
         - "justfile"
         - "lefthook.yml"
         - ".github/workflows/*"
+        - ".agents/skills/**/SKILL.md"
+        - ".claude/skills/**/SKILL.md"
+        - ".claude-plugin/*.json"
+        - "release-please-config.json"
       run: uv run --with pytest --with "duckdb==1.5.5" pytest tests/ -q

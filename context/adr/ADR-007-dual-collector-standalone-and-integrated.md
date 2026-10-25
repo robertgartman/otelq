@@ -12,12 +12,13 @@ must_not_contain:
   - implementation_walkthroughs
   - reversible_decisions
 created: 2026-06-23
-last_updated: 2026-06-23
+last_updated: 2026-10-25
 related_documents:
   - ADR-001-host-cli-reads-bind-mounted-files
   - ADR-004-collector-in-docker-bind-mount
   - CONTRACT-telemetry-directory
   - SPEC-otelq-cli
+  - ADR-016-cli-carries-versioned-agent-skill
 supersedes: null
 superseded_by: null
 ai_summary: "otelq is a pure consumer of the telemetry dir; it supports both a bundled (standalone) Collector and a project-owned (integrated) one, with `collector-config` as the generated reference-producer config and `doctor` as the conformance check. It manages only producers it owns."
@@ -69,7 +70,9 @@ producer topologies** behind the one contract:
   integration is driven **from the otelq repo onto the target project** (addressed
   by its absolute path): otelq is the tool, the target project is operated on — not
   the reverse. The `target-project-setup` skill encodes this direction and asks for
-  the target path before touching anything.
+  the target path before touching anything. *(Amended 2026-10-25 — see the
+  amendment below: the direction stands, but the skill no longer has to run from
+  a clone of the otelq repo.)*
 
 Two CLI affordances make the integrated path reliable:
 
@@ -139,3 +142,15 @@ stays a pure, read-only conformance check and never generates data.**
 - Adding a producer topology is additive to the contract (no interface change);
   ADR-004's bundled Collector remains valid and unchanged as the standalone
   producer.
+
+## Amendment (2026-10-25) — the direction holds; the location relaxes
+
+This amendment **narrows** one phrase and reverses nothing. The integration is
+still driven *onto* the target project, addressed by its absolute path, and otelq
+still never edits that project except through a consented setup run. What changes
+is *where* that run starts: under
+[ADR-016](ADR-016-cli-carries-versioned-agent-skill.md) the query skill is
+written by the version-pinned CLI and reference files come from a version-pinned
+otelq release, so the `target-project-setup` skill no longer needs a clone of the
+otelq repository. It may be loaded from a clone, from a plugin, or from any other
+copy of the skill. A clone, when used, is still never edited by the setup.
