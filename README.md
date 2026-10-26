@@ -12,7 +12,7 @@ otelq is a tiny command-line tool that turns the OpenTelemetry signals your appl
 - **Built for AI coding agents.** Feed close-the-loop verification with real traces, logs, and metrics from any OpenTelemetry-compliant app: make a change, run it, and let the agent confirm from telemetry that it actually worked.
 - **Lightweight, fast, token-efficient.** A single-file CLI invoked on demand — structured `json`/`csv`/`table` output an agent can parse, not dashboards to scrape, no MCPs crunching your tokens. No always-on services burning resources or context.
 - **Zero heavy infrastructure.** A stock [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) writes signals to plain JSONL files; otelq reads them in-process with DuckDB. Nothing to deploy, nothing to run between queries. A one-shot bundled demo gets you querying real signals in seconds.
-- **Fully local, fully isolated.** Telemetry never leaves your machine — it lives in a directory you own and read directly. Nothing is shipped to a backend, a vendor, or the cloud.
+- **Fully local, fully isolated.** Telemetry never leaves your machine — it lives in a directory you own and read directly. Nothing is shipped to a backend, a vendor, or the cloud. Besides the one-time DuckDB extension download, the only request otelq makes is `doctor` asking PyPI whether a newer otelq exists; it sends no data, and `OTELQ_RELEASE_CHECK=off` turns it off.
 
 ## Install & run
 
@@ -66,6 +66,19 @@ uvx otelq summary             # pin a version with: uvx otelq@<version> summary
 ```sh
 uv run otelq.py summary
 ```
+
+### Upgrade
+
+How you upgrade depends on how you run otelq. `otelq doctor` checks PyPI for a newer release and names the matching command for your setup.
+
+| You run otelq… | Upgrade with |
+|---|---|
+| through the query skill installed in your project | `uvx otelq@latest skill install` in the project root, then commit the skill. The skill pins its CLI version, so this moves both together. |
+| ad hoc with `uvx otelq` | `uvx otelq@latest …`, since an unpinned `uvx otelq` keeps the version it cached first |
+| after `uv tool install otelq` | `uv tool upgrade otelq` |
+| after `pipx install otelq` | `pipx upgrade otelq` |
+| from a clone, as `uv run otelq.py` | `git pull` |
+| via the Claude Code plugin, for the setup skill | `claude plugin update otelq@otelq` |
 
 ## Take it for a test run
 
@@ -313,7 +326,8 @@ positional arguments:
                         lists the top templates
     collector-config    print the file-export fragment to add to an existing
                         Collector
-    doctor              check that --dir satisfies the telemetry contract
+    doctor              check that --dir satisfies the telemetry contract, and
+                        that the project's skill and otelq itself are current
     troubleshoot        print the capture → query loop and common fixes
     set_resource_attributes
                         write git-derived otelq.worktree.id/branch into
@@ -531,7 +545,10 @@ agent skill:
   skill print          print that SKILL.md to stdout
   Upgrade otelq and the skill together, from the project root:
     uvx otelq@latest skill install
-  `doctor` warns when a project's skill and the CLI disagree.
+  `doctor` warns when a project's skill and the CLI disagree, and
+  asks the package index whether a newer otelq is out. Apart from
+  the one-time extension download, that is otelq's only network
+  request; OTELQ_RELEASE_CHECK=off skips it.
 
 Run `otelq troubleshoot` for the capture → query loop and common fixes.
 ```
