@@ -1,7 +1,7 @@
 {
   "name": "otelq",
   "description": "Human-run setup that wires otelq into a project's OpenTelemetry Collector and installs otelq's version-pinned query skill.",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "author": {
     "name": "Robert Gartman"
   },
