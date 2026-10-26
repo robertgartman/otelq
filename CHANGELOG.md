@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.2.0](https://github.com/robertgartman/otelq/compare/v2.1.0...v2.2.0) (2026-10-26)
+
+
+### Features
+
+* add ADR-010 for adopting DuckDB 1.5.4 and duckdb-otlp v0.6.0 schema ([d3a8bb4](https://github.com/robertgartman/otelq/commit/d3a8bb4d7b67d2d40500ee9b13e07330bd6255ac))
+* doctor reports a newer otelq release and how to upgrade ([#46](https://github.com/robertgartman/otelq/issues/46)) ([4c93bbe](https://github.com/robertgartman/otelq/commit/4c93bbe5d8b7a68e56a9fda916723b1c81b85188))
+* ship otelq's agent skill from the CLI, version-pinned ([#45](https://github.com/robertgartman/otelq/issues/45)) ([50efda1](https://github.com/robertgartman/otelq/commit/50efda1382502fd4b8160bb75dfaccc0b303bd1f))
+
+
+### Documentation
+
+* **context:** point references at the renamed ADR-010 ([ea8008e](https://github.com/robertgartman/otelq/commit/ea8008e562fad48edfd79966fb053b55aed46576))
+
 ## [2.1.0](https://github.com/robertgartman/otelq/compare/v2.0.0...v2.1.0) (2026-09-22)
 
 

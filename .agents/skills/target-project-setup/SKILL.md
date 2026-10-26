@@ -59,7 +59,7 @@ from PyPI with `uvx`, pinned to the otelq version this skill ships with — no
 clone, no global install:
 
 ```
-uvx otelq@2.1.0 …
+uvx otelq@2.2.0 …
 ```
 
 Keep the pin. An unpinned invocation runs whichever otelq version uv cached
@@ -204,7 +204,7 @@ otelq), modelled on otelq's reference producer:
 
    ```sh
    curl -fsSL -o "$TARGET/otel-collector-dev.yaml" \
-     https://raw.githubusercontent.com/robertgartman/otelq/v2.1.0/otel-collector-dev.yaml
+     https://raw.githubusercontent.com/robertgartman/otelq/v2.2.0/otel-collector-dev.yaml
    ```
 
    Drop the `debug` exporter if the project does not want
