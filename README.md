@@ -19,35 +19,23 @@ otelq is a tiny command-line tool that turns the OpenTelemetry signals your appl
 ### Install
 
 1. Install [Astral `uv`](https://docs.astral.sh/uv/getting-started/installation/).
-2. Get the setup skill into your agent, one of:
+2. Install the otelq skill into your project — one command, no clone. Run it in the project root:
 
-   - **Claude Code plugin** — no clone needed:
-
-     ```text
-     /plugin marketplace add robertgartman/otelq
-     /plugin install otelq@otelq
-     ```
-
-   - **A clone**, for any agentic coding tool:
-
-     ```sh
-     git clone https://github.com/robertgartman/otelq
-     ```
-
-3. Invoke the setup skill. It wires otelq into the target project's Collector and installs the otelq query skill there. It runs only when you invoke it; your agent never loads it on its own:
-
-   ```text
-   /otelq:target-project-setup <path-to-your-project>     # from the plugin
-   /target-project-setup <path-to-your-project>           # from inside the clone
+   ```sh
+   uvx otelq@latest skill install
    ```
 
-The query skill on its own is one command, with no clone. It writes `.agents/skills/otelq/SKILL.md` plus a Claude Code pointer, and every command in it is pinned to the otelq version that wrote it:
+   It writes `.agents/skills/otelq/SKILL.md` plus a Claude Code pointer, and every command in it is pinned to the otelq version that wrote it. Commit both files so every teammate and agent gets them. Reload your agent session so it picks the skill up.
 
-```sh
-uvx otelq@latest skill install --target <path-to-your-project>
-```
+3. Wire your project's telemetry. In your agent, inside the project, run:
 
-Run the same command inside the project later to upgrade otelq and the skill together. `otelq doctor` warns when a project's skill and the CLI disagree.
+   ```text
+   /otelq project-setup
+   ```
+
+   (Agents without slash-command arguments: ask for "otelq project setup".) The agent inspects your project read-only, explains in plain language what it proposes — adding otelq's file exporters to your existing OpenTelemetry Collector, or scaffolding one if you have none — and changes nothing until you explicitly approve the plan or adjust it. The setup guidance comes from the same pinned otelq version as the skill.
+
+Run `uvx otelq@latest skill install` inside the project later to upgrade otelq, the skill and the setup guidance together, then re-run `/otelq project-setup` to re-check your Collector against the new version. `otelq doctor` warns when a project's skill and the CLI disagree.
 
 ### Run
 
@@ -78,7 +66,6 @@ How you upgrade depends on how you run otelq. `otelq doctor` checks PyPI for a n
 | after `uv tool install otelq` | `uv tool upgrade otelq` |
 | after `pipx install otelq` | `pipx upgrade otelq` |
 | from a clone, as `uv run otelq.py` | `git pull` |
-| via the Claude Code plugin, for the setup skill | `claude plugin update otelq@otelq` |
 
 ## Take it for a test run
 
@@ -191,7 +178,7 @@ The bind-mounted directory is the entire contract: the Collector writes `traces.
 
 otelq is a pure *consumer* of the telemetry directory — it never owns or runs a Collector. In any real setup the Collector belongs to **your** project: it is the one your application already sends OTLP to. You connect otelq by **teeing that Collector's output to a directory otelq can read** — add otelq's `file` exporters to the Collector so it also writes `traces.jsonl` / `logs.jsonl` / `metrics.jsonl`, then point otelq at that directory. otelq never starts, stops, or cleans that Collector; it only reads the files and owns its `.otelq-cache/` subtree.
 
-The _direction_ of integration matters: you integrate otelq **into your target project** (identified by its absolute path, e.g. `/Users/me/dev/my-service`) — not the other way around. You invoke *your* coding agent onto the `target-project-setup` skill, from a clone of this repo or from the otelq Claude Code plugin.
+The _direction_ of integration matters: you integrate otelq **into your project** — not the other way around. Install the otelq skill in your project and run `/otelq project-setup` from your agent there; see [Install](#install).
 
 ```sh
 # otelq runs straight from PyPI via uvx — no clone, no install:
@@ -202,7 +189,7 @@ otelq collector-config                      # prints the exporters + pipeline wi
 otelq --dir /Users/me/dev/my-service/.telemetry doctor    # verify your wiring satisfies the contract
 ```
 
-`collector-config` is generated from otelq's pinned constants, so it never drifts from the contract; `doctor` checks a telemetry directory against it. The `file` exporter requires the `*-contrib` Collector image. The **target-project-setup** skill automates all of this and asks for the target project's path; see below. When exercising your own app is inconvenient, the skill can also confirm the wiring end-to-end with a throwaway [`telemetrygen`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen) probe — committed, run against your Collector over its own network, then reverted — flagging first if the teed pipeline also feeds a real backend.
+`collector-config` is generated from otelq's pinned constants, so it never drifts from the contract; `doctor` checks a telemetry directory against it. The `file` exporter requires the `*-contrib` Collector image. `/otelq project-setup` automates all of this, after you approve its plan. When exercising your own app is inconvenient, the setup can also confirm the wiring end-to-end with a throwaway [`telemetrygen`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen) probe — committed, run against your Collector over its own network, then reverted — flagging first if the teed pipeline also feeds a real backend.
 
 > **No Collector yet?** otelq bundles one purely so you can try the tool without instrumenting anything — see [Take it for a test run](#take-it-for-a-test-run). That bundled stack (and the Compose files and optional `just` recipes that manage it) is a **demo and local-dev aid, not a deployment model**: in real use the Collector lives in your project, and otelq just reads what it writes.
 
@@ -543,6 +530,10 @@ agent skill:
                        Code pointer), pinned to this otelq version;
                        idempotent
   skill print          print that SKILL.md to stdout
+  skill print project-setup
+                       print the guidance an agent follows to wire
+                       a project's Collector for otelq; in Claude
+                       Code, run `/otelq project-setup`
   Upgrade otelq and the skill together, from the project root:
     uvx otelq@latest skill install
   `doctor` warns when a project's skill and the CLI disagree, and
@@ -609,8 +600,7 @@ This repo is built to be developed with AI engineering:
 - **[`AGENTS.md`](AGENTS.md)** — start here. The entry point for agents working in this repo.
 - **[`context/CONTEXT.md`](context/CONTEXT.md)** — the documentation system (PRD / SPEC / ADR / CONTRACT routing rules).
 - **[`.agents/skills/otelq`](.agents/skills/otelq/SKILL.md)** — the otelq skill: capture OTEL signals from the dev Collector and query them with otelq. A `.claude` shim (`.claude/skills/otelq`) points Claude Code at it. Both are **generated**: the skill text lives in `otelq.py`, `otelq skill install` writes it into any project, and `just skill-sync` regenerates this repo's copies.
-- **[`.agents/skills/target-project-setup`](.agents/skills/target-project-setup/SKILL.md)** — the target-project-setup skill: wires otelq's file-export pipeline into *another* project's existing Collector (the integrated setup above) and installs the query skill there. It asks for the target project's absolute path, verifies the result with `otelq doctor`, and runs only when a human invokes it.
-- **[`.claude-plugin/`](.claude-plugin/plugin.json)** — a Claude Code plugin that ships only the setup skill. It is derived packaging: its version moves with each release, and the skills themselves are the source of truth.
+- **Project setup** — `/otelq project-setup` is a user-invoked mode of the same skill. Its guidance is embedded in `otelq.py` too and printed by `otelq skill print project-setup`, so it always matches the pinned CLI (ADR-018). It wires otelq's file-export pipeline into a project's Collector, verifies the result with `otelq doctor`, and changes nothing until the user approves its plan.
 
 ## Contributing
 

@@ -1,6 +1,6 @@
 ---
 name: otelq
-description: "This is the **default** tool for accessing logs, metrics, and traces generated from project codebase and infrastructure. Use otelq CLI to query telemetry captured by the OpenTelemetry Collector. Triggers: otel, OpenTelemetry, RCA, root cause."
+description: "This is the **default** tool for accessing logs, metrics, and traces generated from project codebase and infrastructure. Use otelq CLI to query telemetry captured by the OpenTelemetry Collector. Triggers: otel, OpenTelemetry, RCA, root cause. `/otelq project-setup` wires a project's Collector for otelq."
 # x-release-please-start-version - release tooling moves every otelq pin in this file
 metadata:
   otelq_version: "2.2.0"
@@ -10,6 +10,23 @@ metadata:
 
 Inspect real OpenTelemetry signals to close the loop after a change or for troubleshooting: run the
 code, then confirm from telemetry that it behaved as intended. If infrastructure is feeding into OpenTelemetry, you can also query that data to understand its behavior.
+
+## Project setup — only when the user asks for it
+
+This skill has a `project-setup` mode that wires the project you are working in
+so otelq can read its telemetry: it adds otelq's file-export pipeline to the
+project's OpenTelemetry Collector (or scaffolds one), then verifies the wiring.
+Enter it **only** when the user explicitly asks — they invoked this skill with
+the argument `project-setup` (in Claude Code, `/otelq project-setup`) or asked
+for otelq project setup by name. Never enter it on your own initiative, and
+never because telemetry is missing; for that, suggest it to the user instead.
+
+In that mode, get the setup guidance for this otelq version and follow it
+exactly; skip the rest of this file until setup is done:
+
+```
+uvx otelq@2.2.0 skill print project-setup
+```
 
 ## Run
 

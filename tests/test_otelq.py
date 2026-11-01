@@ -5908,7 +5908,6 @@ def test_supplied_windows_binary_moves_with_the_pin() -> None:
 
 _CANONICAL_SKILL = Path(".agents/skills/otelq/SKILL.md")
 _CLAUDE_SKILL_SHIM = Path(".claude/skills/otelq/SKILL.md")
-_SETUP_SKILL = Path(".agents/skills/target-project-setup/SKILL.md")
 _SKILL_PIN_RE = _re.compile(r"otelq@(\d+\.\d+\.\d+)")
 _UNPINNED_UVX_RE = _re.compile(r"uvx otelq(?!@)")
 _SEMVER_RE = _re.compile(r"\d+\.\d+\.\d+")
@@ -6081,47 +6080,30 @@ def test_inv8_repo_skill_copies_match_embedded_skill() -> None:
 
 def test_inv8_release_pins_are_in_lockstep() -> None:
     # AC-130: every version pin release tooling owns equals __version__, and
-    # release-please is configured to move each of them.
+    # release-please is configured to move each of them. ADR-018 retired the
+    # separate setup skill and the plugin manifest, so neither may come back as
+    # a second, independently versioned copy of the setup guidance.
     version = otelq.__version__
-    plugin: dict[str, Any] = _json.loads(
-        (_REPO_ROOT / ".claude-plugin/plugin.json").read_text(encoding="utf-8")
-    )
-    assert plugin["version"] == version
-    declared: Any = plugin["skills"]
-    skill_dirs: list[str] = [declared] if isinstance(declared, str) else list(declared)
-    assert skill_dirs
-    for rel in skill_dirs:
-        assert rel.startswith("./")
-        resolved = (_REPO_ROOT / rel).resolve()
-        assert resolved.is_relative_to(_REPO_ROOT.resolve())
-        assert (resolved / "SKILL.md").is_file() or any(resolved.glob("*/SKILL.md"))
-
-    setup = (_REPO_ROOT / _SETUP_SKILL).read_text(encoding="utf-8")
-    pins = _SKILL_PIN_RE.findall(setup)
+    skill = (_REPO_ROOT / _CANONICAL_SKILL).read_text(encoding="utf-8")
+    pins = _SKILL_PIN_RE.findall(skill)
     assert pins and set(pins) == {version}
-    assert not _UNPINNED_UVX_RE.search(setup)
-    # Every version the setup skill names (the CLI pin and the pinned release
-    # URL it fetches reference files from) is this release.
-    assert set(_SEMVER_RE.findall(setup)) == {version}
+    assert not (_REPO_ROOT / ".agents/skills/target-project-setup").exists()
+    assert not (_REPO_ROOT / ".claude/skills/target-project-setup").exists()
+    assert not (_REPO_ROOT / ".claude-plugin").exists()
 
     config: dict[str, Any] = _json.loads(
         (_REPO_ROOT / "release-please-config.json").read_text(encoding="utf-8")
     )
     extra: list[dict[str, Any]] = config["packages"]["."]["extra-files"]
     owned = {str(e["path"]) for e in extra}
-    assert {
-        "otelq.py",
-        ".claude-plugin/plugin.json",
-        _CANONICAL_SKILL.as_posix(),
-        _SETUP_SKILL.as_posix(),
-    } <= owned
+    assert owned == {"otelq.py", _CANONICAL_SKILL.as_posix()}
 
 
 def test_release_please_blocks_cover_every_skill_pin() -> None:
     # release-please's generic updater rewrites only versions inside an
     # x-release-please block, and only the FIRST one on each line: a pin outside
     # a block, or a second version on one line, would silently stay behind.
-    for rel in (_CANONICAL_SKILL, _SETUP_SKILL):
+    for rel in (_CANONICAL_SKILL,):
         inside = False
         blocks = 0
         for number, line in enumerate(
@@ -6138,6 +6120,80 @@ def test_release_please_blocks_cover_every_skill_pin() -> None:
                 assert inside, f"{rel}:{number} has a version outside a release block"
                 assert len(found) == 1, f"{rel}:{number} has more than one version"
         assert blocks == 1 and not inside, f"{rel} needs exactly one closed release block"
+
+
+
+# --- project setup inside the otelq skill: FR-53, FR-54 (ADR-018) -------------
+
+_SETUP_PRINT_CMD_RE = _re.compile(r"uvx otelq@(\d+\.\d+\.\d+) skill print project-setup")
+
+
+def test_fr53_skill_print_project_setup() -> None:
+    # AC-138: the guidance verbatim, whatever --format says; unknown topic is
+    # a usage_error.
+    expected = otelq.render_project_setup()
+    assert expected != otelq.render_skill()
+    for fmt in ("compact", "json", "table"):
+        code, out, _ = _main_io(["--format", fmt, "skill", "print", "project-setup"])
+        assert code == 0
+        assert out == expected
+    code, out, err = _main_io(["skill", "print", "bogus"])
+    assert code == 2
+    assert out == ""
+    assert "otelq: usage_error:" in err
+
+
+def test_fr53_project_setup_guidance_is_pinned_and_gated() -> None:
+    # AC-139: pinned like the skill, and nothing changes before the user
+    # explicitly approves (approve / alter / stop).
+    text = otelq.render_project_setup()
+    version = otelq.__version__
+    pins = _SKILL_PIN_RE.findall(text)
+    assert pins and set(pins) == {version}
+    assert not _UNPINNED_UVX_RE.search(text)
+    assert "@OTELQ_VERSION@" not in text
+    urls = _re.findall(r"https://raw\.githubusercontent\.com/\S+", text)
+    assert urls and all(f"/v{version}/" in u for u in urls)
+    # The only semver-shaped strings are this release.
+    assert set(_SEMVER_RE.findall(text)) == {version}
+    lowered = text.lower()
+    assert "explicitly approved" in lowered
+    assert "is **not** approval" in text
+    for choice in ("**Approve**", "**Alter**", "**Stop**"):
+        assert choice in text
+    assert "What this setup is" in text
+    assert "What will not change" in text
+    assert "Already set up?" in text
+
+
+def test_fr54_skill_exposes_project_setup_on_request() -> None:
+    # AC-140: the skill names the mode, its Claude Code invocation, the pinned
+    # command that prints the guidance, and that only the user enters it.
+    text = otelq.render_skill()
+    assert "`project-setup`" in text
+    assert "/otelq project-setup" in text
+    assert _SETUP_PRINT_CMD_RE.findall(text) == [otelq.__version__]
+    assert "only** when the user explicitly asks" in text
+    assert "Never enter it on your own initiative" in text
+
+
+def test_fr48_skill_install_advertises_project_setup(tmp_path: Path) -> None:
+    # AC-141: the hint is install's last stderr line on every run (created
+    # and unchanged alike); stdout stays the parseable rows.
+    target = tmp_path / "proj"
+    target.mkdir()
+    for _ in range(2):
+        code, out, err = _main_io(
+            ["--format", "json", "skill", "install", "--target", str(target)]
+        )
+        assert code == 0, err
+        lines = [line for line in err.splitlines() if line.strip()]
+        # Only the FR-33 session footer, printed after every command, follows.
+        assert lines[-1].startswith("To track this ongoing analysis")
+        assert lines[-2] == otelq.SKILL_PROJECT_SETUP_HINT
+        assert "/otelq project-setup" in otelq.SKILL_PROJECT_SETUP_HINT
+        assert "project-setup" not in out
+        assert len(_json.loads(out)) == 2
 
 
 # --- doctor release check: FR-51, FR-52, EC-41, EC-42 (ADR-017) --------------

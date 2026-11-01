@@ -12,8 +12,9 @@ must_not_contain:
   - implementation_walkthroughs
   - reversible_decisions
 created: 2026-10-25
-last_updated: 2026-10-25
+last_updated: 2026-11-01
 related_documents:
+  - ADR-018-project-setup-ships-in-the-otelq-skill
   - ADR-002-pep723-uv-single-file-distribution
   - ADR-007-dual-collector-standalone-and-integrated
   - ADR-012-exit-codes-as-public-contract
@@ -105,6 +106,10 @@ agent needs.** The skill is part of the CLI's release, not a sibling of it.
    belongs in the target project, where every teammate and every agent receives
    it with the repository.
 
+*(Decision 6 and the next paragraph are amended 2026-11-01 by
+[ADR-018](ADR-018-project-setup-ships-in-the-otelq-skill.md) — see the
+amendment below.)*
+
 The setup skill stays human-invoked. It is a one-time, consented operation on
 another project ([ADR-007](ADR-007-dual-collector-standalone-and-integrated.md)),
 so an agent must not load it on its own initiative.
@@ -149,3 +154,14 @@ so an agent must not load it on its own initiative.
   [SPEC-otelq-cli](../spec/SPEC-otelq-cli.md)** (the `skill` command and the
   `doctor` skill check); this ADR governs only how the skill is delivered and
   versioned.
+
+## Amendment (2026-11-01) — setup moves into the otelq skill
+
+[ADR-018](ADR-018-project-setup-ships-in-the-otelq-skill.md) amends decision 6
+and the statement that the setup skill stays a separate, non-model-invocable
+skill. Project setup is now a user-invoked mode of the otelq skill whose
+guidance the version-pinned CLI prints, so the setup guidance joins the CLI
+pin and the query skill in the one versioned artifact this ADR establishes. The
+separate setup skill and the plugin manifest that packaged it are retired. The
+consent requirement stands: setup runs only when the user asks for it and edits
+nothing until the user approves.

@@ -12,7 +12,7 @@ must_not_contain:
   - architectural_rationale
   - external_data_schemas
 created: 2026-06-23
-last_updated: 2026-10-25
+last_updated: 2026-11-01
 related_documents:
   - ADR-015-wall-clock-query-window
   - PRD-otelq
@@ -28,6 +28,7 @@ related_documents:
   - ADR-012-exit-codes-as-public-contract
   - ADR-016-cli-carries-versioned-agent-skill
   - ADR-017-doctor-release-check
+  - ADR-018-project-setup-ships-in-the-otelq-skill
 ai_summary: "otelq CLI base behavior: the query relations/columns it exposes, its subcommands (incl. history/triage over the query-history store), global flags and argument order, its exit-code contract, its friendly read-only failure handling, and the skill command that installs its own agent skill."
 semantic_tags:
   - otelq
@@ -1137,7 +1138,7 @@ configuration that produces the raw files.
   asked. Explicitly requested help (FR-22) keeps stdout and exit `0`, because
   there the help *is* the answer.
 
-### Agent skill delivery (ADR-016)
+### Agent skill delivery (ADR-016, ADR-018)
 
 - **FR-48 — `skill` command.** otelq **must** expose a `skill` command with two
   actions:
@@ -1145,7 +1146,9 @@ configuration that produces the raw files.
   - `skill print` **must** write the canonical otelq query skill — the full
     `SKILL.md` text, rendered for the running version (FR-49) — to stdout and
     exit `0`. Its output is the file content verbatim; `--format` does not
-    change it.
+    change it. `skill print project-setup` **must** instead write the
+    project-setup guidance (FR-53) for the running version, under the same
+    rules. Any other value in that position is a `usage_error` (exit `2`).
   - `skill install [--target DIR]` **must** install that skill into the project
     rooted at `DIR` (default: the current working directory) by writing exactly
     two files: the canonical skill at `DIR/.agents/skills/otelq/SKILL.md` and a
@@ -1159,7 +1162,12 @@ configuration that produces the raw files.
   content, which is replaced), or `unchanged` (it was byte-identical, and is not
   rewritten). The rows **must** be rendered through the global `--format`
   (FR-10) and exit `0`. Each file **must** be replaced atomically, so a reader
-  never observes a half-written skill.
+  never observes a half-written skill. After the rows, `skill install` **must**
+  write to stderr, as the last line of its own output (only the FR-33 session
+  footer follows it) and whatever the actions were, a line
+  telling the user that running `/otelq project-setup` in their agent, inside a
+  project that emits or should emit OpenTelemetry, gets guided help wiring
+  that project's telemetry for otelq. It **must not** write this to stdout.
 
   `skill` reads no telemetry store: it is exempt from FR-38, prints no response
   header (FR-29), records no history (FR-34), and rejects `--regex` (FR-32) and
@@ -1222,6 +1230,37 @@ configuration that produces the raw files.
   prints and installs **must** instruct the agent that, when `doctor` reports a
   newer otelq release, it tells the user and does not upgrade otelq or the skill
   on its own.
+
+- **FR-53 — Project-setup guidance.** otelq **must** embed the guidance an
+  agent follows to wire the project it is working in for otelq: adding otelq's
+  file-export pipeline to the project's existing Collector, or scaffolding one
+  when there is none, verifying the wiring, and confirming the otelq skill is
+  loadable by the project's agent. The rendered guidance **must**:
+
+  - pin otelq like the skill (FR-49): every otelq invocation is
+    `uvx otelq@<version>` and every otelq release URL names `v<version>`, where
+    `<version>` is the version FR-24 reports;
+  - direct the agent to inspect the project read-only first, then explain to the
+    user in plain language what the proposed setup is — what otelq is, how the
+    Collector, the `.telemetry/` directory and otelq relate, each concrete
+    change with its reason, what will not change, and the side effects (a
+    Collector restart, synthetic data reaching other exporters of a teed
+    pipeline);
+  - direct the agent to ask the user for **explicit approval** with three
+    choices — approve the plan and implement it, alter details of the plan
+    first, or stop — and to change no file, make no commit, and restart nothing
+    until the user explicitly approves; anything other than an explicit approval
+    is not approval;
+  - direct the agent, when the project already matches the setup, to report that
+    and make no changes.
+
+- **FR-54 — The skill exposes project setup on request.** The skill text that
+  FR-48 prints and installs **must** describe a `project-setup` mode that the
+  agent enters only when the user explicitly asks for it — invoking the skill
+  with the argument `project-setup` (in Claude Code, `/otelq project-setup`) or
+  asking for otelq project setup by name — and never on its own initiative. In
+  that mode the agent **must** be told to run
+  `uvx otelq@<version> skill print project-setup` and follow its output.
 
 ## Edge Cases & Failure Modes
 
@@ -2246,9 +2285,9 @@ configuration that produces the raw files.
 
 - **AC-130** (Verifies INV-8, FR-49): Given the otelq repository, then its
   `.agents/skills/otelq/SKILL.md` and `.claude/skills/otelq/SKILL.md` are
-  byte-identical to what `skill install` writes, and every otelq version pin in
-  the repository's setup skill and plugin manifest equals the `--version`
-  output.
+  byte-identical to what `skill install` writes, every otelq version pin in
+  the repository's skill equals the `--version` output, and the repository
+  carries no separate setup skill or plugin manifest (ADR-018).
   *Verification hint: `test_inv8_repo_skill_copies_match_embedded_skill`,
   `test_inv8_release_pins_are_in_lockstep`.*
 
@@ -2292,6 +2331,34 @@ configuration that produces the raw files.
   agent to report a newer release reported by `doctor` to the user and not to
   upgrade on its own.
   *Verification hint: `test_fr52_skill_keeps_upgrades_with_the_user`.*
+
+- **AC-138** (Verifies FR-48, FR-53): Given any working directory, when
+  `otelq skill print project-setup` runs, then stdout is the rendered
+  project-setup guidance, identical for every `--format`, with no response
+  header, and the exit code is `0`; `otelq skill print bogus` exits `2` with
+  `usage_error`.
+  *Verification hint: `test_fr53_skill_print_project_setup`.*
+
+- **AC-139** (Verifies FR-53): Given the rendered project-setup guidance, then
+  every otelq invocation in it is `uvx otelq@<--version output>`, no unpinned
+  `uvx otelq ` invocation remains, every release URL names `v<that version>`, and
+  it instructs the agent to explain the proposed setup, to ask for explicit
+  approval offering approve, alter and stop, and to change nothing before that
+  approval.
+  *Verification hint: `test_fr53_project_setup_guidance_is_pinned_and_gated`.*
+
+- **AC-140** (Verifies FR-54): Given the rendered skill, then it names the
+  `project-setup` mode, `/otelq project-setup`, the command
+  `uvx otelq@<version> skill print project-setup`, and states that the mode is
+  entered only on the user's explicit request.
+  *Verification hint: `test_fr54_skill_exposes_project_setup_on_request`.*
+
+- **AC-141** (Verifies FR-48): Given any target, when `skill install` runs —
+  whether it creates, updates, or leaves the files unchanged — then the last
+  stderr line before the FR-33 session footer names `/otelq project-setup`, and
+  stdout carries only the
+  `(file, action)` rows for the chosen `--format`.
+  *Verification hint: `test_fr48_skill_install_advertises_project_setup`.*
 
 ### Examples
 
@@ -2355,4 +2422,5 @@ configuration that produces the raw files.
 - **INV-8** — One skill, one version: the agent skill otelq installs is a pure
   function of the running otelq version, and the copies committed in the otelq
   repository are identical to it. A skill never names an otelq version other
-  than the one that produced it.
+  than the one that produced it. The project-setup guidance (FR-53) is likewise
+  a pure function of the running version.
