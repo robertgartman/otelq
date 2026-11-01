@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.3.0](https://github.com/robertgartman/otelq/compare/v2.2.0...v2.3.0) (2026-11-01)
+
+
+### Features
+
+* /otelq project-setup replaces the separate setup skill ([#47](https://github.com/robertgartman/otelq/issues/47)) ([1599f8b](https://github.com/robertgartman/otelq/commit/1599f8b9edd32bbd385f8d0b236631f19af41687))
+
 ## [2.2.0](https://github.com/robertgartman/otelq/compare/v2.1.0...v2.2.0) (2026-10-26)
 
 

@@ -3,7 +3,7 @@ name: otelq
 description: "This is the **default** tool for accessing logs, metrics, and traces generated from project codebase and infrastructure. Use otelq CLI to query telemetry captured by the OpenTelemetry Collector. Triggers: otel, OpenTelemetry, RCA, root cause. `/otelq project-setup` wires a project's Collector for otelq."
 # x-release-please-start-version - release tooling moves every otelq pin in this file
 metadata:
-  otelq_version: "2.2.0"
+  otelq_version: "2.3.0"
 ---
 
 # Query Telemetry
@@ -25,13 +25,13 @@ In that mode, get the setup guidance for this otelq version and follow it
 exactly; skip the rest of this file until setup is done:
 
 ```
-uvx otelq@2.2.0 skill print project-setup
+uvx otelq@2.3.0 skill print project-setup
 ```
 
 ## Run
 
 ```
-uvx otelq@2.2.0 --format compact summary
+uvx otelq@2.3.0 --format compact summary
 ```
 
 **`--dir` is not required.** otelq resolves the store itself:
@@ -55,7 +55,7 @@ names every path it tried — it never creates a store.
 
 ## Keep the version pin
 
-Every command in this skill runs `otelq@2.2.0`, the version this skill was
+Every command in this skill runs `otelq@2.3.0`, the version this skill was
 written for. Keep the pin: an unpinned invocation runs whichever version uv
 cached first, which may lack the flags described here. To upgrade otelq and this skill
 together, run from the project root:
@@ -64,7 +64,7 @@ together, run from the project root:
 uvx otelq@latest skill install
 ```
 
-`uvx otelq@2.2.0 doctor` reports an `otelq skill` row that warns
+`uvx otelq@2.3.0 doctor` reports an `otelq skill` row that warns
 when this file and the CLI disagree, and an `otelq release` row that says when a
 newer otelq is out. When it reports a newer release, tell the user and let them decide: never upgrade
 otelq or this skill on your own, because the upgrade changes files the project
@@ -92,7 +92,7 @@ otelq records every telemetry query it runs (locally, in `.otelq-history/`
 under the telemetry dir), and `triage` acts on that history:
 
 ```
-uvx otelq@2.2.0 --format compact triage
+uvx otelq@2.3.0 --format compact triage
 ```
 
 What it does, in order:
@@ -284,7 +284,7 @@ typically ~40–60% fewer tokens on the same rows, identical data.
 (`--top`, `--service`, `--level`, `--grep`) go **after**:
 
 ```
-uvx otelq@2.2.0 --since 10m --format compact errors --top 20
+uvx otelq@2.3.0 --since 10m --format compact errors --top 20
 ```
 
 ## Filter inside otelq (`--regex` / `--grep`), not shell `| grep`
@@ -308,7 +308,7 @@ latest matching rows without first raising `--top`.
 Example:
 
 ```
-uvx otelq@2.2.0 --regex "timeout|ECONNRESET" errors
+uvx otelq@2.3.0 --regex "timeout|ECONNRESET" errors
 ```
 
 Case-sensitive by default (use inline `(?i)` for case-insensitive). Only
@@ -325,7 +325,7 @@ full history); cap rows with `--top N`. Full reference (incl. the `sql` view
 columns):
 
 ```
-uvx otelq@2.2.0 --help
+uvx otelq@2.3.0 --help
 ```
 
 `--help`'s `sql` column list is a curated subset. For the full live schema —
@@ -333,8 +333,8 @@ including `*_attributes` columns carrying whatever custom OTel tags an app
 actually emits — use standard DuckDB introspection:
 
 ```
-uvx otelq@2.2.0 sql "DESCRIBE traces"
-uvx otelq@2.2.0 sql "PRAGMA table_info('logs')"
+uvx otelq@2.3.0 sql "DESCRIBE traces"
+uvx otelq@2.3.0 sql "PRAGMA table_info('logs')"
 ```
 
 ## Wait for something to arrive (`await`)
@@ -343,7 +343,7 @@ Telemetry lands seconds after it is emitted (Collector batch + flush). Do **not*
 sleep-and-retry from the shell — otelq polls in-process, so the budget is real:
 
 ```
-uvx otelq@2.2.0 --resource-attr smoke.run_id=abc123 \
+uvx otelq@2.3.0 --resource-attr smoke.run_id=abc123 \
   await --timeout 60s --poll 1s logs --attr smoke.step=pair-node
 ```
 
@@ -370,8 +370,8 @@ An OTel **Resource** attribute is the spine that ties one run's traces, logs and
 metrics together. Filter on it directly — never by grepping the raw JSON:
 
 ```
-uvx otelq@2.2.0 --resource-attr smoke.run_id=abc123 errors
-uvx otelq@2.2.0 --resource-attr service.namespace=api --resource-attr deployment.environment=dev logs
+uvx otelq@2.3.0 --resource-attr smoke.run_id=abc123 errors
+uvx otelq@2.3.0 --resource-attr service.namespace=api --resource-attr deployment.environment=dev logs
 ```
 
 Repeatable (terms AND together), **exact** match, dotted keys need no escaping.
@@ -392,7 +392,7 @@ In `sql` (never rewritten, so filter yourself) use the otelq-defined macro —
 not `json_extract_string`, which needs escaping and raises on a malformed row:
 
 ```
-uvx otelq@2.2.0 sql "SELECT * FROM logs
+uvx otelq@2.3.0 sql "SELECT * FROM logs
   WHERE resource_attr(resource_attributes, 'smoke.run_id') = 'abc123'"
 ```
 
@@ -403,7 +403,7 @@ whose parent was never exported — leaves spans in one trace split into separat
 components. Ask with `root_id`, not `trace_id`:
 
 ```
-uvx otelq@2.2.0 sql "SELECT span_id, root_id, depth, is_orphan FROM span_tree"
+uvx otelq@2.3.0 sql "SELECT span_id, root_id, depth, is_orphan FROM span_tree"
 ```
 
 | Relation | Use |
@@ -447,7 +447,7 @@ Do **not** write `otelq ... 2>/dev/null || echo 0` — that is the pattern this
 contract exists to kill. Branch on the exit code:
 
 ```bash
-hits=$(uvx otelq@2.2.0 --format compact \
+hits=$(uvx otelq@2.3.0 --format compact \
          sql "SELECT count(*) FROM logs WHERE severity_text = 'ERROR'") || {
   echo "otelq failed — do not treat this as zero errors" >&2; exit 2; }
 ```
@@ -460,7 +460,7 @@ cannot hide.
 ## Not seeing data?
 
 ```
-uvx otelq@2.2.0 troubleshoot
+uvx otelq@2.3.0 troubleshoot
 ```
 
 <!-- x-release-please-end -->
