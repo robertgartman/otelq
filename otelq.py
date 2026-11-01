@@ -3912,6 +3912,11 @@ def render_troubleshooting() -> str:
 SKILL_CANONICAL_PATH = Path(".agents/skills/otelq/SKILL.md")
 SKILL_CLAUDE_SHIM_PATH = Path(".claude/skills/otelq/SKILL.md")
 SKILL_REFRESH_COMMAND = "uvx otelq@latest skill install"
+SKILL_PROJECT_SETUP_HINT = (
+    "otelq: next, run `/otelq project-setup` in your AI agent, inside a project "
+    "that emits (or should emit) OpenTelemetry, for guided help wiring its "
+    "Collector so otelq can read the telemetry"
+)
 _SKILL_CHECK = "otelq skill"
 _SKILL_VERSION_TOKEN = "@OTELQ_VERSION@"
 _RELEASE_BLOCK_START_TOKEN = "@RELEASE_BLOCK_START@"
@@ -3922,7 +3927,7 @@ _SKILL_DESCRIPTION_RE = re.compile(r"^description: (.+)$", re.MULTILINE)
 
 _SKILL_TEMPLATE = r"""---
 name: otelq
-description: "This is the **default** tool for accessing logs, metrics, and traces generated from project codebase and infrastructure. Use otelq CLI to query telemetry captured by the OpenTelemetry Collector. Triggers: otel, OpenTelemetry, RCA, root cause."
+description: "This is the **default** tool for accessing logs, metrics, and traces generated from project codebase and infrastructure. Use otelq CLI to query telemetry captured by the OpenTelemetry Collector. Triggers: otel, OpenTelemetry, RCA, root cause. `/otelq project-setup` wires a project's Collector for otelq."
 # @RELEASE_BLOCK_START@ - release tooling moves every otelq pin in this file
 metadata:
   otelq_version: "@OTELQ_VERSION@"
@@ -3932,6 +3937,23 @@ metadata:
 
 Inspect real OpenTelemetry signals to close the loop after a change or for troubleshooting: run the
 code, then confirm from telemetry that it behaved as intended. If infrastructure is feeding into OpenTelemetry, you can also query that data to understand its behavior.
+
+## Project setup — only when the user asks for it
+
+This skill has a `project-setup` mode that wires the project you are working in
+so otelq can read its telemetry: it adds otelq's file-export pipeline to the
+project's OpenTelemetry Collector (or scaffolds one), then verifies the wiring.
+Enter it **only** when the user explicitly asks — they invoked this skill with
+the argument `project-setup` (in Claude Code, `/otelq project-setup`) or asked
+for otelq project setup by name. Never enter it on your own initiative, and
+never because telemetry is missing; for that, suggest it to the user instead.
+
+In that mode, get the setup guidance for this otelq version and follow it
+exactly; skip the rest of this file until setup is done:
+
+```
+uvx otelq@@OTELQ_VERSION@ skill print project-setup
+```
 
 ## Run
 
@@ -4386,6 +4408,313 @@ This Claude Code entry is only a pointer. `otelq skill install` writes both file
 from the same otelq release, so the two cannot drift.
 """
 
+# The project-setup guidance (FR-53, ADR-018). The skill tells the agent to fetch
+# it with `skill print project-setup` only when the user asks for setup, so the
+# one-time Collector wiring text never loads with every telemetry query, and it
+# is always the guidance for the otelq version the project pins.
+PROJECT_SETUP_TOPIC = "project-setup"
+
+_PROJECT_SETUP_TEMPLATE = r"""# otelq project setup
+
+You are helping the user wire **the project you are working in** so otelq can
+read its OpenTelemetry signals (traces, logs, metrics). Follow the phases below
+in order. The user may not know OpenTelemetry or otelq well, so **explain as you
+go**: say what you are checking, what you found, and what you propose, in plain
+language and without assuming jargon.
+
+**The one rule that overrides everything else:** Phases 1 and 2 are read-only.
+Do **not** edit, create, or delete any file, make any commit, or start, stop, or
+restart anything until the user has **explicitly approved** your plan in Phase
+2. Only a clear "yes, go ahead" (or equivalent) counts. Silence, a question, "maybe",
+or "looks interesting" is **not** approval. If in doubt, ask again.
+
+Every otelq command below is pinned to otelq @OTELQ_VERSION@, the version of the
+otelq skill installed in this project. Keep the pin: `uvx otelq@@OTELQ_VERSION@ …`.
+The first run downloads otelq and the DuckDB `otlp` extension (network once,
+then cached).
+
+---
+
+## Phase 0 — Confirm which project to wire
+
+Call the project root `$PROJECT`: the git top-level of the working directory
+(`git rev-parse --show-toplevel`), or the working directory itself outside git.
+Tell the user which directory you are about to inspect and confirm it is the
+project they mean. If they name a different project, use that one instead. Every
+file you inspect or (later) change lives under `$PROJECT`.
+
+## Phase 1 — Inspect, read-only
+
+Gather the facts the plan needs. Change nothing.
+
+1. **Host tools.** `uv --version` (runs otelq) and `docker compose version`
+   (runs the Collector). Note anything missing; it goes in the plan as a
+   prerequisite the user must fix.
+
+2. **Git state.**
+
+   ```sh
+   git -C "$PROJECT" rev-parse --is-inside-work-tree
+   git -C "$PROJECT" branch --show-current
+   git -C "$PROJECT" status --porcelain
+   ```
+
+3. **Find the Collector.** Search `$PROJECT` for a Compose service using an
+   `otel/opentelemetry-collector*` image (`compose.yaml`, `compose.yml`,
+   `docker-compose.yml`, and overlays referenced with `-f`). Note its service
+   name, image (core or `-contrib`), the config file it mounts (`--config`), and
+   its volumes. Also look for signs of a Collector run outside Compose
+   (Kubernetes manifests, a binary, a managed agent).
+   - Found in Compose → the plan will be **Path A — integrate**.
+   - Not found → the plan will be **Path B — scaffold**. Confirm with the user
+     that the project really has no Collector before proposing one.
+   - Found outside Compose → propose adding the exporters below to *that*
+     Collector by hand, using `collector-config` as the reference, and skip the
+     Compose-specific steps.
+
+4. **Get otelq's canonical fragment** — the exact exporters and pipeline wiring
+   otelq reads, generated from otelq's own constants:
+
+   ```sh
+   uvx otelq@@OTELQ_VERSION@ collector-config
+   ```
+
+5. **Compare.** For Path A, check the Collector config for existing
+   `file/traces`, `file/logs`, `file/metrics` exporters and diff each against
+   the fragment (`path`, `flush_interval`, `rotation`); check each
+   `service.pipelines.<signal>.exporters` list; check the `.telemetry` bind
+   mount and that `$PROJECT/.telemetry/` exists; check `.gitignore` for the
+   telemetry rule (shown in Phase 3). For each pipeline, note whether it also
+   exports to a real backend (`otlp`, `otlphttp`, `prometheus`, …) — that
+   matters for the verification options.
+
+6. **The otelq skill.** Run
+   `uvx otelq@@OTELQ_VERSION@ --dir "$PROJECT/.telemetry" doctor` from
+   `$PROJECT` and note the `otelq skill` row. If the skill is missing or
+   outdated, the plan includes `uvx otelq@@OTELQ_VERSION@ skill install`. Ask which AI coding agent(s) the
+   project's team uses, because the skill must be in a directory each of them
+   scans (Phase 5).
+
+**Already set up?** If everything already matches — exporters identical to the
+fragment, wired into the pipelines, mount, directory and gitignore rule present,
+skill `OK` — tell the user the project is already wired for otelq, change
+nothing, and offer only the read-only verification in Phase 4. You are done.
+
+## Phase 2 — Explain the proposal and ask for explicit approval
+
+Present the proposal to the user in this shape. Keep it concrete: name real
+files and services from Phase 1.
+
+**1. What this setup is.** Explain briefly:
+
+> otelq is a command-line tool that lets you (and your AI agent) query the
+> traces, logs and metrics your app emits — "what errored", "what was slow",
+> "show me this trace". It does not receive telemetry itself. Your app already
+> sends (or will send) OpenTelemetry to a **Collector**; the setup adds three
+> **file exporters** to that Collector so it *also* writes every signal as
+> JSON lines into a `.telemetry/` folder in this project. otelq reads that
+> folder. Nothing else about where your telemetry goes changes.
+>
+> ```
+> your app ──OTLP──▶ Collector ──▶ your existing exporters (unchanged)
+>                        └──────▶ .telemetry/{traces,logs,metrics}.jsonl ──▶ otelq
+> ```
+
+**2. The concrete changes**, one line each with its reason, for example:
+
+- `otel-collector.yaml`: add `file/traces`, `file/logs`, `file/metrics`
+  exporters (otelq's canonical definitions) — so the Collector writes the files
+  otelq reads.
+- the same file: append `file/<signal>` to each pipeline's exporter list,
+  keeping every existing exporter — the Collector sends each item to all
+  exporters, so this is a copy, not a redirect.
+- `compose.yaml`: mount `./.telemetry:/.telemetry` into the Collector service —
+  so the files land in the project, where otelq looks for them.
+- `compose.yaml`: switch the image to `-contrib` at the same tag (only if it is
+  core) — the file exporter exists only in the contrib image.
+- `.telemetry/`: create the directory — created up front, so Docker does not
+  create it owned by root.
+- `.gitignore`: ignore captured telemetry — captures can be large and may hold
+  sensitive data; they are never committed.
+- For Path B, instead: a new Collector config and Compose service owned by this
+  project (Phase 3, Path B).
+- Any existing `file/*` exporter that differs from otelq's: replaced by otelq's
+  version, and say which fields differ.
+
+**3. What will not change.** Your app's code, your other exporters and
+backends, and anything outside `$PROJECT`. otelq never starts, stops, or cleans
+your Collector at runtime; it only reads the folder.
+
+**4. Side effects and choices to make.**
+
+- The Collector must **restart once** to load the new config.
+- **Where to make the change.** Recommend a dedicated branch (for example
+  `otelq-setup`). If there are uncommitted changes, recommend committing or
+  stashing them first, so the setup does not mix with in-flight work. If
+  `$PROJECT` is not a git repository, say so: the verification probe relies on
+  git to undo itself.
+- **How to verify** (Phase 4): (a) run the user's own app — nothing to undo; or
+  (b) a short synthetic probe. If any teed pipeline also exports to a real
+  backend, say plainly that probe data would also reach that backend.
+- **How to apply:** step by step, confirming each change, or all at once.
+
+**5. Ask for explicit approval.** End with a direct question offering exactly
+these choices, and wait for the answer:
+
+> 1. **Approve** — plan and implement this setup as described.
+> 2. **Alter** — change some details first (tell me what: branch name, which
+>    pipelines to tee, verification method, scaffold vs. integrate, …).
+> 3. **Stop** — make no changes.
+
+If the user picks **Alter**, revise the proposal, show the revised version, and
+ask again. Only **Approve** moves you to Phase 3. If the user stops, change
+nothing and say how to resume later (`/otelq project-setup`).
+
+## Phase 3 — Implement the approved plan
+
+Do only what was approved, in the order and mode (step by step or all at once)
+the user chose. Start by creating or switching to the agreed branch.
+
+### Path A — integrate into the existing Collector
+
+1. **Image.** If the Collector service uses the core
+   `otel/opentelemetry-collector` image, switch it to
+   `otel/opentelemetry-collector-contrib` at the same tag.
+2. **Exporters.** Add the three `file/*` exporter blocks from `collector-config`.
+   Where one already exists and differs in any field, replace the whole block
+   with otelq's version: otelq is the master for these definitions, and a
+   drifted copy that only looks wired up can silently break queries.
+3. **Pipelines — tee, never replace.** Append `file/traces` / `file/logs` /
+   `file/metrics` to the existing `service.pipelines.<signal>.exporters` lists,
+   keeping every exporter already there:
+
+   ```yaml
+   exporters: [otlphttp/their-backend, file/traces]   # add file/traces; keep the rest
+   ```
+
+4. **Directory and mount.**
+
+   ```sh
+   mkdir -p "$PROJECT/.telemetry"
+   ```
+   ```yaml
+   volumes:
+     - ./.telemetry:/.telemetry            # host dir : the contract mount path
+   ```
+
+5. **Gitignore.**
+
+   ```gitignore
+   # otelq: local telemetry capture + query cache — never committed
+   /.telemetry/*
+   !/.telemetry/.gitkeep
+   ```
+
+### Path B — scaffold a Collector the project owns
+
+1. Fetch otelq's reference Collector config from the release matching this
+   otelq version:
+
+   ```sh
+   curl -fsSL -o "$PROJECT/otel-collector-dev.yaml" \
+     https://raw.githubusercontent.com/robertgartman/otelq/v@OTELQ_VERSION@/otel-collector-dev.yaml
+   ```
+
+   It receives OTLP and writes the three `file/*` exporters with otelq's pinned
+   rotation. Drop its `debug` exporter if the project does not want console
+   output.
+2. Add a Collector service to the project's Compose file (create `compose.yaml`
+   if there is none): image `otel/opentelemetry-collector-contrib`, mounting that
+   config and `./.telemetry:/.telemetry`, publishing the OTLP ports the app uses
+   (`4317` gRPC, `4318` HTTP).
+3. Create `.telemetry/` and add the gitignore rule, as in Path A steps 4–5.
+4. Tell the user to point the app at it, e.g.
+   `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`. The project owns this
+   Collector's lifecycle.
+
+### Then
+
+Restart the project's Collector so it loads the new config (for Compose,
+`docker compose up -d <collector-service>`). Show the user the resulting diff.
+
+## Phase 4 — Verify the wiring
+
+Use the method the user chose:
+
+- **(a) Their own app** — run it so it emits telemetry.
+- **(b) Synthetic probe** — commit, probe, revert:
+  1. Commit the integration (confirm with the user first; this writes to the
+     project's history):
+     `git -C "$PROJECT" add -A && git -C "$PROJECT" commit -m "Wire OpenTelemetry Collector for otelq"`.
+  2. Add a temporary, uncommitted service to the Compose file, on the same
+     Compose network as the Collector, reaching it by service name:
+
+     ```yaml
+     telemetrygen-probe:
+       image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen@sha256:6bb6a56e325b8e8a600a9d6a5acb7e08a96cfefac08ddab052af540633abce77
+       restart: "no"
+       command:
+         ["traces", "--otlp-endpoint", "<collector-service>:4317", "--otlp-insecure",
+          "--duration", "15s", "--rate", "5", "--service", "otelq-probe"]
+     ```
+
+     Repeat for `metrics` and `logs` (swap the first argument) to cover all
+     three signals.
+  3. Run it (`docker compose up telemetrygen-probe`), then wait about 7 seconds
+     for the Collector to flush.
+  4. After checking (below), revert the probe:
+     `git -C "$PROJECT" checkout -- <compose-file>`. The synthetic capture stays
+     in the gitignored `.telemetry/*.jsonl`, tagged `service.name=otelq-probe`.
+     Do **not** truncate those files while the Collector runs — it writes at a
+     tracked offset, and truncating under it corrupts the file. To clear them,
+     stop the project's Collector first.
+
+Either way, check:
+
+```sh
+uvx otelq@@OTELQ_VERSION@ --dir "$PROJECT/.telemetry" doctor     # exit 0 + OK rows = wired
+uvx otelq@@OTELQ_VERSION@ --dir "$PROJECT/.telemetry" summary    # counts per signal
+```
+
+`doctor` only reads what is on disk; on an empty directory it exits non-zero
+until something emits. Show the user a real result, e.g.
+`uvx otelq@@OTELQ_VERSION@ --dir "$PROJECT/.telemetry" slow --top 5`.
+
+## Phase 5 — Make sure every agent can use otelq
+
+`skill install` wrote `.agents/skills/otelq/SKILL.md` (read by Codex, Cursor,
+Gemini CLI, GitHub Copilot and others) and `.claude/skills/otelq/SKILL.md` (a
+pointer for Claude Code). For any agent the team uses that reads neither, ask
+for its project-scoped skills directory and add an `otelq/SKILL.md` there whose
+body says: *read the canonical instructions at `.agents/skills/otelq/SKILL.md`
+and follow them exactly.* Never install into a global or user directory. The
+`doctor` `otelq skill` row must be `OK`; tell the user to commit the skill files
+with the setup.
+
+## Phase 6 — Wrap up
+
+Summarize what changed, what was verified, and what the user should do next:
+commit (if not done), and ask their agent questions such as "did the last run
+error?" or "what was slow?". To upgrade otelq and this skill together later, run
+`uvx otelq@latest skill install` in the project root, then re-run
+`/otelq project-setup`, which re-checks the Collector against that version.
+
+## When something is off
+
+- `doctor` says **no `*.jsonl` found** — the Collector is not writing: check the
+  bind mount, that the `file/*` exporters are in the **active** pipelines, and
+  that the image is `-contrib`.
+- `doctor` reports **FAIL** on a signal — the file is not valid OTLP/JSON; check
+  the exporter `path` and that nothing else writes to that file.
+- A signal shows **WARN (no files)** — that signal is simply not emitted yet.
+- The probe cannot reach the Collector — both must be in the **same Compose
+  project**, addressed by **service** name, not `container_name`.
+- The agent never loads otelq — the skill is not in a directory that agent
+  scans (Phase 5); reload the agent session after adding it.
+- `doctor`'s `otelq skill` row is `WARN` — run `uvx otelq@latest skill install`
+  in the project root and commit the result.
+"""
+
 
 def render_skill() -> str:
     """The canonical otelq query skill for the running version (FR-48, FR-49)."""
@@ -4394,6 +4723,11 @@ def render_skill() -> str:
         .replace(_RELEASE_BLOCK_START_TOKEN, _RELEASE_MARKER + "-start-version")
         .replace(_RELEASE_BLOCK_END_TOKEN, _RELEASE_MARKER + "-end")
     )
+
+
+def render_project_setup() -> str:
+    """The project-setup guidance for the running version (FR-53)."""
+    return _PROJECT_SETUP_TEMPLATE.replace(_SKILL_VERSION_TOKEN, __version__)
 
 
 def render_skill_shim() -> str:
@@ -4458,6 +4792,7 @@ def _run_skill_install(target: Path | None, fmt: str) -> int:
             "otelq: reload your agent session so it picks up the new skill",
             file=sys.stderr,
         )
+    print(SKILL_PROJECT_SETUP_HINT, file=sys.stderr)
     return 0
 
 
@@ -5002,6 +5337,10 @@ def build_parser() -> argparse.ArgumentParser:
                                    Code pointer), pinned to this otelq version;
                                    idempotent
               skill print          print that SKILL.md to stdout
+              skill print project-setup
+                                   print the guidance an agent follows to wire
+                                   a project's Collector for otelq; in Claude
+                                   Code, run `/otelq project-setup`
               Upgrade otelq and the skill together, from the project root:
                 uvx otelq@latest skill install
               `doctor` warns when a project's skill and the CLI disagree, and
@@ -5214,8 +5553,17 @@ def build_parser() -> argparse.ArgumentParser:
     skill_sub = p_skill.add_subparsers(
         dest="skill_action", required=True, metavar="{print,install}"
     )
-    skill_sub.add_parser(
-        "print", help="print the skill (SKILL.md) for this otelq version to stdout"
+    p_skill_print = skill_sub.add_parser(
+        "print",
+        help="print the skill (SKILL.md) for this otelq version to stdout, or "
+        f"with `{PROJECT_SETUP_TOPIC}` the project-setup guidance",
+    )
+    p_skill_print.add_argument(
+        "topic",
+        nargs="?",
+        choices=[PROJECT_SETUP_TOPIC],
+        default=None,
+        help="print the guidance for wiring a project's Collector for otelq",
     )
     p_skill_install = skill_sub.add_parser(
         "install",
@@ -6199,7 +6547,10 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "skill":
         # A meta command (FR-48): reads no store, so it is exempt from FR-38.
         if args.skill_action == "print":
-            sys.stdout.write(render_skill())
+            topic: str | None = args.topic
+            sys.stdout.write(
+                render_project_setup() if topic == PROJECT_SETUP_TOPIC else render_skill()
+            )
             return 0
         return _run_skill_install(args.target, args.format)
     if args.command == "doctor":

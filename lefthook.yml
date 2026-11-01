@@ -38,7 +38,8 @@ pre-commit:
     #   - skill copies, .claude-plugin/*.json, release-please-config.json
     #                    — pinned by the ADR-016 lockstep tests: a hand edit to a
     #                      generated skill, or a version pin left behind, breaks
-    #                      the suite.
+    #                      the suite. ADR-018 retired the plugin; the glob stays
+    #                      so re-adding one runs the test that rejects it.
 
     ruff-check:
       priority: 1

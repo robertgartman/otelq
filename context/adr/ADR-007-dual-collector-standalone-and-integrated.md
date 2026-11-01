@@ -12,8 +12,9 @@ must_not_contain:
   - implementation_walkthroughs
   - reversible_decisions
 created: 2026-06-23
-last_updated: 2026-10-25
+last_updated: 2026-11-01
 related_documents:
+  - ADR-018-project-setup-ships-in-the-otelq-skill
   - ADR-001-host-cli-reads-bind-mounted-files
   - ADR-004-collector-in-docker-bind-mount
   - CONTRACT-telemetry-directory
@@ -72,7 +73,8 @@ producer topologies** behind the one contract:
   the reverse. The `target-project-setup` skill encodes this direction and asks for
   the target path before touching anything. *(Amended 2026-10-25 — see the
   amendment below: the direction stands, but the skill no longer has to run from
-  a clone of the otelq repo.)*
+  a clone of the otelq repo. Amended again 2026-11-01: setup now runs from inside
+  the target, as a mode of the otelq skill — see the second amendment.)*
 
 Two CLI affordances make the integrated path reliable:
 
@@ -154,3 +156,13 @@ written by the version-pinned CLI and reference files come from a version-pinned
 otelq release, so the `target-project-setup` skill no longer needs a clone of the
 otelq repository. It may be loaded from a clone, from a plugin, or from any other
 copy of the skill. A clone, when used, is still never edited by the setup.
+
+## Amendment (2026-11-01) — setup runs from inside the target
+
+[ADR-018](ADR-018-project-setup-ships-in-the-otelq-skill.md) moves project setup
+into the otelq skill installed in the target project. The direction of this ADR
+holds — the target project is the one operated on, and otelq never manages its
+Collector — but the setup now runs from the target project's own agent session
+rather than from a separate setup skill that addresses the target by path. The
+probe guidance and consent gates described above are carried by the guidance
+the version-pinned CLI prints for that mode.
